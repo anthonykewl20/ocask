@@ -132,10 +132,8 @@ const EXECUTION_GUIDANCE = {
   ].join('\n'),
   'review-general': [
     'This is an analytical review. Think step by step — show your reasoning before reaching a verdict.',
-    'Inspect evidence deeply: use Read, Glob, and Grep to examine relevant files, trace call paths, and check edge cases.',
-    'Cite specific code patterns, function signatures, or line references that support each finding.',
-    'Consider the system context: how does this change interact with existing modules, invariants, and contracts?',
-    'Focus only on what matters: ignore style trivia unless it signals a deeper design flaw.',
+    'Base your analysis on the provided evidence. Only inspect additional files if the task explicitly references them.',
+    'Focus on what matters: ignore style trivia unless it signals a deeper design flaw.',
   ].join('\n'),
   default: ['Answer directly. Inspect only the evidence needed, and avoid unrelated discovery or delegation; use available tools when they materially help.'].join('\n'),
 };
