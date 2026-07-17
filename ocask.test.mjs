@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   buildPrompt,
@@ -185,4 +187,35 @@ test('availableProviders lists all', async () => {
   assert.ok(providers.includes('opencode'));
   assert.ok(providers.includes('deepseek'));
   assert.ok(providers.includes('qwen'));
+});
+
+// install.sh installs the CLI as a symlink, so argv[1] is the link path while
+// import.meta.url is the resolved target. `pricing` is local-only: no network,
+// no spend. A silent exit 0 here is the exact shape of the outage this guards.
+test('entrypoint: main() runs when the CLI is invoked through a symlink', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-entrypoint-'));
+  try {
+    const link = path.join(tmp, 'ocask');
+    await fs.symlink(fileURLToPath(new URL('ocask.mjs', import.meta.url)), link);
+    const run = spawnSync(process.execPath, [link, 'pricing'], { encoding: 'utf8' });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.match(run.stdout, /Pricing/, 'symlink invocation must produce real output, not a silent exit 0');
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('entrypoint: main() does not run when the module is merely imported', async () => {
+  const probe = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-import-'));
+  try {
+    const file = path.join(probe, 'probe.mjs');
+    const target = fileURLToPath(new URL('ocask.mjs', import.meta.url));
+    await fs.writeFile(file, `import ${JSON.stringify(target)}; console.log('imported-clean');\n`);
+    const run = spawnSync(process.execPath, [file], { encoding: 'utf8' });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.match(run.stdout, /imported-clean/);
+    assert.doesNotMatch(run.stdout, /Usage:/, 'importing must not trigger the CLI');
+  } finally {
+    await fs.rm(probe, { recursive: true, force: true });
+  }
 });

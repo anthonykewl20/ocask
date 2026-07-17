@@ -4,8 +4,10 @@
 // See ARCHITECTURE.md for design rationale.
 
 import { randomBytes } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isPaidModelAllowed, PAID_MODELS } from './ocverify.mjs';
 import { invokeWithFallback, ProviderError, modelFamily, availableProviders, defaultProvider } from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
@@ -667,4 +669,17 @@ function formatDoctor(report) {
   }
   return lines.join('\n');
 }
-if (import.meta.url === `file://${process.argv[1]}`) { main(); }
+// `process.argv[1]` is the path as invoked — the symlink itself under an
+// `ln -s` install — while `import.meta.url` is always the resolved real path.
+// Both sides must be realpath'd or main() never runs and the CLI exits 0 with
+// no output. fileURLToPath also handles paths containing spaces.
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) { main(); }
