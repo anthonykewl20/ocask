@@ -131,22 +131,26 @@ analytical reasoning strength:
 ```
 ocask (Node.js CLI)
   │
-  ├─ buildPrompt()          — assembles prompt with lens framework + execution guidance
-  ├─ runAsk()               — model-level fallback (opposite family on malformed output)
+  ├─ buildPrompt()              — assembles prompt with lens framework + execution guidance
+  ├─ runAsk()                   — model-level fallback, wired to logging
   │   └─ invokeWithFallback()
   │       │
   │       ├─ providers/deepseek.mjs  — POST api.deepseek.com/v1/chat/completions
   │       ├─ providers/qwen.mjs      — POST dashscope-intl.aliyuncs.com/compatible-mode/v1
   │       └─ providers/opencode.mjs  — opencode run --pure (deepseek/ for DS, alibaba/ for Qwen)
   │
-  └─ validateAssistantOutput() — enforces verdict contract, JSONL parsing
+  ├─ validateAssistantOutput()   — enforces verdict contract, JSONL parsing
+  ├─ logging.mjs                 — JSONL observability (~/.local/share/ocask/log.jsonl)
+  │   ├─ doctor                  — provider health, flake detection, error suggestions
+  │   └─ diagnose                — per-run root cause + timeline
+  └─ pricing.mjs                 — rates, cost calculation, --refresh from provider APIs
 ```
 
-- **Lazy-loaded providers** — no provider is loaded until needed (no dependency on OpenCode CLI if using native APIs).
-- **Two-layer fallback** — provider chain (transport failures: rate limit, auth, timeout) + model chain (output quality: missing verdict, numbers-only).
-- **Fail-open on infrastructure** — missing baseline, git errors, or state corruption never block the session.
-- **Provider errors are classified** — callers can distinguish AUTH_FAILURE, RATE_LIMITED, TIMEOUT, CONNECTION_ERROR, MALFORMED_RESPONSE, ENTITLEMENT_UNAVAILABLE.
-- **Privacy-safe metadata** — `--metadata` reports contain only attempt timing, model routing, and verdict classification. Never raw prompt, output, or credentials.
+- **Lazy-loaded providers** — no provider is loaded until needed.
+- **Two-layer fallback** — provider chain (transport) + model chain (output quality).
+- **Structured logging** — every invocation tracked with token usage for cost analysis.
+- **Subcommands** — `ocask doctor`, `ocask diagnose`, `ocask cost`, `ocask pricing`, `ocask help`.
+- **Classified errors** — AUTH_FAILURE, RATE_LIMITED, TIMEOUT, CONNECTION_ERROR, MALFORMED_RESPONSE, ENTITLEMENT_UNAVAILABLE.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for full design rationale, sad-path handling, security model, and configuration.
 
@@ -207,6 +211,7 @@ retry), high-latency providers, and auth/rate-limit patterns.
 | `QWEN_API_KEY` | `qwen` | API key (primary; overrides key file) |
 | `QWEN_TOKEN_PLAN` | `qwen` | Set `1` for Alibaba Token Plan billing mode |
 | `OCASK_DISABLE_SERVER` | `opencode` | Set `0` to re-enable persistent server (direct mode is default) |
+| `XDG_DATA_HOME` | all | Base for log and pricing cache (default: `~/.local/share/ocask/`) |
 
 Key files (fallback, read once per invocation):
 
