@@ -1,6 +1,6 @@
 ---
 name: ocask
-description: Delegate analytical review and audit work to DeepSeek V4 Pro. Use when the user wants a code review, architecture audit, security analysis, TDD check, or maintainability assessment. Also use for heavy read/analysis work. Invoke via /ocask or when the task requires deep analytical scrutiny.
+description: Delegate analytical review and audit work to DeepSeek V4 Pro. Use when the user wants a code review, architecture audit, security analysis, TDD check, maintainability assessment, deep-module audit, or heavy read/analysis. Also use for checking provider health (doctor), diagnosing failures (diagnose), viewing pricing (pricing), or checking cumulative spend (cost). Invoke via /ocask or when the task requires deep analytical scrutiny.
 user-invocable: true
 ---
 
@@ -8,8 +8,8 @@ user-invocable: true
 
 ## Rule
 
-One canonical ocask binary: `/home/soultransit/devtony/opencode-verify/ocask.mjs`
-(or the installed `ocask` on PATH). Do not inline `opencode run` commands;
+One canonical ocask binary: `ocask` on PATH, or `/home/soultransit/devtony/opencode-verify/ocask.mjs`,
+or `node ~/ocask/ocask.mjs`. Do not inline `opencode run` commands;
 use `ocask` for all DeepSeek/Qwen analytical delegation.
 
 The host (Claude) owns scope, prompt, evidence collection, and verdict interpretation.
@@ -137,6 +137,49 @@ Prefer the native API provider (`--provider deepseek`) for fastest response.
 - Do not pipe secrets, credentials, or `.env` contents into ocask prompts.
 - Do not use ocask for trivial lookups the host can answer directly.
 
+## Operations: doctor, diagnose, cost, pricing
+
+ocask logs every invocation to `~/.local/share/ocask/log.jsonl`. The host can
+inspect the log to surface provider health issues, cost, or failure patterns.
+
+### Doctor — provider health dashboard
+
+```bash
+ocask doctor
+```
+
+Returns JSON with: provider success rates, avg latency, error breakdown,
+flake detection (intermittent failures that recover on retry), and
+actionable suggestions.
+
+When to run: after a failed review, or periodically to check provider health.
+The host should relay any high-severity suggestions to the user (e.g.
+"Qwen has 40% error rate — consider removing from fallback chain").
+
+### Diagnose — root cause for a specific run
+
+```bash
+ocask diagnose --run-id <id>
+```
+
+Returns: full attempt chain, fallback history, event timeline, and inferred
+root cause. Use when a review fails and the user asks "what happened?"
+
+### Cost — cumulative or per-run spend
+
+```bash
+ocask cost                # all-time spend across all runs
+ocask cost --run-id <id>  # per-run breakdown
+ocask cost --refresh      # with live pricing from provider APIs
+```
+
+### Pricing — current rates
+
+```bash
+ocask pricing             # table of all models
+ocask pricing --refresh   # fetch latest from api.deepseek.com
+```
+
 ## Model-Flow Integration
 
 In the multi-model pipeline, ocask is the analytical channel:
@@ -159,10 +202,3 @@ Host (Claude)                    ocask (DeepSeek)
 
 For crucial work, the model-flow `review plan` and `review final` phases
 automatically invoke ocask with `--no-fallback` for the mandatory DeepSeek gate.
-
-## Observability
-
-Ask Claude to run `ocask doctor` to check provider health, `ocask cost` for
-cumulative spend, or `ocask diagnose --run-id <id>` after a failed review.
-The host should relay the doctor's suggestions (flake detection, error patterns,
-high-latency warnings) to the user.
