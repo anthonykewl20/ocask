@@ -265,6 +265,28 @@ export function validateAssistantOutput(raw, { jsonMode = false, requireVerdict 
   return trimmed;
 }
 
+// ── VERDICT EXTRACTION ──
+// Pull an APPROVED/WARNING/BLOCKED verdict out of model output. Handles BOTH the
+// prose `VERDICT: <X>` line (text mode) and a JSON object's `.verdict` field
+// (jsonMode), so a verdict reached via either response contract is first-class.
+// Returns null when no verdict is present (e.g. freeform analysis).
+export function extractVerdict(output) {
+  if (output && typeof output === 'object' && !Array.isArray(output)) {
+    const v = typeof output.verdict === 'string' ? output.verdict.trim() : '';
+    return /^(APPROVED|WARNING|BLOCKED)$/i.test(v) ? v.toUpperCase() : null;
+  }
+  const text = typeof output === 'string' ? output : '';
+  return (text.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase() || null;
+}
+
+// Attach the four-way contract fields to a runAsk success envelope. The verdict is
+// derived from the ACTUAL output being returned so it can never drift from what the
+// caller observes; the classification is the judgment taxonomy for that verdict.
+function withContract(envelope) {
+  const verdict = extractVerdict(envelope.output);
+  return { ...envelope, verdict, classification: verdict ? classifyFailure(null, { verdict }) : null };
+}
+
 // ── FILE / STDIN INPUT ──
 function shouldTryAsPath(source) { return !source.includes('\n') && !source.includes('\r') && Buffer.byteLength(source) <= MAX_PLAUSIBLE_PATH_LENGTH; }
 
@@ -333,8 +355,7 @@ export async function runAsk({
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
       const out = validateAssistantOutput(raw, options);
       const outBytes = Buffer.byteLength(typeof out === 'string' ? out : JSON.stringify(out), 'utf8');
-      const localVerdict = ((typeof out === 'string' ? out : JSON.stringify(out))
-        .match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase() || null;
+      const localVerdict = extractVerdict(out);
       // A judgment exists only when this attempt demonstrably produced a verdict.
       const successClass = localVerdict
         ? classifyFailure(null, { verdict: localVerdict })
@@ -392,9 +413,9 @@ export async function runAsk({
   }
   metadata.exit_code = 0; metadata.duration_ms = Date.now() - runStarted;
 
-  // Extract primary verdict
+  // Extract primary verdict (object-aware: works for jsonMode `.verdict` too)
   const primaryOutput = typeof result.output === 'string' ? result.output : JSON.stringify(result.output);
-  const primaryVerdict = (primaryOutput.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase();
+  const primaryVerdict = extractVerdict(result.output);
   if (primaryVerdict) {
     await logVerdict({ verdict: primaryVerdict, model: result.model, provider, lens, durationMs: metadata.duration_ms, briefRationale: primaryOutput.slice(0, 200) });
   }
@@ -464,12 +485,12 @@ export async function runAsk({
             `${buddyModel} (buddy): ${buddyVerdict}`,
             buddyOutput.slice(0, 400),
           ].join('\n');
-          return { ...result, output: combinedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: false } };
+          return withContract({ ...result, output: combinedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: false } });
         }
 
         // Agreement — note buddy concurrence
         const agreedOutput = jsonMode ? result.output : `${result.output}\n\n→ Buddy ${buddyModel} CONCURS: ${buddyVerdict}`;
-        return { ...result, output: agreedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: true } };
+        return withContract({ ...result, output: agreedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: true } });
       }
     } catch {
       // Buddy check failed — don't block, just note
@@ -477,7 +498,7 @@ export async function runAsk({
     }
   }
 
-  return { ...result, metadata, run_id: runId };
+  return withContract({ ...result, metadata, run_id: runId });
 }
 
 // ── ATOMIC METADATA WRITE ──
@@ -490,6 +511,70 @@ async function writeAtomicPrivate(target, text) {
   try { await fh.writeFile(text); await fh.sync(); } finally { await fh.close(); }
   await fs.rename(tmp, parsed);
   await fs.chmod(parsed, 0o600);
+}
+
+// ── FOUR-WAY CALLER CONTRACT (#11) ──
+// ocask exposes FOUR outcomes and signals each BOTH via the process exit code AND
+// a self-describing --json stdout object (redundant agreeing signals). Exit 0 is
+// reserved for a positively-produced, parseable verdict — never for a failure, an
+// empty/unparseable result, or a thrown run. Bands avoid shell-reserved codes
+// (2, 126, 127, 128, 130).
+//   APPROVED  -> exit 0
+//   WARNING   -> exit 0   (proceed; told apart from APPROVED only via the JSON verdict)
+//   BLOCKED   -> exit 20   (a rendered "no" is NOT "could not judge")
+//   no-judgment (any infra/failure/could-not-judge) -> exit 30
+export const EXIT_CODE = Object.freeze({ APPROVED: 0, WARNING: 0, BLOCKED: 20, NO_JUDGMENT: 30 });
+
+// Map a produced outcome to its exit-code band. The ONLY routes to exit 0 are a
+// real verdict (APPROVED/WARNING) or a freeform success that simply was not asked
+// to judge (failed=false, no verdict). A thrown/failed run with no verdict is
+// no-judgment -> 30. BLOCKED is its own band, distinct from 30.
+export function exitCodeForOutcome({ verdict, failed = false }) {
+  if (verdict === 'BLOCKED') return EXIT_CODE.BLOCKED;
+  if (verdict === 'APPROVED' || verdict === 'WARNING') return EXIT_CODE.APPROVED;
+  return failed ? EXIT_CODE.NO_JUDGMENT : 0;
+}
+
+// Build the full outcome descriptor from which BOTH the exit code and the --json
+// object are derived (single source of truth → guaranteed agreement). reason/
+// locus/mechanism describe WHY there is no judgment, so they come from
+// classifyFailure(error) on a failure and stay null otherwise.
+// NOTE on the three non-BLOCKED labels: a real verdict is "judgment"; a FAILURE is
+// "no-judgment" (exit 30); a freeform success (no --require-verdict, no verdict, did
+// not fail) is "analysis" with verdict:null and exit 0. Keeping freeform as its own
+// label reserves "no-judgment" strictly for failures, so a caller never observes the
+// contradictory pair outcome:"no-judgment" with exit 0.
+export function describeOutcome({ verdict, output = null, classification = null, failed = false }) {
+  const v = (verdict === 'APPROVED' || verdict === 'WARNING' || verdict === 'BLOCKED') ? verdict : null;
+  const reason = failed ? (classification?.subclass ?? null) : null;
+  const locus = failed ? (classification?.locus ?? null) : null;
+  const mechanism = failed ? (classification?.mechanism ?? null) : null;
+  return {
+    outcome: v ? 'judgment' : (failed ? 'no-judgment' : 'analysis'),
+    verdict: v,
+    reason,
+    locus,
+    mechanism,
+    exit_code: exitCodeForOutcome({ verdict: v, failed }),
+    output,
+  };
+}
+
+// Render the self-describing --json stdout object. The machine fields
+// (outcome/verdict/reason/locus/mechanism/exit_code) are first-class so a caller
+// that never sees stderr still gets the full outcome; the human model text rides
+// under "output" so nothing is lost. exit_code always equals the process exit
+// code (redundant agreeing signal).
+export function buildJsonResponse(descriptor) {
+  return {
+    outcome: descriptor.outcome,
+    verdict: descriptor.verdict,
+    reason: descriptor.reason,
+    locus: descriptor.locus,
+    mechanism: descriptor.mechanism,
+    exit_code: descriptor.exit_code,
+    output: descriptor.output ?? null,
+  };
 }
 
 // ── MAIN ENTRY POINT ──
@@ -531,7 +616,8 @@ export async function runMain(
       args.context ? readExistingPathOrLiteral(args.context, stdin) : Promise.resolve(''),
     ]);
 
-    const result = await runAsk({
+    const runAskFn = providedRunAsk || runAsk;
+    const result = await runAskFn({
       model: args.model, taskText, systemText, contextText,
       jsonMode: args.json === true, requireVerdict: args['require-verdict'] === true,
       noFallback, crossVerify: args['cross-verify'] === true,
@@ -540,15 +626,34 @@ export async function runMain(
     });
 
     if (args.metadata) await writeAtomicPrivate(args.metadata, JSON.stringify(result.metadata || {}) + '\n');
-    writeStdout(args.json ? JSON.stringify(result.output) : result.output);
+
+    // Four-way caller contract (#11): derive the outcome from the produced verdict
+    // (or freeform success) and set the process exit band. Exit 0 requires a real
+    // verdict; BLOCKED is 20; a no-judgment is 30. The --json object mirrors the band.
+    const humanOutput = typeof result.output === 'string' ? result.output : JSON.stringify(result.output);
+    const descriptor = describeOutcome({
+      verdict: result.verdict || null,
+      output: humanOutput,
+      classification: result.classification || null,
+      failed: false,
+    });
+    process.exitCode = descriptor.exit_code;
+    if (args.json) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
+    else writeStdout(humanOutput);
   } catch (error) {
     const cause = error?.message || 'delegation failed';
-    writeStderr(`ocask error: ${cause}`);
-    if (argv.includes('--json')) writeStdout(JSON.stringify({ error: cause }));
+    // A throw means no usable verdict was produced -> no-judgment (exit 30; NEVER 0
+    // or 1). Derive reason/locus/mechanism from classifyFailure(error) (it unwraps
+    // the factory wrapper to the true mechanism) so a --json caller sees the full
+    // outcome without stderr. Applies to provider failures AND usage/arg throws.
+    const classification = classifyFailure(error);
+    const descriptor = describeOutcome({ verdict: null, output: null, classification, failed: true });
+    process.exitCode = descriptor.exit_code;
+    writeStderr(`ocask error: ${cause}`); // human line retained for non-json callers
+    if (argv.includes('--json')) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
     if (args?.metadata && error?.ocaskMetadata) {
       await writeAtomicPrivate(args.metadata, JSON.stringify(error.ocaskMetadata) + '\n').catch(() => {});
     }
-    process.exitCode = 1;
   }
 }
 

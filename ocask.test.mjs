@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   buildPrompt,
+  buildJsonResponse,
   defaultFallbackModel,
+  describeOutcome,
+  exitCodeForOutcome,
   extractJsonObject,
+  extractVerdict,
   guardAllowedModels,
   parseArgs,
   parseOpenCodeJsonl,
@@ -153,17 +157,21 @@ test('inline literals bypass stat, paths resolved', async () => {
 });
 
 // ── runMain validation gates (tested before provider invocation) ──
+// #11 contract: a usage/arg throw is a no-judgment -> exit band 30 (was exit 1).
+// The human stderr line is still emitted; the band simply moved from 1 to 30.
 test('runMain rejects unknown flag', async () => {
   const stderr = []; const prev = process.exitCode;
   await runMain(['--model', QWEN_MODEL, '--task', 'test', '--bogus'], () => {}, (l) => stderr.push(l));
   assert.match(stderr.join(''), /Unknown option/);
+  assert.equal(process.exitCode, 30, 'usage throw is no-judgment band 30, not 1');
   process.exitCode = prev;
 });
 
 test('runMain rejects missing model or task', async () => {
   const stderr = []; const prev = process.exitCode;
   await runMain(['--model', QWEN_MODEL], () => {}, (l) => stderr.push(l));
-  assert.ok(stderr.join('').includes('Usage') || process.exitCode === 1);
+  assert.ok(stderr.join('').includes('Usage'));
+  assert.equal(process.exitCode, 30, 'usage throw is no-judgment band 30, not 1');
   process.exitCode = prev;
 });
 
@@ -379,4 +387,198 @@ test('logAttemptResult writes the full failure-record taxonomy to the log', asyn
     else process.env.XDG_DATA_HOME = prevXdg;
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+// ── Four-way caller contract (#11) ──
+// ocask signals FOUR outcomes redundantly via exit code AND a self-describing
+// --json object. The pure helpers are unit-tested directly; the end-to-end main()
+// mapping is exercised through an injected runAsk (7th param) so no provider is
+// hit. exit 0 requires a real verdict; BLOCKED is 20; no-judgment is 30.
+
+test('extractVerdict reads prose VERDICT lines and JSON object .verdict', () => {
+  assert.equal(extractVerdict('VERDICT: APPROVED\n\nok'), 'APPROVED');
+  assert.equal(extractVerdict('VERDICT: WARNING'), 'WARNING');
+  assert.equal(extractVerdict('VERDICT: BLOCKED.'), 'BLOCKED');
+  assert.equal(extractVerdict('no verdict here'), null);
+  assert.equal(extractVerdict(''), null);
+  // jsonMode object form
+  assert.equal(extractVerdict({ verdict: 'BLOCKED', reason: 'x' }), 'BLOCKED');
+  assert.equal(extractVerdict({ verdict: 'approved' }), 'APPROVED'); // case-insensitive
+  assert.equal(extractVerdict({ verdict: 'MAYBE' }), null);
+  assert.equal(extractVerdict({}), null);
+});
+
+test('exitCodeForOutcome: APPROVED/WARNING -> 0, BLOCKED -> 20, failure -> 30, freeform -> 0', () => {
+  assert.equal(exitCodeForOutcome({ verdict: 'APPROVED' }), 0);
+  assert.equal(exitCodeForOutcome({ verdict: 'WARNING' }), 0);
+  assert.equal(exitCodeForOutcome({ verdict: 'BLOCKED' }), 20);
+  assert.equal(exitCodeForOutcome({ verdict: null, failed: true }), 30);
+  // Freeform success (no verdict requested, but the run succeeded) stays exit 0.
+  assert.equal(exitCodeForOutcome({ verdict: null, failed: false }), 0);
+  // Reserved shell codes are never produced.
+  for (const v of ['APPROVED', 'WARNING', 'BLOCKED']) {
+    const code = exitCodeForOutcome({ verdict: v });
+    assert.ok(![2, 126, 127, 128, 130].includes(code));
+  }
+});
+
+test('describeOutcome: judgment vs freeform vs failure', () => {
+  // Judgment: verdict set, no failure reason.
+  const j = describeOutcome({ verdict: 'APPROVED', output: 'VERDICT: APPROVED', failed: false });
+  assert.equal(j.outcome, 'judgment');
+  assert.equal(j.verdict, 'APPROVED');
+  assert.equal(j.reason, null);
+  assert.equal(j.locus, null);
+  assert.equal(j.mechanism, null);
+  assert.equal(j.exit_code, 0);
+
+  // BLOCKED judgment: its own band.
+  const b = describeOutcome({ verdict: 'BLOCKED', output: 'x', failed: false });
+  assert.equal(b.outcome, 'judgment');
+  assert.equal(b.verdict, 'BLOCKED');
+  assert.equal(b.exit_code, 20);
+
+  // Freeform success (no verdict, did NOT fail) -> "analysis" outcome, exit 0.
+  const f = describeOutcome({ verdict: null, output: 'analysis text', failed: false });
+  assert.equal(f.outcome, 'analysis', 'freeform success is analysis, never no-judgment');
+  assert.equal(f.verdict, null);
+  assert.equal(f.reason, null, 'freeform has no failure reason');
+  assert.equal(f.exit_code, 0);
+
+  // Failure -> no-judgment, exit 30, reason/locus/mechanism from classifyFailure.
+  const fail = describeOutcome({
+    verdict: null, output: null, failed: true,
+    classification: { subclass: 'reply-absent', locus: 'our-side', mechanism: 'AUTH_FAILURE' },
+  });
+  assert.equal(fail.outcome, 'no-judgment');
+  assert.equal(fail.verdict, null);
+  assert.equal(fail.reason, 'reply-absent');
+  assert.equal(fail.locus, 'our-side');
+  assert.equal(fail.mechanism, 'AUTH_FAILURE');
+  assert.equal(fail.exit_code, 30);
+});
+
+test('buildJsonResponse: first-class machine fields + output, exit_code agrees with band', () => {
+  const d = describeOutcome({ verdict: 'BLOCKED', output: 'VERDICT: BLOCKED\nfix me', failed: false });
+  const json = buildJsonResponse(d);
+  // Machine fields are first-class, in the contract's documented order.
+  assert.deepEqual(Object.keys(json),
+    ['outcome', 'verdict', 'reason', 'locus', 'mechanism', 'exit_code', 'output']);
+  assert.equal(json.outcome, 'judgment');
+  assert.equal(json.verdict, 'BLOCKED');
+  assert.equal(json.reason, null);
+  assert.equal(json.exit_code, 20);
+  assert.equal(json.output, 'VERDICT: BLOCKED\nfix me');
+  // Redundant agreeing signal: JSON exit_code == process exit band.
+  assert.equal(json.exit_code, d.exit_code);
+});
+
+// A runAsk fake shaped exactly like the real success envelope: output + verdict +
+// classification + metadata + run_id. main() never calls a provider.
+function fakeJudgment(verdict, text) {
+  return async () => ({
+    output: text, model: QWEN_MODEL, verdict,
+    classification: { class: 'judgment', subclass: null, locus: null, mechanism: null },
+    metadata: {}, run_id: 'fake',
+  });
+}
+
+async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }) {
+  const prev = process.exitCode;
+  await runMain(argv,
+    (l) => capture.stdout.push(l), (l) => capture.stderr.push(l),
+    process.stdin, process.cwd(), process.env, fakeRunAsk);
+  const out = capture.stdout.join('');
+  const restored = process.exitCode;
+  process.exitCode = prev;
+  return { exitCode: restored, stdout: out, stderr: capture.stderr.join('') };
+}
+
+test('main(): APPROVED verdict -> exit 0 + verdict in json', async () => {
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    fakeJudgment('APPROVED', 'VERDICT: APPROVED\n\nLooks good.'));
+  const obj = JSON.parse(stdout);
+  assert.equal(exitCode, 0);
+  assert.equal(obj.outcome, 'judgment');
+  assert.equal(obj.verdict, 'APPROVED');
+  assert.equal(obj.exit_code, 0);
+});
+
+test('main(): WARNING verdict -> exit 0 (proceed), distinguished only in json verdict', async () => {
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    fakeJudgment('WARNING', 'VERDICT: WARNING\n\nMinor issue.'));
+  const obj = JSON.parse(stdout);
+  assert.equal(exitCode, 0);
+  assert.equal(obj.verdict, 'WARNING');
+  assert.equal(obj.exit_code, 0);
+});
+
+test('main(): BLOCKED verdict -> exit 20', async () => {
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    fakeJudgment('BLOCKED', 'VERDICT: BLOCKED\n\nMust fix.'));
+  const obj = JSON.parse(stdout);
+  assert.equal(exitCode, 20);
+  assert.equal(obj.verdict, 'BLOCKED');
+  assert.equal(obj.exit_code, 20);
+});
+
+test('main(): non-json BLOCKED still prints the human text and exits 20', async () => {
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict'],
+    fakeJudgment('BLOCKED', 'VERDICT: BLOCKED\n\nMust fix.'));
+  assert.equal(exitCode, 20);
+  assert.match(stdout, /VERDICT: BLOCKED/);
+});
+
+test('main(): forced AUTH_FAILURE -> exit 30, verdict:null, reason/locus/mechanism set', async () => {
+  const authError = Object.assign(
+    new ProviderError('DEEPSEEK_API_KEY not set', 'AUTH_FAILURE'),
+    { code: 'AUTH_FAILURE', provider: 'deepseek' },
+  );
+  const { exitCode, stdout, stderr } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    async () => { throw authError; });
+  const obj = JSON.parse(stdout);
+  assert.equal(exitCode, 30);
+  assert.equal(obj.outcome, 'no-judgment');
+  assert.equal(obj.verdict, null);
+  assert.equal(obj.reason, 'reply-absent');
+  assert.equal(obj.locus, 'our-side');
+  assert.equal(obj.mechanism, 'AUTH_FAILURE');
+  assert.equal(obj.exit_code, 30);
+  // Human stderr line is still emitted for non-json callers.
+  assert.match(stderr, /ocask error:/);
+});
+
+test('main(): a no-judgment run never exits 0 and never emits a non-null verdict', async () => {
+  const timeoutError = Object.assign(
+    new ProviderError('timed out', 'TIMEOUT'),
+    { code: 'TIMEOUT', provider: 'deepseek' },
+  );
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    async () => { throw timeoutError; });
+  const obj = JSON.parse(stdout);
+  assert.notEqual(exitCode, 0, 'no-judgment must never exit 0');
+  assert.equal(exitCode, 30);
+  assert.equal(obj.verdict, null, 'no-judgment must never carry a verdict');
+  assert.equal(obj.outcome, 'no-judgment');
+});
+
+test('main(): freeform success (no --require-verdict) -> exit 0, verdict:null, not a judgment', async () => {
+  const freeform = async () => ({
+    output: 'Here is the analysis.', model: QWEN_MODEL, verdict: null,
+    classification: null, metadata: {}, run_id: 'fake',
+  });
+  const { exitCode, stdout } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--json'], freeform);
+  const obj = JSON.parse(stdout);
+  assert.equal(exitCode, 0, 'freeform success did not fail -> exit 0');
+  assert.equal(obj.outcome, 'analysis', 'freeform success is analysis (exit 0), never no-judgment');
+  assert.equal(obj.verdict, null);
+  assert.equal(obj.exit_code, 0);
+  assert.equal(obj.reason, null);
 });
