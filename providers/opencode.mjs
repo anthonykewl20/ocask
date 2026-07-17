@@ -337,7 +337,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       env: childEnv,
       timeoutMs,
     });
-    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model };
+    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: null };
   } catch (error) {
     if (error?.code === 'TIMEOUT') throw makeError(`opencode timed out after ${timeoutMs}ms`, 'TIMEOUT');
     if (error?.code === 'PROCESS_EXIT') throw makeError('opencode CLI exited with error', 'PROVIDER_ERROR');

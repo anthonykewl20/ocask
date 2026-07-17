@@ -166,6 +166,39 @@ Two independent layers:
 Use `--no-fallback` for mandatory audit gates where the primary model's
 verdict is the acceptance requirement.
 
+## Observability
+
+ocask logs every invocation to `~/.local/share/ocask/log.jsonl` (JSONL,
+auto-rotates at 10MB). Use these subcommands to inspect:
+
+```bash
+# Provider health, flake detection, error suggestions
+ocask doctor
+
+# Deep-dive a specific run
+ocask diagnose --run-id <id>
+
+# Cumulative cost across all runs
+ocask cost
+
+# Cost of a specific run
+ocask cost --run-id <id>
+
+# Cost with refreshed pricing from provider APIs
+ocask cost --refresh
+
+# Current pricing table
+ocask pricing
+
+# Fetch latest pricing from providers
+ocask pricing --refresh
+```
+
+Each invocation logs: model, provider, lens, attempt chain (which providers
+tried, what errors, durations), token usage, verdict, and root cause for
+failures. The doctor detects flakes (intermittent failures that recover on
+retry), high-latency providers, and auth/rate-limit patterns.
+
 ## Configuration
 
 | Env var | Provider | Purpose |

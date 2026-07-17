@@ -139,7 +139,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       const stdout = JSON.stringify([
         { type: 'text', timestamp: Date.now(), part: { type: 'text', text: outputText } },
       ]);
-      return { stdout, stderr: '', provider: 'qwen', model_used: apiModelId };
+      return { stdout, stderr: '', provider: 'qwen', model_used: apiModelId, tokensUsed: { input: 0, output: 0, total: 0 } };
     }
     throw Object.assign(new ProviderError('Qwen returned empty response content', 'MALFORMED_RESPONSE'), { code: 'MALFORMED_RESPONSE' });
   }
@@ -151,5 +151,8 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
   const usage = body.usage || {};
   const stderr = `[Qwen API] tokens: ${usage.prompt_tokens || 0} in / ${usage.completion_tokens || 0} out / ${usage.total_tokens || 0} total`;
 
-  return { stdout, stderr, provider: 'qwen', model_used: apiModelId };
+  return {
+    stdout, stderr, provider: 'qwen', model_used: apiModelId,
+    tokensUsed: { input: usage.input_tokens || usage.prompt_tokens || 0, output: usage.output_tokens || usage.completion_tokens || 0, total: usage.total_tokens || 0 },
+  };
 }

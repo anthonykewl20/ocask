@@ -5,11 +5,12 @@
 
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
-import fsSync from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { isPaidModelAllowed, PAID_MODELS } from './ocverify.mjs';
 import { invokeWithFallback, ProviderError, modelFamily, availableProviders, defaultProvider } from './providers/factory.mjs';
+import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
+  logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun } from './logging.mjs';
+import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
 
 const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 
@@ -302,6 +303,8 @@ export async function runAsk({
   lens = 'general', temperature = 0, maxTokens, timeoutMs = 0,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
 }) {
+  const runId = makeRunId();
+  startRun(runId);
   parseTemperature(String(temperature));
   guardAllowedModels({ model, fallbackModel });
 
@@ -313,46 +316,76 @@ export async function runAsk({
   const runStarted = Date.now();
   const metadata = { requested_model: model, actual_model: null, no_fallback: Boolean(noFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'), output_bytes: null, attempts: [], exit_code: null, fallback_used: false };
 
-  const timeAttempt = async (askModel, prompt) => {
+  await logRunStart({
+    model, lens, provider, promptHash: randomBytes(8).toString('hex'),
+    inputBytes: metadata.input_bytes, timeoutMs,
+  });
+
+  let attemptIndex = 0;
+  const timeAttempt = async (askModel, prompt, isFallback = false) => {
+    const attemptIdx = attemptIndex++;
     const t0 = Date.now();
     try {
+      if (isFallback) {
+        await logFallback({ fromModel: model, toModel: askModel, fromProvider: provider || defaultProvider(model), toProvider: provider || defaultProvider(askModel), reason: 'malformed_output' });
+      }
       const result = await invokeWithFallback({
         model: askModel, prompt: DELEGATED_IDENTITY_PREFIX + prompt,
-        timeoutMs, env, cwd, preferredProvider: provider, noFallback: true, // no provider-level fallback on first attempt
+        timeoutMs, env, cwd, preferredProvider: provider, noFallback: true,
       });
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
       const out = validateAssistantOutput(raw, options);
-      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'success', reason_code: 'ok', fallback: askModel !== model, provider: result.provider });
-      metadata.output_bytes = Buffer.byteLength(typeof out === 'string' ? out : JSON.stringify(out), 'utf8');
+      const outBytes = Buffer.byteLength(typeof out === 'string' ? out : JSON.stringify(out), 'utf8');
+      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'success', reason_code: 'ok', fallback: isFallback, provider: result.provider });
+      metadata.output_bytes = outBytes;
+      await logAttemptResult({
+        provider: result.provider || 'unknown', model: askModel, attemptIndex: attemptIdx,
+        outcome: 'success', durationMs: Date.now() - t0, reasonCode: 'ok',
+        outputBytes: outBytes, tokensUsed: result.tokensUsed || null,
+      });
       return out;
     } catch (error) {
-      error.ocaskAttempt = { model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: reasonCodeFor(error), fallback: askModel !== model };
+      const code = reasonCodeFor(error);
+      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback });
+      await logAttemptResult({
+        provider: error?.provider || provider || 'unknown', model: askModel, attemptIndex: attemptIdx,
+        outcome: 'failed', durationMs: Date.now() - t0, reasonCode: code,
+        outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
+      });
       throw error;
     }
   };
 
   let result;
   try {
-    const out = await timeAttempt(model, originalPrompt);
+    const out = await timeAttempt(model, originalPrompt, false);
     result = { ok: true, output: out, model }; metadata.actual_model = model;
   } catch (primaryError) {
-    metadata.attempts.push(primaryError.ocaskAttempt || { model, duration_ms: Date.now() - runStarted, outcome: 'failed', reason_code: reasonCodeFor(primaryError), fallback: false });
     metadata.actual_model = model;
     if (!selectedFallback || !isFallbackEligible(primaryError)) {
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
+      await logError({ model, provider, errorCode: reasonCodeFor(primaryError), errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
     try {
-      const fbOut = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(primaryError)}`);
+      const fbOut = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(primaryError)}`, true);
       result = { ok: true, output: fbOut, model: selectedFallback }; metadata.actual_model = selectedFallback; metadata.fallback_used = true;
     } catch (fbError) {
-      metadata.attempts.push(fbError.ocaskAttempt || { model: selectedFallback, duration_ms: 0, outcome: 'failed', reason_code: reasonCodeFor(fbError), fallback: true });
       metadata.actual_model = selectedFallback; metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
+      await logError({ model: selectedFallback, provider, errorCode: reasonCodeFor(fbError), errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms });
       fbError.ocaskMetadata = metadata; throw fbError;
     }
   }
   metadata.exit_code = 0; metadata.duration_ms = Date.now() - runStarted;
-  return { ...result, metadata };
+
+  // Log verdict
+  const verdictMatch = (typeof result.output === 'string' ? result.output : JSON.stringify(result.output))
+    .match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i);
+  if (verdictMatch) {
+    await logVerdict({ verdict: verdictMatch[1].toUpperCase(), model: result.model, provider, lens, durationMs: metadata.duration_ms, briefRationale: String(result.output).slice(0, 200) });
+  }
+
+  return { ...result, metadata, run_id: runId };
 }
 
 // ── ATOMIC METADATA WRITE ──
@@ -427,5 +460,79 @@ export async function runMain(
   }
 }
 
-async function main() { await runMain(); }
+async function main() {
+  const argv = process.argv.slice(2);
+  const subcommand = argv[0];
+
+  if (subcommand === 'doctor') {
+    const report = await doctorReport();
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  if (subcommand === 'diagnose') {
+    const runIdIdx = argv.indexOf('--run-id');
+    const runId = runIdIdx >= 0 ? argv[runIdIdx + 1] : null;
+    if (!runId) { console.error('Usage: ocask diagnose --run-id <id>'); process.exitCode = 1; return; }
+    const diag = await diagnoseRun(runId);
+    console.log(JSON.stringify(diag, null, 2));
+    return;
+  }
+
+  if (subcommand === 'cost') {
+    const refreshFlag = argv.includes('--refresh');
+    const runIdIdx = argv.indexOf('--run-id');
+    const runId = runIdIdx >= 0 ? argv[runIdIdx + 1] : null;
+    const pricing = await getPricing(refreshFlag);
+
+    if (runId) {
+      const diag = await diagnoseRun(runId);
+      if (diag.status === 'not_found') { console.error(`Run ${runId} not found in log.`); process.exitCode = 1; return; }
+      const tokens = diag.attempts?.filter(a => a.outcome === 'success') || [];
+      let totalIn = 0, totalOut = 0;
+      for (const a of tokens) {
+        const t = a.tokens || {};
+        totalIn += t.input || 0;
+        totalOut += t.output || 0;
+      }
+      const cost = calculateCost(totalIn, totalOut, diag.model, pricing);
+      console.log(formatCost(cost));
+      return;
+    }
+
+    const entries = await readLog();
+    const summary = await cumulativeCost(pricing, entries);
+    console.log(formatCumulativeCost(summary));
+    return;
+  }
+
+  if (subcommand === 'pricing') {
+    const refreshFlag = argv.includes('--refresh');
+    const pricing = await getPricing(refreshFlag);
+    console.log(formatPricingTable(pricing));
+    return;
+  }
+
+  if (subcommand === 'help' || subcommand === '--help' || subcommand === '-h') {
+    console.log(`ocask v0.1 — OpenCode Analytical Scrutiny Kit
+
+Subcommands:
+  ocask [args]               Run a review (default)
+  ocask doctor               Provider health, flake detection, error suggestions
+  ocask diagnose --run-id <id>  Deep-dive a specific invocation
+  ocask cost                 Cumulative cost from log
+  ocask cost --run-id <id>   Cost of a specific run
+  ocask cost --refresh       Cost with refreshed pricing
+  ocask pricing              Current pricing table
+  ocask pricing --refresh    Fetch latest pricing from providers
+  ocask help                 This message
+
+Run args:
+  ${USAGE}`);
+    return;
+  }
+
+  // Default: run mode
+  await runMain(argv);
+}
 if (import.meta.url === `file://${process.argv[1]}`) { main(); }

@@ -159,3 +159,10 @@ Host (Claude)                    ocask (DeepSeek)
 
 For crucial work, the model-flow `review plan` and `review final` phases
 automatically invoke ocask with `--no-fallback` for the mandatory DeepSeek gate.
+
+## Observability
+
+Ask Claude to run `ocask doctor` to check provider health, `ocask cost` for
+cumulative spend, or `ocask diagnose --run-id <id>` after a failed review.
+The host should relay the doctor's suggestions (flake detection, error patterns,
+high-latency warnings) to the user.

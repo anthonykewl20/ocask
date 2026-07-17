@@ -119,5 +119,8 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
   const usage = body.usage || {};
   const stderr = `[DeepSeek API] tokens: ${usage.prompt_tokens || 0} in / ${usage.completion_tokens || 0} out / ${usage.total_tokens || 0} total`;
 
-  return { stdout, stderr, provider: 'deepseek', model_used: apiModelId };
+  return {
+    stdout, stderr, provider: 'deepseek', model_used: apiModelId,
+    tokensUsed: { input: usage.prompt_tokens || 0, output: usage.completion_tokens || 0, total: usage.total_tokens || 0 },
+  };
 }
