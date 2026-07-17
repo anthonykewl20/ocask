@@ -18,18 +18,18 @@ while reserving its own tokens for orchestration only.
 ```bash
 git clone https://github.com/anthonykewl20/ocask.git
 cd ocask
-chmod +x ocask.mjs
+./install.sh
+```
 
-# Symlink to PATH
-ln -s "$(pwd)/ocask.mjs" ~/.local/bin/ocask
+The installer handles: CLI symlink, Claude Code skill (`/ocask`), OpenCode
+slash command, and provider auth check. Re-run any time to refresh.
 
-# Install Claude Code skill (enables /ocask slash command)
-mkdir -p ~/.claude/skills/ocask
-cp skill/SKILL.md ~/.claude/skills/ocask/
+### Manual install
 
-# Install OpenCode command
-mkdir -p ~/.config/opencode/commands
-cp commands/ocask.md ~/.config/opencode/commands/
+```bash
+ln -s "$(pwd)/ocask.mjs" ~/.local/bin/ocask                               # CLI
+mkdir -p ~/.claude/skills/ocask && cp skill/SKILL.md ~/.claude/skills/ocask/  # skill
+mkdir -p ~/.config/opencode/commands && cp commands/ocask.md ~/.config/opencode/commands/  # command
 ```
 
 ### Auth setup per provider
