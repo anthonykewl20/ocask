@@ -22,6 +22,14 @@ chmod +x ocask.mjs
 
 # Symlink to PATH
 ln -s "$(pwd)/ocask.mjs" ~/.local/bin/ocask
+
+# Install Claude Code skill (enables /ocask slash command)
+mkdir -p ~/.claude/skills/ocask
+cp skill/SKILL.md ~/.claude/skills/ocask/
+
+# Install OpenCode command
+mkdir -p ~/.config/opencode/commands
+cp commands/ocask.md ~/.config/opencode/commands/
 ```
 
 ### Auth setup per provider
