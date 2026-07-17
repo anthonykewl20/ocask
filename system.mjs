@@ -12,7 +12,7 @@ const MIN_NODE_MAJOR = 20;
 
 // ── Check runner ──
 async function run(name, fn) {
-  try { const r = await fn(); return { ok: r !== false, name, detail: typeof r === 'string' ? r : (r?.detail || 'ok') }; }
+  try { const r = await fn(); return { ok: r !== false, name, detail: r === false ? 'not configured' : (typeof r === 'string' ? r : (r?.detail || 'ok')) }; }
   catch (e) { return { ok: false, name, detail: e?.message || 'check failed' }; }
 }
 

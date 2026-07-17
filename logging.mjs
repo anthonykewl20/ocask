@@ -190,7 +190,7 @@ export async function doctorReport(options = {}) {
       if (!providerStats[key]) providerStats[key] = { total: 0, success: 0, errors: {}, total_ms: 0, tokens: 0 };
       providerStats[key].total++;
       providerStats[key].total_ms += e.duration_ms || 0;
-      providerStats[key].tokens += e.tokens_used || 0;
+      providerStats[key].tokens += (e.tokens_used?.total || e.tokens_used || 0);
       if (e.outcome === 'success') providerStats[key].success++;
       else {
         const code = e.reason_code || 'unknown';

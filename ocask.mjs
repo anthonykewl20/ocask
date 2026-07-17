@@ -349,7 +349,7 @@ export async function runAsk({
       const code = reasonCodeFor(error);
       metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback });
       await logAttemptResult({
-        provider: error?.provider || provider || 'unknown', model: askModel, attemptIndex: attemptIdx,
+        provider: error?.provider || provider || defaultProvider(model) || 'unknown', model: askModel, attemptIndex: attemptIdx,
         outcome: 'failed', durationMs: Date.now() - t0, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
       });

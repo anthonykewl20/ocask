@@ -109,6 +109,7 @@ export async function invokeWithFallback({
     } catch (error) {
       const duration = Date.now() - started;
       const code = error?.code || 'UNKNOWN';
+      error.provider = error.provider || providerId;
       attempts.push({ provider: providerId, duration_ms: duration, outcome: 'failed', reason_code: code });
       lastError = error;
 
