@@ -4,7 +4,7 @@ description: Delegate analytical review and audit work to DeepSeek V4 Pro. Use w
 user-invocable: true
 ---
 
-# ocask — OpenCode Analytical Scrutiny Kit
+# ocask v0.1 — OpenCode Analytical Scrutiny Kit
 
 ## Rule
 

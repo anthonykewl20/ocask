@@ -58,7 +58,7 @@ Takes raw task text + context + lens and produces a structured prompt
 optimized for analytical reasoning models. Three components:
 
 - **Task body** — user-supplied review target (diff, file paths, question)
-- **Lens framework** — domain-specific audit checklist injected per `--lens` (7 lenses)
+- **Lens framework** — domain-specific audit checklist injected per `--lens` (7 lenses: `code-review`, `architecture`, `security`, `tdd`, `maintainability`, `deep-modules`, `general`)
 - **Execution guidance** — chain-of-thought instruction, evidence inspection, structural simplification
 - **Response contract** — `VERDICT: APPROVED | WARNING | BLOCKED` with structured rationale
 

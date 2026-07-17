@@ -230,11 +230,11 @@ Key files (fallback, read once per invocation):
 
 ```bash
 node --test ocask.test.mjs
+./check.sh         # verify all docs, skill, install are in sync
 ```
 
-23 unit tests: args parsing, prompt building (all 7 lenses), output validation
-(verdict, JSON, numeric), JSONL parsing, extractJsonObject, file/stdin input,
-provider factory classification, and error codes.
+23 unit tests. 88 sync checks across code, architecture doc, README, skill,
+slash command, and installer.
 
 ## License
 
