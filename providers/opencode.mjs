@@ -321,6 +321,16 @@ function extractOpenCodeTokens(stdout) {
   return null;
 }
 
+// Detect silent exhaustion: exit 0 but no usable text output
+function _hasTextEvent(stdout) {
+  if (!stdout) return false;
+  for (const line of stdout.split('\n')) {
+    try { const e = JSON.parse(line); if (e?.type === 'text' && e.part?.type === 'text' && typeof e.part?.text === 'string') return true; }
+    catch { /* skip */ }
+  }
+  return false;
+}
+
 export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, cwd = process.cwd() }) {
   if (!isPaidModelAllowed(model)) throw makeError(`Model ${model} is not allowed`, 'MODEL_NOT_ALLOWED');
 
@@ -354,8 +364,14 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       env: childEnv,
       timeoutMs,
     });
-    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: extractOpenCodeTokens(result.stdout) };
+    const tokens = extractOpenCodeTokens(result.stdout);
+    // Detect silent exhaustion: exit 0 but no usable text output
+    if (!result.stdout || !_hasTextEvent(result.stdout)) {
+      throw makeError(`opencode produced no usable text output (exhausted/quota/empty response). Check OpenCode Go balance at https://opencode.ai/account.`, 'OPencode_EXHAUSTED');
+    }
+    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: tokens };
   } catch (error) {
+    if (error?.code === 'OPencode_EXHAUSTED') throw error;
     if (error?.code === 'TIMEOUT') throw makeError(`opencode timed out after ${timeoutMs}ms`, 'TIMEOUT');
     if (error?.code === 'PROCESS_EXIT') throw makeError('opencode CLI exited with error', 'PROVIDER_ERROR');
     throw error;

@@ -594,6 +594,11 @@ async function main() {
     return;
   }
 
+  if (subcommand === 'version' || subcommand === '--version' || subcommand === '-v') {
+    console.log(`ocask ${CURRENT_VERSION}`);
+    return;
+  }
+
   if (subcommand === 'upgrade') {
     const { checkVersion } = await import('./version.mjs');
     const v = await checkVersion({ force: true });

@@ -294,13 +294,26 @@ function generateSuggestions(providers, flakes, topErrors) {
 
   for (const p of providers) {
     const rate = parseFloat(p.success_rate);
-    // Any failure on a provider → check immediately (not just ≥5)
     if (rate < 50 && p.total >= 1 && p.total - p.success > 0) {
       const codes = Object.keys(p.error_breakdown || {});
-      if (codes.includes('AUTH_FAILURE') || codes.includes('all_exhausted')) {
+      const isAuth = codes.includes('AUTH_FAILURE');
+      const isTimeout = codes.includes('TIMEOUT');
+      const isExhausted = codes.includes('all_exhausted') || codes.includes('OPencode_EXHAUSTED');
+
+      if (isTimeout && p.avg_latency_ms > 20000) {
+        suggestions.push({
+          severity: 'medium',
+          action: `Provider ${p.provider_model}: ${p.total - p.success} timeout(s) at ${p.avg_latency_ms}ms avg. Increase --timeout-ms or check network.`,
+        });
+      } else if (isExhausted && !isAuth) {
         suggestions.push({
           severity: 'high',
-          action: `Provider ${p.provider_model}: ${rate}% success. Auth/config issue detected. Check credentials or use --provider flag to select a working backend.`,
+          action: `Provider ${p.provider_model}: ${p.total - p.success} exhausted/failures. OpenCode Go may be out of credits — check https://opencode.ai/account.`,
+        });
+      } else if (isAuth || isExhausted) {
+        suggestions.push({
+          severity: 'high',
+          action: `Provider ${p.provider_model}: ${rate}% success. Auth/config issue. Check credentials or use --provider flag.`,
         });
       } else if (p.total >= 3) {
         suggestions.push({
@@ -447,7 +460,7 @@ function _inferRootCause(attempts, fallbacks, error, start) {
 
   const codes = [...new Set(failed.map(a => a.reason_code))];
 
-  if (codes.includes('AUTH_FAILURE') || codes.includes('all_exhausted')) {
+  if (codes.includes('AUTH_FAILURE') || codes.includes('all_exhausted') || codes.includes('OPencode_EXHAUSTED')) {
     const missing = failed.find(a => a.provider !== 'unknown' && a.provider !== 'opencode');
     const worksVia = attempts.find(a => a.outcome === 'success');
     if (worksVia) {
