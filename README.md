@@ -1,9 +1,11 @@
-# ocask v0.1
+# ocask v0.1 — OpenCode Analytical Scrutiny Kit
 
 Provider-agnostic review and analysis CLI for paid models. Delegates
 analytical tasks — code review, architecture audit, security analysis,
 TDD compliance, maintainability assessment — to DeepSeek V4 Pro,
 Qwen 3.7, or OpenCode Go through three pluggable backends.
+
+ocask = **O**pen**C**ode **A**nalytical **S**crutiny **K**it.
 
 Designed as the analytical brain for multi-model orchestration pipelines:
 a host (Claude, CI) sends heavy analytical work to DeepSeek via `ocask`
