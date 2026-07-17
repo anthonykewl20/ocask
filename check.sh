@@ -18,8 +18,9 @@ section() { echo ""; echo "$1"; echo "$(printf '%.0s─' $(seq 1 ${#1}))"; }
 
 # ── Core files ──
 section "Core files"
-for f in ocask.mjs logging.mjs pricing.mjs ocverify.mjs README.md \
-         ARCHITECTURE.md install.sh skill/SKILL.md commands/ocask.md \
+for f in ocask.mjs logging.mjs pricing.mjs ocverify.mjs version.mjs system.mjs \
+         README.md ARCHITECTURE.md install.sh check.sh \
+         skill/SKILL.md commands/ocask.md \
          providers/factory.mjs providers/deepseek.mjs \
          providers/qwen.mjs providers/opencode.mjs; do
   file_ok "$REPO/$f" "$f"
@@ -54,7 +55,7 @@ done
 
 # ── Subcommands ──
 section "Subcommands"
-for cmd in doctor diagnose cost pricing help; do
+for cmd in doctor diagnose cost pricing help upgrade; do
   text_ok "ocask.mjs: $cmd"  "$cmd" "$REPO/ocask.mjs"
   text_ok "README.md: $cmd"  "$cmd" "$REPO/README.md"
 done
@@ -66,6 +67,10 @@ text_ok "skill: pricing"  "pricing"  "$REPO/skill/SKILL.md"
 section "Architecture integrity"
 text_ok "imports logging"    "from './logging.mjs'" "$REPO/ocask.mjs"
 text_ok "imports pricing"    "from './pricing.mjs'" "$REPO/ocask.mjs"
+text_ok "imports version"    "from './version.mjs'" "$REPO/ocask.mjs"
+text_ok "has upgrade check"  "ocask upgrade"        "$REPO/ocask.mjs"
+text_ok "system.mjs exports" "systemHealth"          "$REPO/system.mjs"
+text_ok "version.mjs exports" "CURRENT_VERSION"      "$REPO/version.mjs"
 for f in providers/deepseek.mjs providers/qwen.mjs providers/opencode.mjs; do
   text_ok "$f: exports invoke" "export async function invoke" "$REPO/$f"
 done

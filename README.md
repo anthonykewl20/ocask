@@ -204,6 +204,9 @@ ocask pricing
 
 # Fetch latest pricing from providers
 ocask pricing --refresh
+
+# Check for new version
+ocask upgrade
 ```
 
 Each invocation logs: model, provider, lens, attempt chain (which providers

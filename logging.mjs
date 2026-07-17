@@ -167,7 +167,11 @@ export async function readLog(options = {}) {
 
 export async function doctorReport(options = {}) {
   const entries = await readLog(options);
-  if (entries.length === 0) return { status: 'empty', message: 'No log entries found.' };
+  const sysHealth = options.system !== false ? await (async () => {
+    try { const { systemHealth } = await import('./system.mjs'); return await systemHealth(); } catch { return null; }
+  })() : null;
+
+  if (entries.length === 0 && !sysHealth) return { status: 'empty', message: 'No log entries or system data found. Run ocask first.' };
 
   const runs = {};
   const providerStats = {};
@@ -265,6 +269,7 @@ export async function doctorReport(options = {}) {
     flakes: flakes.slice(0, 10),
     top_errors: topErrors,
     suggestions: generateSuggestions(providers, flakes, topErrors),
+    system: sysHealth,
   };
 }
 

@@ -11,6 +11,7 @@ import { invokeWithFallback, ProviderError, modelFamily, availableProviders, def
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
   logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun } from './logging.mjs';
 import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
+import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 
 const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 
@@ -461,12 +462,21 @@ export async function runMain(
 }
 
 async function main() {
+  // Fire-and-forget version check (non-blocking, prints to stderr)
+  notifyUpgrade().catch(() => {});
+
   const argv = process.argv.slice(2);
   const subcommand = argv[0];
 
+  const jsonOutput = argv.includes('--json');
+
   if (subcommand === 'doctor') {
-    const report = await doctorReport();
-    console.log(JSON.stringify(report, null, 2));
+    const report = await doctorReport({ system: true });
+    if (jsonOutput) console.log(JSON.stringify(report));
+    else {
+      console.log(formatDoctor(report));
+      if (report.system) console.log('\n' + (await import('./system.mjs')).formatSystemHealth(report.system));
+    }
     return;
   }
 
@@ -487,29 +497,32 @@ async function main() {
 
     if (runId) {
       const diag = await diagnoseRun(runId);
-      if (diag.status === 'not_found') { console.error(`Run ${runId} not found in log.`); process.exitCode = 1; return; }
+      if (diag.status === 'not_found') { console.error(`Run ${runId} not found.`); process.exitCode = 1; return; }
       const tokens = diag.attempts?.filter(a => a.outcome === 'success') || [];
       let totalIn = 0, totalOut = 0;
-      for (const a of tokens) {
-        const t = a.tokens || {};
-        totalIn += t.input || 0;
-        totalOut += t.output || 0;
-      }
+      for (const a of tokens) { const t = a.tokens || {}; totalIn += t.input || 0; totalOut += t.output || 0; }
       const cost = calculateCost(totalIn, totalOut, diag.model, pricing);
-      console.log(formatCost(cost));
+      console.log(jsonOutput ? JSON.stringify(cost) : formatCost(cost));
       return;
     }
-
     const entries = await readLog();
     const summary = await cumulativeCost(pricing, entries);
-    console.log(formatCumulativeCost(summary));
+    console.log(jsonOutput ? JSON.stringify(summary) : formatCumulativeCost(summary));
     return;
   }
 
   if (subcommand === 'pricing') {
     const refreshFlag = argv.includes('--refresh');
     const pricing = await getPricing(refreshFlag);
-    console.log(formatPricingTable(pricing));
+    console.log(jsonOutput ? JSON.stringify(pricing) : formatPricingTable(pricing));
+    return;
+  }
+
+  if (subcommand === 'upgrade') {
+    const { checkVersion } = await import('./version.mjs');
+    const v = await checkVersion({ force: true });
+    if (v.upgrade) console.log(`Upgrade available: ${v.current} → ${v.latest}\n  git -C ~/ocask pull && ~/ocask/install.sh`);
+    else console.log(`Already at latest: ${v.current}`);
     return;
   }
 
@@ -517,15 +530,13 @@ async function main() {
     console.log(`ocask v0.1 — OpenCode Analytical Scrutiny Kit
 
 Subcommands:
-  ocask [args]               Run a review (default)
-  ocask doctor               Provider health, flake detection, error suggestions
+  ocask [args]                Run a review (default)
+  ocask doctor                Provider health, flake detection, system checks. Use --json for structured output.
   ocask diagnose --run-id <id>  Deep-dive a specific invocation
-  ocask cost                 Cumulative cost from log
-  ocask cost --run-id <id>   Cost of a specific run
-  ocask cost --refresh       Cost with refreshed pricing
-  ocask pricing              Current pricing table
-  ocask pricing --refresh    Fetch latest pricing from providers
-  ocask help                 This message
+  ocask cost [--run-id <id>] [--refresh] [--json]  Cumulative or per-run cost
+  ocask pricing [--refresh] [--json]                Current pricing table
+  ocask upgrade               Check for new version
+  ocask help                  This message
 
 Run args:
   ${USAGE}`);
@@ -534,5 +545,34 @@ Run args:
 
   // Default: run mode
   await runMain(argv);
+}
+
+// ── Doctor text formatter ──
+function formatDoctor(report) {
+  if (report.status === 'empty') return report.message;
+  const lines = [`ocask doctor — ${report.summary.total_runs} runs, ${report.summary.successful} successful`];
+  lines.push('');
+  lines.push('Providers:');
+  for (const p of report.providers || []) {
+    lines.push(`  ${p.provider_model}: ${p.success_rate} success, ${p.avg_latency_ms}ms avg, ${p.total_tokens.toLocaleString()} tokens`);
+    for (const [code, count] of Object.entries(p.error_breakdown || {})) {
+      lines.push(`    ${code}: ${count}`);
+    }
+  }
+  if (report.flakes?.length) {
+    lines.push('');
+    lines.push('Flakes detected:');
+    for (const f of report.flakes) {
+      lines.push(`  ${f.run_id}: ${f.flaky_provider}/${f.flaky_model} → ${f.recovered_by}/${f.recovered_model} (${f.error_code})`);
+    }
+  }
+  if (report.suggestions?.length) {
+    lines.push('');
+    lines.push('Suggestions:');
+    for (const s of report.suggestions) {
+      lines.push(`  [${s.severity}] ${s.action}`);
+    }
+  }
+  return lines.join('\n');
 }
 if (import.meta.url === `file://${process.argv[1]}`) { main(); }
