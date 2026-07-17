@@ -72,11 +72,9 @@ async function checkProviderAuth(provider) {
       return checkKeyFile('.qwen-key', 'Qwen');
     }
     case 'opencode': {
-      try {
-        const bin = await findOnPath('opencode');
-        execSync(`"${bin}" auth status`, { timeout: 5000, stdio: 'pipe' });
-        return 'OpenCode CLI authenticated';
-      } catch { return false; }
+      const bin = await findOnPath('opencode');
+      if (bin) return `OpenCode CLI found at ${bin}`;
+      return false;
     }
     default: return false;
   }

@@ -304,6 +304,23 @@ function runBoundedCommand({ command, args, prompt, cwd, env, timeoutMs, maxOutp
   });
 }
 
+const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
+
+// Extract token usage from opencode JSONL output
+function extractOpenCodeTokens(stdout) {
+  if (!stdout) return null;
+  const lines = stdout.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const e = JSON.parse(lines[i]);
+      if (e.type === 'step_finish' && e.part?.tokens) {
+        return { input: e.part.tokens.input || 0, output: e.part.tokens.output || 0, total: e.part.tokens.total || 0 };
+      }
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
 export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, cwd = process.cwd() }) {
   if (!isPaidModelAllowed(model)) throw makeError(`Model ${model} is not allowed`, 'MODEL_NOT_ALLOWED');
 
@@ -337,7 +354,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       env: childEnv,
       timeoutMs,
     });
-    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: null };
+    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: extractOpenCodeTokens(result.stdout) };
   } catch (error) {
     if (error?.code === 'TIMEOUT') throw makeError(`opencode timed out after ${timeoutMs}ms`, 'TIMEOUT');
     if (error?.code === 'PROCESS_EXIT') throw makeError('opencode CLI exited with error', 'PROVIDER_ERROR');
