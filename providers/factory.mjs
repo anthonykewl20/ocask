@@ -94,8 +94,10 @@ export async function invokeWithFallback({
     let invoke;
     try {
       invoke = await _loadProvider(providerId);
-    } catch {
-      attempts.push({ provider: providerId, duration_ms: 0, outcome: 'skipped', reason_code: 'UNKNOWN_PROVIDER' });
+    } catch (err) {
+      const e = Object.assign(new ProviderError(`Provider ${providerId} unavailable: ${err.message}`, 'PROVIDER_UNAVAILABLE'), { provider: providerId });
+      attempts.push({ provider: providerId, duration_ms: 0, outcome: 'skipped', reason_code: 'PROVIDER_UNAVAILABLE' });
+      lastError = e;
       continue;
     }
 

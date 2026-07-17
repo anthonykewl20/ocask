@@ -16,9 +16,9 @@ import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 
 // ── USAGE ──
-export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
+export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
 
-const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback']);
+const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify']);
 const VALUE_ARGS = new Set([
   'model', 'task', 'system', 'context', 'provider', 'lens',
   'metadata', 'temperature', 'max-tokens', 'timeout-ms', 'fallback-model',
@@ -519,7 +519,8 @@ export async function runMain(
     const result = await runAsk({
       model: args.model, taskText, systemText, contextText,
       jsonMode: args.json === true, requireVerdict: args['require-verdict'] === true,
-      noFallback, lens, provider, temperature, maxTokens, timeoutMs,
+      noFallback, crossVerify: args['cross-verify'] === true,
+      lens, provider, temperature, maxTokens, timeoutMs,
       fallbackModel: args['fallback-model'], cwd, env,
     });
 
@@ -625,28 +626,41 @@ Run args:
 // ── Doctor text formatter ──
 function formatDoctor(report) {
   if (report.status === 'empty') return report.message;
-  const lines = [`ocask doctor — ${report.summary.total_runs} runs, ${report.summary.successful} successful`];
+  const s = report.summary;
+  const lines = [`ocask doctor — ${s.total_runs} runs, ${s.successful} successful, ${s.failed} failed`];
+  if (s.partial_crashes > 0) lines.push(`  ${s.partial_crashes} partial crashes (runs with no verdict/error — check for interrupt/timeout)`);
+  lines.push(`  Verdicts: ${s.verdict_distribution?.APPROVED || 0}A / ${s.verdict_distribution?.WARNING || 0}W / ${s.verdict_distribution?.BLOCKED || 0}B`);
+  lines.push(`  Tokens: ${(s.total_tokens || 0).toLocaleString()} | ${s.date_range}`);
   lines.push('');
+
   lines.push('Providers:');
   for (const p of report.providers || []) {
-    lines.push(`  ${p.provider_model}: ${p.success_rate} success, ${p.avg_latency_ms}ms avg, ${p.total_tokens.toLocaleString()} tokens`);
-    for (const [code, count] of Object.entries(p.error_breakdown || {})) {
-      lines.push(`    ${code}: ${count}`);
-    }
+    lines.push(`  ${p.provider_model}: ${p.success_rate} (${p.success}/${p.total}), ${p.avg_latency_ms}ms avg, ${(p.total_tokens || 0).toLocaleString()} tokens`);
+    for (const [code, count] of Object.entries(p.error_breakdown || {})) lines.push(`    ${code}: ${count}`);
   }
+
+  if (report.models?.length) {
+    lines.push('');
+    lines.push('Models:');
+    for (const m of report.models) lines.push(`  ${m.model}: ${m.success_rate} (${m.success}/${m.total}), ${m.avg_latency_ms}ms avg`);
+  }
+
+  if (report.trend?.length > 1) {
+    lines.push('');
+    lines.push('Trend:');
+    for (const d of report.trend) lines.push(`  ${d.date}: ${d.success_rate} (${d.total} attempts, ${(d.tokens || 0).toLocaleString()} tokens)`);
+  }
+
   if (report.flakes?.length) {
     lines.push('');
-    lines.push('Flakes detected:');
-    for (const f of report.flakes) {
-      lines.push(`  ${f.run_id}: ${f.flaky_provider}/${f.flaky_model} → ${f.recovered_by}/${f.recovered_model} (${f.error_code})`);
-    }
+    lines.push('Flakes:');
+    for (const f of report.flakes) lines.push(`  ${f.run_id.slice(0,8)}: ${f.flaky_provider}/${f.flaky_model} → ${f.recovered_by}/${f.recovered_model} [${f.error_code}]`);
   }
+
   if (report.suggestions?.length) {
     lines.push('');
     lines.push('Suggestions:');
-    for (const s of report.suggestions) {
-      lines.push(`  [${s.severity}] ${s.action}`);
-    }
+    for (const s of report.suggestions) lines.push(`  [${s.severity}] ${s.action}`);
   }
   return lines.join('\n');
 }
