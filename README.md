@@ -236,9 +236,21 @@ node --test ocask.test.mjs
 ./check.sh         # verify all docs, skill, install are in sync
 ```
 
-23 unit tests. 88 sync checks across code, architecture doc, README, skill,
-slash command, and installer.
+45 unit tests. 96 sync checks across code, architecture doc, README, skill,
+slash command, and installer. CI runs `node --test` on every PR and push to `main`.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the test
+commands, and the pull-request workflow (`main` is protected and requires a green CI check).
+Security issues: please follow [SECURITY.md](SECURITY.md), not a public issue. Release process:
+[RELEASING.md](RELEASING.md); user-facing changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+```
+Copyright 2026 Anthony Garces
+Licensed under the Apache License, Version 2.0.
+```
