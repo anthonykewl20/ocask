@@ -26,11 +26,13 @@ ln -s "$(pwd)/ocask.mjs" ~/.local/bin/ocask
 
 ### Auth setup per provider
 
-| Provider | Auth method |
-|----------|-------------|
-| `deepseek` | `DEEPSEEK_API_KEY` env var, or `~/.deepseek-key` (mode 0600, one line) |
-| `qwen` | `QWEN_API_KEY` env var, or `~/.qwen-key` (mode 0600, one line) |
-| `opencode` | `opencode providers login` (picks up existing CLI auth) |
+| Provider | Auth method | Models |
+|----------|-------------|--------|
+| `deepseek` | `DEEPSEEK_API_KEY` env var, or `~/.deepseek-key` (mode 0600, one line) | DeepSeek V4 Pro, V4 Flash, Chat, Reasoner |
+| `qwen` | `QWEN_API_KEY` env var, or `~/.qwen-key` (mode 0600, one line) | Qwen 3.7 Plus/Max, 3.6 Plus/Pro |
+| `opencode` | `opencode providers login` (picks up existing CLI auth) | Routes via `deepseek/` and `alibaba/` provider prefixes |
+
+For Qwen via OpenCode CLI: get an API key from https://home.qwencloud.com/api-keys and run `opencode providers login alibaba`.
 
 For Alibaba Token Plan billing: set `QWEN_TOKEN_PLAN=1`.
 
@@ -135,7 +137,7 @@ ocask (Node.js CLI)
   │       │
   │       ├─ providers/deepseek.mjs  — POST api.deepseek.com/v1/chat/completions
   │       ├─ providers/qwen.mjs      — POST dashscope-intl.aliyuncs.com/compatible-mode/v1
-  │       └─ providers/opencode.mjs  — opencode run --pure --variant max
+  │       └─ providers/opencode.mjs  — opencode run --pure (deepseek/ for DS, alibaba/ for Qwen)
   │
   └─ validateAssistantOutput() — enforces verdict contract, JSONL parsing
 ```

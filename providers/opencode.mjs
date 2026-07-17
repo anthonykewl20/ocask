@@ -311,7 +311,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
   if (!opencodeBin) throw makeError('OpenCode CLI not found on PATH', 'ENOENT');
 
   const disableServer = env.OCASK_DISABLE_SERVER !== '0';
-  const providerPrefix = isDeepSeekModel(model) ? 'deepseek' : (isQwenModel(model) ? 'opencode-go' : 'deepseek');
+  const providerPrefix = isDeepSeekModel(model) ? 'deepseek' : (isQwenModel(model) ? 'alibaba' : 'deepseek');
   const isDeepSeek = isDeepSeekModel(model);
 
   const args = [

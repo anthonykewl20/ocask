@@ -28,10 +28,12 @@ a structured verdict with cited rationale.
 | Deep-module audit | `deepseek-v4-pro` | `deep-modules` | `--require-verdict` |
 | Heavy read/analysis | `deepseek-v4-pro` | `general` | — |
 | Light/fast analysis | `deepseek-v4-flash` | `general` | — |
+| Quick sanity check | `qwen3.7-plus` | `general` | — |
 | Mandatory gate review | `deepseek-v4-pro` | (any lens) | `--require-verdict --no-fallback` |
 
-DeepSeek v4 Pro is the default for all analytical work. v4 Flash is the fallback for
-lighter tasks where speed matters more than depth.
+DeepSeek v4 Pro is the primary analytical engine. v4 Flash for lighter tasks.
+Qwen 3.7 Plus is the fallback: it handles opposite-family retries automatically on
+malformed DeepSeek output, and can be used explicitly for quick one-off checks.
 
 ## Invocation
 
