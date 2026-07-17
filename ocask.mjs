@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { isPaidModelAllowed, PAID_MODELS } from './ocverify.mjs';
 import { invokeWithFallback, ProviderError, modelFamily, availableProviders, defaultProvider } from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
-  logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun } from './logging.mjs';
+  logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun,
+  classifyFailure, unwrapOrigin } from './logging.mjs';
 import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
 import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 
@@ -280,17 +281,11 @@ export async function readExistingPathOrLiteral(source, stdin = process.stdin) {
 }
 
 // ── RETRY / FALLBACK ──
+// Reports the TRUE mechanism: unwrap the factory's ALL_PROVIDERS_EXHAUSTED wrapper
+// and read the originating cause's code. `all_exhausted` is retired as an output —
+// the wrapper is structural (noFallback chains are length 1), never the real cause.
 function reasonCodeFor(error) {
-  const code = error?.code;
-  if (code === 'ENTITLEMENT_UNAVAILABLE') return 'entitlement_unavailable';
-  if (code === 'MODEL_OUTPUT') return 'malformed_contract';
-  if (code === 'TIMEOUT') return 'timeout';
-  if (code === 'RATE_LIMITED') return 'rate_limited';
-  if (code === 'AUTH_FAILURE') return 'auth_failure';
-  if (code === 'PROVIDER_ERROR') return 'provider_error';
-  if (code === 'CONNECTION_ERROR') return 'connection_error';
-  if (code === 'ALL_PROVIDERS_EXHAUSTED') return 'all_exhausted';
-  return code || 'unknown';
+  return classifyFailure(error).mechanism || 'unknown';
 }
 
 function retryCorrection(error) { return `## RETRY CORRECTION\nThe prior attempt failed with reason code: ${reasonCodeFor(error)}. Follow the response contract exactly. Do not repeat the invalid response.`; }
@@ -338,21 +333,34 @@ export async function runAsk({
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
       const out = validateAssistantOutput(raw, options);
       const outBytes = Buffer.byteLength(typeof out === 'string' ? out : JSON.stringify(out), 'utf8');
-      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'success', reason_code: 'ok', fallback: isFallback, provider: result.provider });
+      const localVerdict = ((typeof out === 'string' ? out : JSON.stringify(out))
+        .match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase() || null;
+      // A judgment exists only when this attempt demonstrably produced a verdict.
+      const successClass = localVerdict
+        ? classifyFailure(null, { verdict: localVerdict })
+        : { class: 'no-judgment', subclass: null, locus: null, mechanism: null, censored: false, http_status: null, retry_after: null };
+      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'success', reason_code: 'ok', fallback: isFallback, provider: result.provider, class: successClass.class });
       metadata.output_bytes = outBytes;
       await logAttemptResult({
         provider: result.provider || 'unknown', model: askModel, attemptIndex: attemptIdx,
-        outcome: 'success', durationMs: Date.now() - t0, reasonCode: 'ok',
+        outcome: 'success', durationMs: Date.now() - t0, timeoutMs, reasonCode: 'ok',
         outputBytes: outBytes, tokensUsed: result.tokensUsed || null,
+        classification: successClass,
       });
       return out;
     } catch (error) {
-      const code = reasonCodeFor(error);
-      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback });
+      // Classify from the TRUE (unwrapped) mechanism; attribute the real provider
+      // that failed via the originating cause — never the wrapper, never 'unknown'
+      // when the cause carries a provider.
+      const classification = classifyFailure(error, { timeoutMs });
+      const code = classification.mechanism || 'unknown';
+      const failProvider = unwrapOrigin(error)?.provider || provider || defaultProvider(askModel) || 'unknown';
+      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback, provider: failProvider, class: classification.class, subclass: classification.subclass, locus: classification.locus, mechanism: code });
       await logAttemptResult({
-        provider: error?.provider || provider || defaultProvider(model) || 'unknown', model: askModel, attemptIndex: attemptIdx,
-        outcome: 'failed', durationMs: Date.now() - t0, reasonCode: code,
+        provider: failProvider, model: askModel, attemptIndex: attemptIdx,
+        outcome: 'failed', durationMs: Date.now() - t0, timeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
+        classification,
       });
       throw error;
     }
@@ -366,7 +374,9 @@ export async function runAsk({
     metadata.actual_model = model;
     if (!selectedFallback || !isFallbackEligible(primaryError)) {
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
-      await logError({ model, provider, errorCode: reasonCodeFor(primaryError), errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms });
+      const primaryClass = classifyFailure(primaryError, { timeoutMs });
+      const primaryProvider = unwrapOrigin(primaryError)?.provider || provider || defaultProvider(model) || 'unknown';
+      await logError({ model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown', errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
     try {
@@ -374,7 +384,9 @@ export async function runAsk({
       result = { ok: true, output: fbOut, model: selectedFallback }; metadata.actual_model = selectedFallback; metadata.fallback_used = true;
     } catch (fbError) {
       metadata.actual_model = selectedFallback; metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
-      await logError({ model: selectedFallback, provider, errorCode: reasonCodeFor(fbError), errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms });
+      const fbClass = classifyFailure(fbError, { timeoutMs });
+      const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
+      await logError({ model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown', errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: fbClass });
       fbError.ocaskMetadata = metadata; throw fbError;
     }
   }
@@ -422,8 +434,11 @@ export async function runAsk({
 
       await logAttemptResult({
         provider: buddyResult.provider || 'unknown', model: buddyModel, attemptIndex: attemptIndex++,
-        outcome: 'success', durationMs: 0, reasonCode: 'ok',
+        outcome: 'success', durationMs: 0, timeoutMs, reasonCode: 'ok',
         outputBytes: Buffer.byteLength(buddyOutput, 'utf8'), tokensUsed: buddyResult.tokensUsed || null,
+        classification: buddyVerdict
+          ? classifyFailure(null, { verdict: buddyVerdict })
+          : { class: 'no-judgment', subclass: null, locus: null, mechanism: null, censored: false, http_status: null, retry_after: null },
       });
 
       if (buddyVerdict) {

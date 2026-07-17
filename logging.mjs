@@ -8,21 +8,119 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 
-const LOG_DIR = path.join(
-  process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'),
-  'ocask'
-);
-const LOG_PATH = path.join(LOG_DIR, 'log.jsonl');
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB before rotation
 const ROTATION_KEEP = 2; // keep this many rotated files
 
+// Resolve the log location at CALL time (not import time) so the path reflects
+// the live XDG_DATA_HOME — this lets tests redirect the log to a temp dir and
+// keeps logPath() honest if the environment shifts between processes.
+function logDir() {
+  return path.join(
+    process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'),
+    'ocask'
+  );
+}
+export function logPath() {
+  return path.join(logDir(), 'log.jsonl');
+}
+
 // ── Init ──
 async function ensureLogDir() {
-  await fs.mkdir(LOG_DIR, { recursive: true, mode: 0o700 });
+  await fs.mkdir(logDir(), { recursive: true, mode: 0o700 });
+}
+
+// ── Failure-record taxonomy (#2) + contract (#3) ──
+// A failure record must let the cause be recovered from the log line ALONE — no
+// inference at read time. The provider factory wraps every terminal failure as
+// ALL_PROVIDERS_EXHAUSTED, keeping the real error as `.cause`. classifyFailure
+// UNWRAPS to the originating cause and classifies THAT, so the reported
+// `mechanism` is always the true code (never the wrapper). `all_exhausted` is
+// retired as a classifier output; ALL_PROVIDERS_EXHAUSTED remains an internal
+// wrapper code only.
+
+// Originating codes whose failure is on the provider's side of the wire.
+const _THEIR_SIDE = new Set([
+  'TIMEOUT', 'RATE_LIMITED', 'CONNECTION_ERROR', 'ENTITLEMENT_UNAVAILABLE',
+  'PROVIDER_ERROR', 'INSUFFICIENT_BALANCE', 'MALFORMED_RESPONSE', 'OPencode_EXHAUSTED',
+]);
+// Originating codes whose failure is on our side (config / environment / our gate).
+const _OUR_SIDE = new Set([
+  'AUTH_FAILURE', 'PROVIDER_UNAVAILABLE', 'NO_PROVIDER', 'MODEL_NOT_FOUND',
+  'MODEL_NOT_ALLOWED', 'ENOENT', 'SPAWN', 'SERVER_SETUP', 'OUTPUT_LIMIT',
+]);
+// Originating codes where the model replied but the reply was unusable.
+const _REPLY_UNUSABLE = new Set(['MODEL_OUTPUT', 'VERDICT_PARSE', 'VERDICT_VALIDATE']);
+
+// Peel the factory's ALL_PROVIDERS_EXHAUSTED wrapper iteratively (in case of
+// nesting) to reach the originating cause. Stops at the first non-wrapper node so
+// it never drills past a real ProviderError into that error's own internal cause.
+export function unwrapOrigin(error) {
+  let node = error;
+  let guard = 0;
+  while (node && node.code === 'ALL_PROVIDERS_EXHAUSTED' && node.cause && guard++ < 32) {
+    node = node.cause;
+  }
+  return node || error;
+}
+
+// Classify an attempt outcome into the failure-record taxonomy.
+//   classifyFailure(error)                         → failure (no-judgment + mechanism)
+//   classifyFailure(null, { verdict: 'APPROVED' }) → judgment (validated verdict)
+// `error` may be factory-wrapped; it is unwrapped before classification.
+export function classifyFailure(error, opts = {}) {
+  const verdict = opts.verdict;
+  if (verdict === 'APPROVED' || verdict === 'WARNING' || verdict === 'BLOCKED') {
+    // A judgment is emitted ONLY when a model demonstrably judged the code.
+    return { class: 'judgment', subclass: null, locus: null, mechanism: null,
+      censored: false, http_status: null, retry_after: null };
+  }
+
+  const origin = unwrapOrigin(error);
+  const mechanism = origin?.code || null;
+  const httpStatus = Number.isInteger(origin?.status) ? origin.status : null;
+  const retryAfter = origin?.retryAfter != null ? origin.retryAfter : null;
+
+  // Fail-safe defaults: anything not positively a validated verdict is
+  // no-judgment; anything unclassifiable is the loud `indeterminate` residual.
+  let subclass = 'indeterminate';
+  let locus = null;
+  if (_REPLY_UNUSABLE.has(mechanism)) {
+    subclass = 'reply-unusable';
+  } else if (_THEIR_SIDE.has(mechanism)) {
+    subclass = 'reply-absent'; locus = 'their-side';
+  } else if (_OUR_SIDE.has(mechanism)) {
+    subclass = 'reply-absent'; locus = 'our-side';
+  }
+
+  return {
+    class: 'no-judgment',
+    subclass,
+    locus,
+    mechanism,
+    censored: mechanism === 'TIMEOUT',
+    http_status: httpStatus,
+    retry_after: retryAfter,
+  };
+}
+
+// Spread a classification into the snake_case record fields written to the log.
+function _classificationFields(c) {
+  if (!c) return null;
+  const fields = {
+    class: c.class,
+    subclass: c.subclass ?? null,
+    locus: c.locus ?? null,
+    mechanism: c.mechanism ?? null,
+    duration_censored: Boolean(c.censored),
+  };
+  if (c.http_status != null) fields.http_status = c.http_status;
+  if (c.retry_after != null) fields.retry_after = c.retry_after;
+  return fields;
 }
 
 // ── Rotation ──
 async function maybeRotate() {
+  const LOG_PATH = logPath();
   try {
     const stat = await fs.stat(LOG_PATH);
     if (stat.size > MAX_LOG_BYTES) {
@@ -41,6 +139,7 @@ async function maybeRotate() {
 export async function logEvent(event, data = {}) {
   await ensureLogDir();
   await maybeRotate();
+  const LOG_PATH = logPath();
   const line = JSON.stringify({
     v: 1,
     ts: new Date().toISOString(),
@@ -85,19 +184,24 @@ export async function logAttemptStart({ provider, model, attemptIndex }) {
 }
 
 export async function logAttemptResult({ provider, model, attemptIndex, outcome, durationMs,
-  reasonCode, outputBytes, tokensUsed, errorClass }) {
-  await logEvent('attempt.result', {
+  timeoutMs = 0, reasonCode, outputBytes, tokensUsed, errorClass, classification = null }) {
+  const record = {
     run_id: _currentRunId,
     provider,
     model,
     attempt_index: attemptIndex,
     outcome,
     duration_ms: durationMs,
+    timeout_ms: timeoutMs || 0,
     reason_code: reasonCode || 'ok',
     output_bytes: outputBytes || 0,
     tokens_used: tokensUsed,
     error_class: errorClass || null,
-  });
+  };
+  // Failure-record taxonomy (#2/#3): class/subclass/locus/mechanism/censored/...
+  const cf = _classificationFields(classification);
+  if (cf) Object.assign(record, cf);
+  await logEvent('attempt.result', record);
 }
 
 export async function logFallback({ fromProvider, toProvider, fromModel, toModel, reason }) {
@@ -123,8 +227,9 @@ export async function logVerdict({ verdict, model, provider, lens, durationMs, b
   });
 }
 
-export async function logError({ model, provider, errorCode, errorClass, attemptCount, durationMs }) {
-  await logEvent('error', {
+export async function logError({ model, provider, errorCode, errorClass, attemptCount, durationMs,
+  timeoutMs = 0, classification = null }) {
+  const record = {
     run_id: _currentRunId,
     model,
     provider,
@@ -132,7 +237,12 @@ export async function logError({ model, provider, errorCode, errorClass, attempt
     error_class: errorClass,
     attempts_exhausted: attemptCount,
     duration_ms: durationMs,
-  });
+    timeout_ms: timeoutMs || 0,
+  };
+  // Failure-record taxonomy (#2/#3): the true mechanism + class/subclass/locus.
+  const cf = _classificationFields(classification);
+  if (cf) Object.assign(record, cf);
+  await logEvent('error', record);
 }
 
 export function currentRunId() {
@@ -142,6 +252,7 @@ export function currentRunId() {
 // ── Doctor: read and analyze the log ──
 export async function readLog(options = {}) {
   const { since, until, limit } = options;
+  const LOG_PATH = logPath();
   if (!fsSync.existsSync(LOG_PATH)) return [];
   try {
     const raw = await fs.readFile(LOG_PATH, 'utf8');
@@ -298,7 +409,7 @@ function generateSuggestions(providers, flakes, topErrors) {
       const codes = Object.keys(p.error_breakdown || {});
       const isAuth = codes.includes('AUTH_FAILURE');
       const isTimeout = codes.includes('TIMEOUT');
-      const isExhausted = codes.includes('all_exhausted') || codes.includes('OPencode_EXHAUSTED');
+      const isExhausted = codes.includes('OPencode_EXHAUSTED');
 
       if (isTimeout && p.avg_latency_ms > 20000) {
         suggestions.push({
@@ -460,7 +571,7 @@ function _inferRootCause(attempts, fallbacks, error, start) {
 
   const codes = [...new Set(failed.map(a => a.reason_code))];
 
-  if (codes.includes('AUTH_FAILURE') || codes.includes('all_exhausted') || codes.includes('OPencode_EXHAUSTED')) {
+  if (codes.includes('AUTH_FAILURE') || codes.includes('OPencode_EXHAUSTED')) {
     const missing = failed.find(a => a.provider !== 'unknown' && a.provider !== 'opencode');
     const worksVia = attempts.find(a => a.outcome === 'success');
     if (worksVia) {
@@ -495,9 +606,4 @@ function _inferRootCause(attempts, fallbacks, error, start) {
     cause: `Multiple failure modes: ${codes.join(', ')}.`,
     fix: 'Check provider status. Run ocask doctor for health overview.',
   };
-}
-
-// ── Expose log path for doctor/reporting ──
-export function logPath() {
-  return LOG_PATH;
 }

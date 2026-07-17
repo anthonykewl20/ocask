@@ -17,6 +17,14 @@ import {
   runMain,
   validateAssistantOutput,
 } from './ocask.mjs';
+import {
+  classifyFailure,
+  unwrapOrigin,
+  logAttemptResult,
+  readLog,
+  startRun,
+} from './logging.mjs';
+import { ProviderError } from './providers/factory.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
@@ -217,5 +225,158 @@ test('entrypoint: main() does not run when the module is merely imported', async
     assert.doesNotMatch(run.stdout, /Usage:/, 'importing must not trigger the CLI');
   } finally {
     await fs.rm(probe, { recursive: true, force: true });
+  }
+});
+
+// ── Failure-record taxonomy (#2) + contract (#3) ──
+// These FAIL against the pre-fix code (everything collapsed to all_exhausted) and
+// PASS once classifyFailure unwraps the factory wrapper to the true mechanism.
+
+// Build an error wrapped exactly as providers/factory.mjs wraps a terminal failure:
+// ALL_PROVIDERS_EXHAUSTED with `.cause` = the originating ProviderError.
+function wrapAsExhausted(origin) {
+  return Object.assign(
+    new ProviderError(`All providers exhausted (${origin.provider || 'unknown'}); last: ${origin.message}`, 'ALL_PROVIDERS_EXHAUSTED'),
+    { attempts: [{ provider: origin.provider || 'unknown', outcome: 'failed', reason_code: origin.code }], cause: origin },
+  );
+}
+
+test('a factory-wrapped TIMEOUT classifies to the true mechanism (never all_exhausted)', () => {
+  const origin = Object.assign(
+    new ProviderError('DeepSeek API timed out after 5000ms', 'TIMEOUT'),
+    { code: 'TIMEOUT', provider: 'deepseek' },
+  );
+  const cls = classifyFailure(wrapAsExhausted(origin));
+  assert.equal(cls.class, 'no-judgment');
+  assert.equal(cls.subclass, 'reply-absent');
+  assert.equal(cls.locus, 'their-side');
+  assert.equal(cls.mechanism, 'TIMEOUT');
+  assert.equal(cls.censored, true);
+  assert.notEqual(cls.mechanism, 'all_exhausted');
+  assert.notEqual(cls.mechanism, 'ALL_PROVIDERS_EXHAUSTED');
+});
+
+test('unwrapOrigin reaches the originating cause and preserves the real provider', () => {
+  const origin = Object.assign(
+    new ProviderError('DEEPSEEK_API_KEY not set', 'AUTH_FAILURE'),
+    { code: 'AUTH_FAILURE', provider: 'deepseek' },
+  );
+  const wrapped = wrapAsExhausted(origin);
+  assert.equal(unwrapOrigin(wrapped), origin);
+  assert.equal(unwrapOrigin(wrapped).provider, 'deepseek');
+  // An already-originating error (no wrapper) is returned unchanged.
+  assert.equal(unwrapOrigin(origin), origin);
+});
+
+test('AUTH_FAILURE classifies as our-side with mechanism AUTH_FAILURE', () => {
+  const origin = Object.assign(
+    new ProviderError('DEEPSEEK_API_KEY not set', 'AUTH_FAILURE'),
+    { code: 'AUTH_FAILURE', provider: 'deepseek' },
+  );
+  const cls = classifyFailure(wrapAsExhausted(origin));
+  assert.equal(cls.class, 'no-judgment');
+  assert.equal(cls.subclass, 'reply-absent');
+  assert.equal(cls.locus, 'our-side');
+  assert.equal(cls.mechanism, 'AUTH_FAILURE');
+  assert.equal(cls.censored, false);
+  // Provider attribution comes from the unwrapped cause — never 'unknown'.
+  assert.equal(unwrapOrigin(wrapAsExhausted(origin)).provider, 'deepseek');
+});
+
+test('unknown / undefined code classifies as indeterminate, never a verdict', () => {
+  const weird = Object.assign(
+    new ProviderError('something broke', 'SOMETHING_WEIRD'),
+    { code: 'SOMETHING_WEIRD', provider: 'qwen' },
+  );
+  const clsUnknown = classifyFailure(wrapAsExhausted(weird));
+  assert.equal(clsUnknown.class, 'no-judgment');
+  assert.equal(clsUnknown.subclass, 'indeterminate');
+  assert.equal(clsUnknown.locus, null);
+
+  const clsNone = classifyFailure(undefined);
+  assert.equal(clsNone.class, 'no-judgment');
+  assert.equal(clsNone.subclass, 'indeterminate');
+  assert.equal(clsNone.mechanism, null);
+});
+
+test('a validated verdict classifies as judgment; a non-verdict never does', () => {
+  for (const v of ['APPROVED', 'WARNING', 'BLOCKED']) {
+    const cls = classifyFailure(null, { verdict: v });
+    assert.equal(cls.class, 'judgment', v);
+    assert.equal(cls.subclass, null, v);
+    assert.equal(cls.mechanism, null, v);
+  }
+  assert.equal(classifyFailure(null, { verdict: null }).class, 'no-judgment');
+  assert.equal(classifyFailure(null, { verdict: 'MAYBE' }).class, 'no-judgment');
+});
+
+test('the ALL_PROVIDERS_EXHAUSTED wrapper never appears as a reported mechanism', () => {
+  for (const code of ['TIMEOUT', 'AUTH_FAILURE', 'RATE_LIMITED', 'CONNECTION_ERROR',
+    'ENTITLEMENT_UNAVAILABLE', 'PROVIDER_ERROR', 'MALFORMED_RESPONSE', 'MODEL_OUTPUT',
+    'INSUFFICIENT_BALANCE', 'MODEL_NOT_ALLOWED']) {
+    const origin = Object.assign(new ProviderError(code, code), { code, provider: 'deepseek' });
+    const cls = classifyFailure(wrapAsExhausted(origin));
+    assert.notEqual(cls.mechanism, 'ALL_PROVIDERS_EXHAUSTED', code);
+    assert.notEqual(cls.mechanism, 'all_exhausted', code);
+    assert.equal(cls.mechanism, code, `${code} should be the reported mechanism`);
+  }
+});
+
+test('non-empty malformed model output classifies as reply-unusable', () => {
+  // MODEL_OUTPUT surfaces UNwrapped (validateAssistantOutput throws it after the
+  // provider already returned successfully), so classify it directly.
+  const origin = Object.assign(new ProviderError('missing verdict line', 'MODEL_OUTPUT'), { code: 'MODEL_OUTPUT' });
+  const cls = classifyFailure(origin);
+  assert.equal(cls.class, 'no-judgment');
+  assert.equal(cls.subclass, 'reply-unusable');
+  assert.equal(cls.locus, null);
+  assert.equal(cls.censored, false);
+});
+
+test('HTTP status and retry-after propagate from the originating cause', () => {
+  const origin = Object.assign(
+    new ProviderError('rate limited', 'RATE_LIMITED'),
+    { code: 'RATE_LIMITED', provider: 'qwen', status: 429, retryAfter: '42' },
+  );
+  const cls = classifyFailure(wrapAsExhausted(origin));
+  assert.equal(cls.mechanism, 'RATE_LIMITED');
+  assert.equal(cls.locus, 'their-side');
+  assert.equal(cls.http_status, 429);
+  assert.equal(cls.retry_after, '42');
+});
+
+test('logAttemptResult writes the full failure-record taxonomy to the log', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-tax-'));
+  const prevXdg = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = tmp;
+  startRun('tax-test-run');
+  try {
+    const origin = Object.assign(
+      new ProviderError('timed out', 'TIMEOUT'),
+      { code: 'TIMEOUT', provider: 'deepseek' },
+    );
+    const wrapped = wrapAsExhausted(origin);
+    const classification = classifyFailure(wrapped);
+    await logAttemptResult({
+      provider: unwrapOrigin(wrapped).provider, model: 'deepseek-v4-flash',
+      attemptIndex: 0, outcome: 'failed', durationMs: 5000, timeoutMs: 5000,
+      reasonCode: classification.mechanism, outputBytes: 0, tokensUsed: null,
+      errorClass: 'ProviderError', classification,
+    });
+    const entries = await readLog();
+    const rec = entries.find(e => e.event === 'attempt.result');
+    assert.ok(rec, 'attempt.result record was written');
+    assert.equal(rec.provider, 'deepseek', 'real provider, not unknown');
+    assert.equal(rec.class, 'no-judgment');
+    assert.equal(rec.subclass, 'reply-absent');
+    assert.equal(rec.locus, 'their-side');
+    assert.equal(rec.mechanism, 'TIMEOUT', 'true mechanism, not all_exhausted');
+    assert.equal(rec.duration_censored, true);
+    assert.equal(rec.timeout_ms, 5000);
+    assert.equal(rec.reason_code, 'TIMEOUT');
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
   }
 });
