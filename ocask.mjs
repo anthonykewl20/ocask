@@ -301,6 +301,7 @@ function isFallbackEligible(error) { return new Set(['MODEL_OUTPUT']).has(error?
 export async function runAsk({
   model, taskText, systemText = '', contextText = '',
   jsonMode = false, requireVerdict = false, noFallback = false,
+  crossVerify = false,
   lens = 'general', temperature = 0, maxTokens, timeoutMs = 0,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
 }) {
@@ -379,11 +380,86 @@ export async function runAsk({
   }
   metadata.exit_code = 0; metadata.duration_ms = Date.now() - runStarted;
 
-  // Log verdict
-  const verdictMatch = (typeof result.output === 'string' ? result.output : JSON.stringify(result.output))
-    .match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i);
-  if (verdictMatch) {
-    await logVerdict({ verdict: verdictMatch[1].toUpperCase(), model: result.model, provider, lens, durationMs: metadata.duration_ms, briefRationale: String(result.output).slice(0, 200) });
+  // Extract primary verdict
+  const primaryOutput = typeof result.output === 'string' ? result.output : JSON.stringify(result.output);
+  const primaryVerdict = (primaryOutput.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase();
+  if (primaryVerdict) {
+    await logVerdict({ verdict: primaryVerdict, model: result.model, provider, lens, durationMs: metadata.duration_ms, briefRationale: primaryOutput.slice(0, 200) });
+  }
+
+  // ── Cross-verify: DeepSeek + Qwen buddy check ──
+  if (crossVerify && requireVerdict && primaryVerdict) {
+    const buddyModel = defaultFallbackModel(model) || 'qwen3.7-plus';
+    const buddyPrompt = buildPrompt({
+      taskText: [
+        `## BUDDY CROSS-VERIFICATION`,
+        `Another model (${result.model}) reviewed the same code and returned:`,
+        `VERDICT: ${primaryVerdict}`,
+        ``,
+        `Their rationale:`,
+        primaryOutput.slice(0, 800),
+        ``,
+        `## YOUR TASK`,
+        `Give your INDEPENDENT second opinion. Review the same evidence below.`,
+        `Do you AGREE or DISAGREE with the ${result.model} verdict?`,
+        ``,
+        taskText,
+      ].join('\n'),
+      requireVerdict: true,
+      lens: 'general',
+      maxTokens: maxTokens ? Math.floor(maxTokens / 2) : undefined,
+    });
+
+    try {
+      const buddyResult = await invokeWithFallback({
+        model: buddyModel, prompt: DELEGATED_IDENTITY_PREFIX + buddyPrompt,
+        timeoutMs, env, cwd, noFallback: true,
+      });
+      const buddyRaw = buddyResult.commandOutput || parseOpenCodeJsonl(buddyResult.stdout);
+      const buddyOut = validateAssistantOutput(buddyRaw, { requireVerdict: true });
+      const buddyOutput = typeof buddyOut === 'string' ? buddyOut : JSON.stringify(buddyOut);
+      const buddyVerdict = (buddyOutput.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase();
+
+      await logAttemptResult({
+        provider: buddyResult.provider || 'unknown', model: buddyModel, attemptIndex: attemptIndex++,
+        outcome: 'success', durationMs: 0, reasonCode: 'ok',
+        outputBytes: Buffer.byteLength(buddyOutput, 'utf8'), tokensUsed: buddyResult.tokensUsed || null,
+      });
+
+      if (buddyVerdict) {
+        const agreement = buddyVerdict === primaryVerdict;
+        await logEvent('cross.verify', {
+          run_id: runId,
+          primary_verdict: primaryVerdict,
+          primary_model: result.model,
+          buddy_verdict: buddyVerdict,
+          buddy_model: buddyModel,
+          agreement,
+        });
+
+        if (!agreement) {
+          const combinedOutput = [
+            `VERDICT: WARNING`,
+            ``,
+            `BUDDIES DISAGREE — manual review recommended.`,
+            ``,
+            `${result.model} (primary): ${primaryVerdict}`,
+            primaryOutput.slice(0, 400),
+            ``,
+            `${buddyModel} (buddy): ${buddyVerdict}`,
+            buddyOutput.slice(0, 400),
+          ].join('\n');
+          return { ...result, output: combinedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: false } };
+        }
+
+        // Agreement — note buddy concurrence
+        const agreedOutput = jsonMode ? result.output : `${result.output}\n\n→ Buddy ${buddyModel} CONCURS: ${buddyVerdict}`;
+        return { ...result, output: agreedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: true } };
+      }
+    } catch {
+      // Buddy check failed — don't block, just note
+      await logEvent('cross.verify', { run_id: runId, primary_verdict: primaryVerdict, buddy_available: false });
+    }
   }
 
   return { ...result, metadata, run_id: runId };
@@ -424,7 +500,6 @@ export async function runMain(
     const timeoutMs = parsePositiveInt(args['timeout-ms'], '--timeout-ms', 0);
     const noFallback = args['no-fallback'] === true;
     if (noFallback && args['fallback-model']) throw new Error('--no-fallback cannot be combined with --fallback-model');
-    if (noFallback && args['provider'] && args['provider'] !== defaultProvider(args.model)) throw new Error('--no-fallback cannot be combined with a non-default --provider');
 
     guardAllowedModels({ model: args.model, fallbackModel: args['fallback-model'] });
 

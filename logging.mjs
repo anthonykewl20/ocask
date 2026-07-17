@@ -278,34 +278,63 @@ function generateSuggestions(providers, flakes, topErrors) {
 
   for (const p of providers) {
     const rate = parseFloat(p.success_rate);
-    if (rate < 50 && p.total >= 5) {
-      suggestions.push({ severity: 'high', action: `Provider ${p.provider_model} has ${p.success_rate} success rate over ${p.total} attempts. Consider removing from fallback chain or rotating credentials.` });
+    // Any failure on a provider → check immediately (not just ≥5)
+    if (rate < 50 && p.total >= 1 && p.total - p.success > 0) {
+      const codes = Object.keys(p.error_breakdown || {});
+      if (codes.includes('AUTH_FAILURE') || codes.includes('all_exhausted')) {
+        suggestions.push({
+          severity: 'high',
+          action: `Provider ${p.provider_model}: ${rate}% success. Auth/config issue detected. Check credentials or use --provider flag to select a working backend.`,
+        });
+      } else if (p.total >= 3) {
+        suggestions.push({
+          severity: 'high',
+          action: `Provider ${p.provider_model}: ${rate}% success over ${p.total} attempts. Consider removing from fallback chain.`,
+        });
+      }
     }
     if (p.avg_latency_ms > 30000) {
-      suggestions.push({ severity: 'medium', action: `Provider ${p.provider_model} avg latency ${p.avg_latency_ms}ms. Consider increasing --timeout-ms or switching provider.` });
+      suggestions.push({ severity: 'medium', action: `Provider ${p.provider_model} avg latency ${p.avg_latency_ms}ms. Increase --timeout-ms or switch.` });
     }
   }
 
+  // Config mismatch: one provider has auth failures, another works fine
+  const working = providers.filter(p => parseFloat(p.success_rate) >= 50 && p.total >= 1).map(p => p.provider_model);
+  const failing = providers.filter(p => parseFloat(p.success_rate) === 0 && p.total >= 1).map(p => p.provider_model);
+  if (failing.length > 0 && working.length > 0) {
+    for (const f of failing) {
+      suggestions.push({
+        severity: 'high',
+        action: `${f} fails but ${working.join(', ')} works. config mismatch: add API key for ${f} or use --provider ${working[0].split('/')[0]}.`,
+      });
+    }
+  }
+
+  // Flake detection — lower threshold to 1
   const flakeByProvider = {};
   for (const f of flakes) {
     const key = `${f.flaky_provider}/${f.flaky_model}`;
     flakeByProvider[key] = (flakeByProvider[key] || 0) + 1;
   }
   for (const [key, count] of Object.entries(flakeByProvider)) {
-    if (count >= 3) {
-      suggestions.push({ severity: 'high', action: `Flaky provider detected: ${key} failed then recovered ${count} times. ${flakes.find(f => `${f.flaky_provider}/${f.flaky_model}` === key)?.error_code} errors. Consider lowering this provider in the fallback chain.` });
+    if (count >= 1) {
+      suggestions.push({
+        severity: 'medium',
+        action: `Flaky provider: ${key} failed (${flakes.find(f => `${f.flaky_provider}/${f.flaky_model}` === key)?.error_code}) then recovered ${count} time(s).`,
+      });
     }
   }
 
+  // Lower thresholds for immediate feedback
   for (const e of topErrors) {
-    if (e.error_code === 'RATE_LIMITED' && e.count >= 5) {
-      suggestions.push({ severity: 'medium', action: `${e.count} rate-limit events detected. Consider adding rate-limit backoff or switching to a higher-tier API plan.` });
+    if (e.error_code === 'RATE_LIMITED' && e.count >= 1) {
+      suggestions.push({ severity: 'medium', action: `${e.count} rate-limit(s). Check API plan limits.` });
     }
-    if (e.error_code === 'AUTH_FAILURE' && e.count >= 3) {
-      suggestions.push({ severity: 'high', action: `${e.count} auth failures detected. Check API keys in env vars or ~/.deepseek-key / ~/.qwen-key.` });
+    if (e.error_code === 'AUTH_FAILURE' && e.count >= 1) {
+      suggestions.push({ severity: 'high', action: `${e.count} auth failure(s). Check API keys.` });
     }
-    if (e.error_code === 'TIMEOUT' && e.count >= 5) {
-      suggestions.push({ severity: 'medium', action: `${e.count} timeouts detected. Consider increasing --timeout-ms or checking network latency to provider APIs.` });
+    if (e.error_code === 'TIMEOUT' && e.count >= 2) {
+      suggestions.push({ severity: 'medium', action: `${e.count} timeout(s). Increase --timeout-ms or check connectivity.` });
     }
   }
 
