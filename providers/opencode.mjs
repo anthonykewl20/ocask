@@ -9,7 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createServer } from 'node:net';
 import { isPaidModelAllowed } from '../ocverify.mjs';
-import { isDeepSeekModel, isQwenModel, ProviderError } from './factory.mjs';
+import { identityTransportRoute, isDeepSeekModel, isQwenModel, ProviderError } from './factory.mjs';
 
 const MAX_OUTPUT_BYTES = 0;
 const KILL_GRACE_MS = 1000;
@@ -339,11 +339,12 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
 
   const disableServer = env.OCASK_DISABLE_SERVER !== '0';
   const providerPrefix = isDeepSeekModel(model) ? 'deepseek' : (isQwenModel(model) ? 'alibaba' : 'deepseek');
+  const modelRoute = identityTransportRoute(model, 'opencode') || `${providerPrefix}/${model}`;
   const isDeepSeek = isDeepSeekModel(model);
 
   const args = [
     'run', '--auto', '--pure',
-    '--model', `${providerPrefix}/${model}`,
+    '--model', modelRoute,
     '--format', 'json',
     ...(isDeepSeek ? ['--variant', 'max'] : []),
   ];
@@ -369,7 +370,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
     if (!result.stdout || !_hasTextEvent(result.stdout)) {
       throw makeError(`opencode produced no usable text output (exhausted/quota/empty response). Check OpenCode Go balance at https://opencode.ai/account.`, 'OPencode_EXHAUSTED');
     }
-    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, tokensUsed: tokens };
+    return { stdout: result.stdout, stderr: result.stderr, provider: 'opencode', model_used: model, model_route: modelRoute, tokensUsed: tokens };
   } catch (error) {
     if (error?.code === 'OPencode_EXHAUSTED') throw error;
     if (error?.code === 'TIMEOUT') throw makeError(`opencode timed out after ${timeoutMs}ms`, 'TIMEOUT');

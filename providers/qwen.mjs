@@ -6,7 +6,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { ProviderError, isQwenModel } from './factory.mjs';
+import { ProviderError, identityTransportRoute, isQwenModel } from './factory.mjs';
 
 const BASE_URL = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
 const CHAT_ENDPOINT = '/chat/completions';
@@ -15,7 +15,7 @@ const DEFAULT_MAX_TOKENS = 65536;
 // Read API key: env var > key file.
 async function resolveApiKey(env = process.env) {
   if (env.QWEN_API_KEY) return env.QWEN_API_KEY;
-  const keyfile = path.join(os.homedir(), '.qwen-key');
+  const keyfile = path.join(env.HOME || os.homedir(), '.qwen-key');
   try {
     const key = (await readFile(keyfile, 'utf8')).trim();
     if (key) return key;
@@ -25,14 +25,13 @@ async function resolveApiKey(env = process.env) {
 
 // Map ocask model IDs to Alibaba DashScope model IDs.
 const MODEL_MAP = {
-  'qwen3.7-plus': 'qwen-plus',
   'qwen3.7-max': 'qwen-max',
   'qwen3.6-plus': 'qwen-plus-2025',   // fallback to latest plus
   'qwen3.6-pro': 'qwen-plus',
 };
 
 function apiModel(model) {
-  return MODEL_MAP[model] || model;
+  return identityTransportRoute(model, 'qwen') || MODEL_MAP[model] || model;
 }
 
 function classifyError(status, body) {
@@ -139,7 +138,13 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       const stdout = JSON.stringify([
         { type: 'text', timestamp: Date.now(), part: { type: 'text', text: outputText } },
       ]);
-      return { stdout, stderr: '', provider: 'qwen', model_used: apiModelId, tokensUsed: { input: 0, output: 0, total: 0 } };
+      const returnedRoute = typeof body.model === 'string' && body.model ? body.model : apiModelId;
+      return {
+        stdout, stderr: '', provider: 'qwen',
+        model_used: returnedRoute === apiModelId ? model : returnedRoute,
+        model_route: apiModelId, provider_model_used: returnedRoute,
+        tokensUsed: { input: 0, output: 0, total: 0 },
+      };
     }
     throw Object.assign(new ProviderError('Qwen returned empty response content', 'MALFORMED_RESPONSE'), { code: 'MALFORMED_RESPONSE' });
   }
@@ -150,9 +155,12 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
 
   const usage = body.usage || {};
   const stderr = `[Qwen API] tokens: ${usage.prompt_tokens || 0} in / ${usage.completion_tokens || 0} out / ${usage.total_tokens || 0} total`;
+  const returnedRoute = typeof body.model === 'string' && body.model ? body.model : apiModelId;
+  const modelUsed = returnedRoute === apiModelId ? model : returnedRoute;
 
   return {
-    stdout, stderr, provider: 'qwen', model_used: apiModelId,
+    stdout, stderr, provider: 'qwen', model_used: modelUsed, model_route: apiModelId,
+    provider_model_used: returnedRoute,
     tokensUsed: { input: usage.input_tokens || usage.prompt_tokens || 0, output: usage.output_tokens || usage.completion_tokens || 0, total: usage.total_tokens || 0 },
   };
 }

@@ -36,6 +36,58 @@ const QWEN_MODELS = new Set([
   'qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-plus', 'qwen3.6-pro',
 ]);
 
+// Curated identity-trust table. Every entry is a HUMAN-ASSERTED DECLARATION,
+// never a cryptographic verification. The table is the sole authority for which
+// transports may carry an identity pin and for the exact route those transports
+// execute. A non-null snapshotId is itself the wire model ID and supersedes the
+// mutable modelRoute alias; null means that transport exposes no usable snapshot.
+const IDENTITY_TRANSPORT_TRUST = Object.freeze({
+  'deepseek-v4-pro': Object.freeze([
+    Object.freeze({
+      provider: 'deepseek',
+      modelRoute: 'deepseek-chat',
+      snapshotId: null,
+      equivalence: 'declared',
+      snapshotStatus: 'vendor-exposes-no-snapshot',
+      declaration: 'Human-curated declaration that the direct DeepSeek route serves the deepseek-v4-pro weights.',
+      provenance: '.evidence/issue5-nofallback-decision.md',
+    }),
+    Object.freeze({
+      provider: 'opencode',
+      modelRoute: 'deepseek/deepseek-v4-pro',
+      snapshotId: null,
+      equivalence: 'declared',
+      snapshotStatus: 'vendor-exposes-no-snapshot',
+      declaration: 'Human-curated declaration that the OpenCode route serves the deepseek-v4-pro weights.',
+      provenance: '.evidence/issue5-nofallback-decision.md',
+    }),
+  ]),
+  'qwen3.7-plus': Object.freeze([
+    Object.freeze({
+      provider: 'qwen',
+      modelRoute: 'qwen-plus',
+      snapshotId: null,
+      equivalence: 'declared',
+      snapshotStatus: 'vendor-exposes-no-snapshot',
+      declaration: 'Human-curated declaration that the native Qwen route serves the qwen3.7-plus weights.',
+      provenance: '.evidence/issue5-nofallback-decision.md',
+    }),
+    Object.freeze({
+      provider: 'opencode',
+      modelRoute: 'alibaba/qwen3.7-plus',
+      snapshotId: null,
+      equivalence: 'declared',
+      snapshotStatus: 'vendor-exposes-no-snapshot',
+      declaration: 'Human-curated declaration that the OpenCode route serves the qwen3.7-plus weights.',
+      provenance: '.evidence/issue5-nofallback-decision.md',
+    }),
+  ]),
+});
+
+export function identityTransportTrustTable() {
+  return IDENTITY_TRANSPORT_TRUST;
+}
+
 export function isDeepSeekModel(model) {
   return DEEPSEEK_MODELS.has(model) || /^deepseek/.test(model);
 }
@@ -67,6 +119,82 @@ const DEFAULT_FALLBACK_CHAIN = {
   opencode: ['opencode', 'deepseek', 'qwen'],
 };
 
+function uniqueProviders(values) {
+  return [...new Set(values)];
+}
+
+export function providerSupportsModel(provider, model) {
+  const family = modelFamily(model);
+  if (provider === 'opencode') return family === 'deepseek' || family === 'qwen';
+  if (provider === 'deepseek') return family === 'deepseek';
+  if (provider === 'qwen') return family === 'qwen';
+  return false;
+}
+
+export function identityTransportsForModel(model) {
+  return [...(IDENTITY_TRANSPORT_TRUST[model] || [])];
+}
+
+export function identityTransportForModel(model, provider) {
+  return IDENTITY_TRANSPORT_TRUST[model]?.find(entry => entry.provider === provider) || null;
+}
+
+export function isIdentityPreservingTransport(model, provider) {
+  return identityTransportForModel(model, provider)?.equivalence === 'declared';
+}
+
+// Provider modules call this for table-backed models, eliminating route drift.
+// snapshotId is deliberately executable: adding a non-null pin changes the wire
+// route without requiring a second edit in the provider implementation.
+export function identityTransportRoute(model, provider) {
+  const entry = identityTransportForModel(model, provider);
+  return entry ? (entry.snapshotId || entry.modelRoute) : null;
+}
+
+function identityTransportProviders(model) {
+  return identityTransportsForModel(model)
+    .filter(entry => entry.equivalence === 'declared')
+    .map(entry => entry.provider);
+}
+
+export function resolveProviderChain({ model, preferredProvider = null, noFallback = false, chain = null }) {
+  const primary = preferredProvider || defaultProvider(model);
+  const configuredChain = chain?.[primary];
+  let providers;
+
+  // --provider pins the wire and therefore takes precedence over configuration.
+  if (preferredProvider) {
+    providers = [preferredProvider];
+  } else if (configuredChain && Array.isArray(configuredChain)) {
+    providers = configuredChain;
+  } else if (noFallback) {
+    providers = identityTransportProviders(model);
+  } else {
+    providers = DEFAULT_FALLBACK_CHAIN[primary] || [primary];
+  }
+
+  // FINAL, unconditional gates. No preferred provider or configured chain can
+  // bypass serving compatibility; an identity pin additionally admits only the
+  // explicitly declared transports in the trust table.
+  let filtered = uniqueProviders(providers);
+  if (noFallback) filtered = filtered.filter(provider => isIdentityPreservingTransport(model, provider));
+  filtered = filtered.filter(provider => providerSupportsModel(provider, model));
+
+  if (preferredProvider && !providerSupportsModel(preferredProvider, model)) {
+    throw Object.assign(
+      new ProviderError(`Provider ${preferredProvider} does not serve model ${model}`, 'MODEL_NOT_FOUND'),
+      { provider: preferredProvider },
+    );
+  }
+  if (preferredProvider && noFallback && !isIdentityPreservingTransport(model, preferredProvider)) {
+    throw Object.assign(
+      new ProviderError(`Provider ${preferredProvider} is not a declared identity transport for ${model}`, 'MODEL_NOT_FOUND'),
+      { provider: preferredProvider },
+    );
+  }
+  return filtered;
+}
+
 const RETRYABLE_CODES = new Set([
   'RATE_LIMITED', 'AUTH_FAILURE', 'TIMEOUT', 'PROVIDER_ERROR',
   'CONNECTION_ERROR', 'MODEL_NOT_FOUND',
@@ -83,9 +211,12 @@ export async function invokeWithFallback({
   noFallback = false,
   chain = null,
 }) {
-  const primary = preferredProvider || defaultProvider(model);
-  const providers = (chain && chain[primary]) || DEFAULT_FALLBACK_CHAIN[primary] || [primary];
-  const fallbackProviders = noFallback ? [primary] : providers;
+  const providers = resolveProviderChain({ model, preferredProvider, noFallback, chain });
+  const fallbackProviders = providers;
+
+  if (!fallbackProviders.length) {
+    throw new ProviderError(`No declared serving providers available for ${model}`, 'NO_PROVIDER');
+  }
 
   let lastError = null;
   const attempts = [];
