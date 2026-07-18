@@ -65,6 +65,7 @@ async function makeFakeOpenCodeCli(mode = 'success') {
   const binDir = path.join(root, 'bin');
   const homeDir = path.join(root, 'home');
   const tracePath = path.join(root, 'opencode-args.json');
+  const promptTracePath = path.join(root, 'opencode-prompts.json');
   const metadataPath = path.join(root, 'metadata.json');
   const ocaskPath = path.join(root, 'ocask');
   await fs.mkdir(binDir);
@@ -74,6 +75,10 @@ async function makeFakeOpenCodeCli(mode = 'success') {
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.OCASK_TEST_OPENCODE_TRACE, JSON.stringify(args) + '\\n');
+let prompt = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { prompt += chunk; });
+process.stdin.on('end', () => fs.appendFileSync(process.env.OCASK_TEST_OPENCODE_PROMPT_TRACE, JSON.stringify(prompt) + '\\n'));
 const route = args[args.indexOf('--model') + 1];
 if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith('deepseek/')) {
   process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({reason:'Primary deliberately omitted its verdict.'})}}) + '\\n');
@@ -102,15 +107,20 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
     XDG_DATA_HOME: path.join(root, 'data'),
     OCASK_DISABLE_SERVER: '1',
     OCASK_TEST_OPENCODE_TRACE: tracePath,
+    OCASK_TEST_OPENCODE_PROMPT_TRACE: promptTracePath,
     OCASK_TEST_OPENCODE_MODE: mode,
     DEEPSEEK_API_KEY: '',
     QWEN_API_KEY: '',
   };
-  return { root, tracePath, metadataPath, ocaskPath, env };
+  return { root, tracePath, promptTracePath, metadataPath, ocaskPath, env };
 }
 
 async function readOpenCodeTrace(tracePath) {
   return (await fs.readFile(tracePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+}
+
+async function readOpenCodePrompts(promptTracePath) {
+  return (await fs.readFile(promptTracePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
 }
 
 // ── Arg parsing ──
@@ -432,6 +442,7 @@ test('runAsk --panel --risk trivial uses the solo path and emits no panel.result
       requireVerdict: true,
       panel: true,
       risk: 'trivial',
+      lens: 'security',
       provider: 'opencode',
       invokeWithFallbackFn: async options => {
         calls.push(options);
@@ -440,6 +451,9 @@ test('runAsk --panel --risk trivial uses the solo path and emits no panel.result
     });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].model, DEEPSEEK_PRO_MODEL);
+    assert.match(calls[0].prompt, /Injection surfaces/);
+    assert.doesNotMatch(calls[0].prompt, /Module boundaries/);
+    assert.doesNotMatch(calls[0].prompt, /Code smells/);
     assert.equal(result.verdict, 'APPROVED');
     assert.equal(Object.hasOwn(result, 'consensus'), false);
     assert.equal(Object.hasOwn(result, 'members'), false);
@@ -462,6 +476,7 @@ test('runAsk risk default/high and bare --panel use the same cross-family K=2 pa
       requireVerdict: true,
       panel: true,
       risk,
+      lens: 'tdd',
       invokeWithFallbackFn: async options => {
         calls.push(options);
         return { provider: 'opencode', model_used: options.model, commandOutput: 'VERDICT: APPROVED\n\nRationale: independent review.' };
@@ -469,6 +484,11 @@ test('runAsk risk default/high and bare --panel use the same cross-family K=2 pa
     });
     assert.deepEqual(calls.map(call => call.model).sort(), [DEEPSEEK_PRO_MODEL, QWEN_MODEL].sort());
     assert.ok(calls.every(call => call.noFallback === (risk === 'high')));
+    assert.ok(calls.every(call => call.prompt.includes('Test-contract alignment') === (risk !== 'high')),
+      `${risk ?? 'bare'} panel must preserve the caller lens unless high risk`);
+    assert.ok(calls.every(call => call.prompt.includes('Injection surfaces') === (risk === 'high')));
+    assert.ok(calls.every(call => call.prompt.includes('Correctness') === (risk === 'high')));
+    assert.ok(calls.every(call => call.prompt.includes('Module boundaries') === (risk === 'high')));
     assert.equal(result.consensus.k, 2);
     assert.equal(result.consensus.n, 2);
     assert.equal(result.members.length, 2);
@@ -571,6 +591,15 @@ test('security lens injects framework', () => {
   assert.match(prompt, /## AUDIT FRAMEWORK/);
   assert.match(prompt, /Injection surfaces/);
   assert.match(prompt, /Auth and access/);
+});
+
+test('high-risk-full lens combines security, code-review, and architecture in one audit framework', () => {
+  const prompt = buildPrompt({ taskText: 'Audit', requireVerdict: true, lens: 'high-risk-full' });
+  assert.equal(prompt.match(/## AUDIT FRAMEWORK/g)?.length, 1);
+  assert.match(prompt, /## AUDIT FRAMEWORK — HIGH-RISK-FULL/);
+  assert.match(prompt, /Injection surfaces/);
+  assert.match(prompt, /Correctness/);
+  assert.match(prompt, /Module boundaries/);
 });
 
 test('general lens omits framework', () => {
@@ -1505,6 +1534,13 @@ test('real CLI: --panel --risk trivial is solo while default/high reach OpenCode
       }
       const traces = await readOpenCodeTrace(fixture.tracePath);
       assert.equal(traces.length, expectedCalls);
+      if (risk === 'high') {
+        const prompts = await readOpenCodePrompts(fixture.promptTracePath);
+        assert.equal(prompts.length, 2);
+        assert.ok(prompts.every(prompt => prompt.includes('Injection surfaces')));
+        assert.ok(prompts.every(prompt => prompt.includes('Correctness')));
+        assert.ok(prompts.every(prompt => prompt.includes('Module boundaries')));
+      }
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
