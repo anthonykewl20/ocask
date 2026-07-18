@@ -353,7 +353,7 @@ test('HTTP status and retry-after propagate from the originating cause', () => {
   );
   const cls = classifyFailure(wrapAsExhausted(origin));
   assert.equal(cls.mechanism, 'RATE_LIMITED');
-  assert.equal(cls.locus, 'their-side');
+  assert.equal(cls.locus, 'our-side');
   assert.equal(cls.http_status, 429);
   assert.equal(cls.retry_after, '42');
 });
@@ -602,6 +602,22 @@ test('issue10: timeout is inferred as timeout/hang, never credentials auth', () 
   assert.match(root.fix ?? '', /timeout|hang|investigate|trial|swit/);
 });
 
+test('issue10: a classified HTTP 429 is inferred as rate-limited on our side', () => {
+  const origin = Object.assign(
+    new ProviderError('rate limited', 'RATE_LIMITED'),
+    { code: 'RATE_LIMITED', provider: 'qwen', status: 429 },
+  );
+  const classification = classifyFailure(wrapAsExhausted(origin));
+  const attempts = [{
+    outcome: 'failed', provider: 'qwen', model: QWEN_MODEL,
+    ...classification,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(classification.locus, 'our-side');
+  assert.match(root.cause, /rate-limited \(our-side\)/i);
+  assert.notEqual(root.cause, 'undetermined');
+});
+
 test('issue10: billing cause requires ENTITLEMENT/402 evidence for that provider only', () => {
   const provider = {
     provider_model: 'deepseek/deepseek-v4-flash',
@@ -674,6 +690,25 @@ test('issue10: doctor suggestions path reaches HANG for a censored bucket ≫ P9
   assert.ok(suggestions.some(a => /HANG/i.test(a.action)), 'doctor path must classify a censored ≫P99 timeout as HANG');
   assert.ok(suggestions.some(a => /Do NOT increase --timeout-ms/i.test(a.action)), 'hang advice must forbid increasing the timeout');
   assert.equal(suggestions.some(a => /HANG/i.test(a.action) && /\bIncrease --timeout-ms\b/.test(a.action)), false);
+});
+
+test('issue10: HANG guidance never coexists with advice to increase timeout', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-pro',
+    total: 2, success: 1, success_rate: '50.0%',
+    avg_latency_ms: 45000, uncensored_latency_count: 1,
+    healthy_p99_ms: 10000,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000],
+      durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  const hangAction = suggestions.find(a => /Do NOT increase --timeout-ms/i.test(a.action));
+  assert.ok(hangAction);
+  assert.equal(suggestions.some(a => a !== hangAction && /increase\b.*timeout|increasing timeout/i.test(a.action)), false);
 });
 
 test('issue10: latency advice excludes censored samples from averaged advice threshold', () => {
@@ -761,6 +796,18 @@ test('issue10: no evidence does not emit a cause', () => {
   }];
   const root = _inferRootCause(attempts, [], null, {});
   assert.equal(root.cause, 'undetermined');
+});
+
+test('issue10: no attempt records and no terminal error is undetermined', () => {
+  const root = _inferRootCause([], [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /no attempt records and no terminal error/i);
+});
+
+test('issue10: terminal error without failed attempts is observed but undetermined', () => {
+  const root = _inferRootCause([], [], { error_code: 'SPAWN' }, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /SPAWN/);
 });
 
 test('issue10: _inferRootCause with two distinct mechanisms yields undetermined', () => {

@@ -43,12 +43,12 @@ async function ensureLogDir() {
 
 // Originating codes whose failure is on the provider's side of the wire.
 const _THEIR_SIDE = new Set([
-  'TIMEOUT', 'RATE_LIMITED', 'CONNECTION_ERROR', 'ENTITLEMENT_UNAVAILABLE',
+  'TIMEOUT', 'CONNECTION_ERROR', 'ENTITLEMENT_UNAVAILABLE',
   'PROVIDER_ERROR', 'INSUFFICIENT_BALANCE', 'MALFORMED_RESPONSE', 'OPencode_EXHAUSTED',
 ]);
 // Originating codes whose failure is on our side (config / environment / our gate).
 const _OUR_SIDE = new Set([
-  'AUTH_FAILURE', 'PROVIDER_UNAVAILABLE', 'NO_PROVIDER', 'MODEL_NOT_FOUND',
+  'AUTH_FAILURE', 'RATE_LIMITED', 'PROVIDER_UNAVAILABLE', 'NO_PROVIDER', 'MODEL_NOT_FOUND',
   'MODEL_NOT_ALLOWED', 'ENOENT', 'SPAWN', 'SERVER_SETUP', 'OUTPUT_LIMIT',
 ]);
 // Originating codes where the model replied but the reply was unusable.
@@ -553,6 +553,7 @@ export function generateSuggestions(providers, flakes) {
   for (const p of providers) {
     const failureBuckets = p.failure_buckets || [];
     if (failureBuckets.length === 0) continue;
+    let hasHangFinding = false;
     for (const failure of failureBuckets) {
       // The bucket aggregates duration as maxDurationMs + a censored COUNT; map those to the
       // per-attempt shape _inferFailureFinding reads so the hang branch (censored + ≫P99) is
@@ -562,6 +563,7 @@ export function generateSuggestions(providers, flakes) {
         p.healthy_p99_ms,
         { requireExplicitEntitlement: true },
       );
+      if (finding.cause.includes('HANG')) hasHangFinding = true;
       const observation = _safeObservation({
         provider: failure.provider,
         model: failure.model,
@@ -596,10 +598,10 @@ export function generateSuggestions(providers, flakes) {
       }
     }
 
-    if (p.uncensored_latency_count > 0 && p.avg_latency_ms > 30000) {
+    if (!hasHangFinding && p.uncensored_latency_count > 0 && p.avg_latency_ms > 30000) {
       suggestions.push({
         severity: 'medium',
-        action: `Provider ${p.provider_model}: uncensored avg latency ${p.avg_latency_ms}ms. Consider increasing timeout or provider hedge.`,
+        action: `Provider ${p.provider_model}: high uncensored avg latency ${p.avg_latency_ms}ms; consider hedging a second provider or investigating the slow tail.`,
       });
     }
 
@@ -716,7 +718,7 @@ function _summarizeEvent(e) {
 }
 
 export function _inferRootCause(attempts, fallbacks, error, start) {
-  if (!error && attempts.every(a => a.outcome === 'success')) {
+  if (attempts.length > 0 && !error && attempts.every(a => a.outcome === 'success')) {
     return { cause: 'All attempts succeeded — no failure.', fix: null };
   }
 
@@ -728,8 +730,20 @@ export function _inferRootCause(attempts, fallbacks, error, start) {
   const healthyP99Ms = _percentile(successDurations, 0.99);
 
   if (failed.length === 0) {
+    if (attempts.length === 0 && !error) {
+      return {
+        cause: 'undetermined',
+        fix: 'Observed: no attempt records and no terminal error.',
+      };
+    }
+    if (error) {
+      return {
+        cause: 'undetermined',
+        fix: `Observed: terminal error ${error.error_code ?? 'unknown'}, no failed attempt records.`,
+      };
+    }
     return {
-      cause: error ? `Terminal error without failed attempts: ${error.error_code}` : 'Unknown failure pattern.',
+      cause: 'Unknown failure pattern.',
       fix: 'Run ocask with --timeout-ms to capture timeout details.',
     };
   }
