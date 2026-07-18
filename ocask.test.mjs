@@ -35,6 +35,8 @@ import {
   unwrapOrigin,
   readLog,
   startRun,
+  scrubMessage,
+  MAX_MECHANISM_MSG_LENGTH,
 } from './logging.mjs';
 import {
   ProviderError,
@@ -623,6 +625,9 @@ test('HTTP status and retry-after propagate from the originating cause', () => {
 test('logAttemptResult writes the full failure-record taxonomy to the log', async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-tax-'));
   const prevXdg = process.env.XDG_DATA_HOME;
+  const prevDeepseek = process.env.DEEPSEEK_API_KEY;
+  const mechanismValue = 'sk-live-fake-key-1234567890';
+  process.env.DEEPSEEK_API_KEY = mechanismValue;
   process.env.XDG_DATA_HOME = tmp;
   startRun('tax-test-run');
   try {
@@ -636,12 +641,13 @@ test('logAttemptResult writes the full failure-record taxonomy to the log', asyn
       provider: unwrapOrigin(wrapped).provider, model: 'deepseek-v4-flash',
       attemptIndex: 0, outcome: 'failed', durationMs: 5000, timeoutMs: 5000,
       reasonCode: classification.mechanism, outputBytes: 0, tokensUsed: null,
-      errorClass: 'ProviderError', classification,
+      errorClass: 'ProviderError', classification, mechanismMessage: `timed out with ${mechanismValue}`,
     });
     const entries = await readLog();
     const rec = entries.find(e => e.event === 'attempt.result');
     assert.ok(rec, 'attempt.result record was written');
     assert.equal(rec.provider, 'deepseek', 'real provider, not unknown');
+    assert.equal(rec.mechanism_message.includes('sk-live-fake-key-1234567890'), false);
     assert.equal(rec.class, 'no-judgment');
     assert.equal(rec.subclass, 'reply-absent');
     assert.equal(rec.locus, 'their-side');
@@ -650,8 +656,53 @@ test('logAttemptResult writes the full failure-record taxonomy to the log', asyn
     assert.equal(rec.timeout_ms, 5000);
     assert.equal(rec.reason_code, 'TIMEOUT');
   } finally {
+    if (prevDeepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = prevDeepseek;
     if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = prevXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('main(): failure metadata never includes mechanism_message (local-only mechanism text)', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-meta-'));
+  const metadataPath = path.join(tmp, 'metadata.json');
+  const home = path.join(tmp, 'home');
+  await fs.mkdir(home, { recursive: true });
+
+  const prevHome = process.env.HOME;
+  const prevDataHome = process.env.XDG_DATA_HOME;
+  const prevRuntime = process.env.XDG_RUNTIME_DIR;
+
+  process.env.HOME = home;
+  process.env.XDG_DATA_HOME = tmp;
+  process.env.XDG_RUNTIME_DIR = path.join(tmp, 'runtime');
+  try {
+    const { exitCode } = await runFakeMain(
+      ['--model', DEEPSEEK_MODEL, '--task', 'metadata confinement', '--require-verdict', '--json', '--metadata', metadataPath],
+      null,
+      { stdout: [], stderr: [] },
+      {
+        ...process.env,
+        HOME: home,
+        DEEPSEEK_API_KEY: '',
+        QWEN_API_KEY: '',
+        OPENCODE_SERVER_PASSWORD: '',
+      },
+    );
+    assert.equal(exitCode, 30);
+
+    const text = await fs.readFile(metadataPath, 'utf8');
+    const parsed = JSON.parse(text || '{}');
+    assert.equal('mechanism_message' in parsed, false, 'mechanism_message must never be in --metadata object');
+    assert.equal(Array.isArray(parsed.attempts), true);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevDataHome;
+    if (prevRuntime === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = prevRuntime;
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
@@ -881,16 +932,56 @@ function fakeJudgment(verdict, text) {
   });
 }
 
-async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }) {
+async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }, env = process.env) {
   const prev = process.exitCode;
   await runMain(argv,
     (l) => capture.stdout.push(l), (l) => capture.stderr.push(l),
-    process.stdin, process.cwd(), process.env, fakeRunAsk);
+    process.stdin, process.cwd(), env, fakeRunAsk);
   const out = capture.stdout.join('');
   const restored = process.exitCode;
   process.exitCode = prev;
   return { exitCode: restored, stdout: out, stderr: capture.stderr.join('') };
 }
+
+test('scrubMessage strips fake DEEPSEEK_API_KEY from mechanism payload while preserving context', async () => {
+  const secret = 'sk-live-fake-key-1234567890';
+  const text = `DeepSeek API error: invalid credentials ${secret} for model deepseek-v4-flash`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  assert.equal(out.includes(secret), false, 'secret token must be removed');
+  assert.equal(out.includes('DEEPSEEK_API_KEY'), false);
+  assert.match(out, /\[redacted:own-key-[0-9a-f]{8}\]/);
+  assert.match(out, /invalid credentials/);
+  assert.match(out, /deepseek-v4-flash/);
+});
+
+test('scrubMessage returns placeholder when scrubbing fails', async () => {
+  const secret = 'sk-live-fake-key-1234567890';
+  const text = `DeepSeek API error: invalid credentials ${secret}`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' }, {
+    createHashImpl: () => { throw new Error('crypto unavailable'); },
+  });
+  assert.equal(out, '[scrubbed:unavailable]');
+  assert.equal(out.includes(secret), false, 'placeholder must replace raw message');
+});
+
+test('scrubMessage enforces a max mechanism-message length and marks truncation', async () => {
+  const out = await scrubMessage('A'.repeat(250));
+  assert.equal(out.length, MAX_MECHANISM_MSG_LENGTH);
+  assert.equal(out.endsWith('…[truncated]'), true);
+
+  const exactly = 'B'.repeat(MAX_MECHANISM_MSG_LENGTH);
+  const stable = await scrubMessage(exactly);
+  assert.equal(stable.length, MAX_MECHANISM_MSG_LENGTH);
+  assert.equal(stable.endsWith('…[truncated]'), false);
+});
+
+test('scrubMessage strips a secret that straddles the 200-char boundary', async () => {
+  const secret = 'sk-live-fake-boundary-key-123456';
+  const text = `${'A'.repeat(196)}${secret}:tail`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  assert.equal(out.includes(secret), false);
+  assert.equal(out.includes(secret.slice(0, 8)), false);
+});
 
 test('main(): APPROVED verdict -> exit 0 + verdict in json', async () => {
   const { exitCode, stdout } = await runFakeMain(
@@ -1398,4 +1489,66 @@ test('issue10: summarizeChecks — warn (no fail) is degraded, all pass is healt
     { category: 'a', name: 'x', ok: true, status: 'pass' },
     { category: 'c', name: 'y', ok: false, status: 'warn' },
   ]).status, 'degraded');
+});
+
+test('issue9: stderr cause line is scrubbed of own secrets (Domain 3, ocask.mjs runMain catch)', async () => {
+  // Regression for the redactor audit: the human "ocask error: <cause>" line written to stderr must
+  // not echo our own key value if a provider error message contains it (e.g. a 401 body). runMain now
+  // routes `cause` through scrubMessage(cause) which reads process.env — so set a synthetic key.
+  const FAKE = 'sk-fake-domain3-secret-0987654321';
+  const prev = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = FAKE;
+  try {
+    const cause = `DeepSeek API error: Invalid API key: ${FAKE} (401)`;
+    const stderrLine = `ocask error: ${await scrubMessage(cause)}`;
+    assert.equal(stderrLine.includes(FAKE), false, 'stderr must not contain the raw key value');
+    assert.match(stderrLine, /redacted:own-key-/, 'the secret must be replaced by the redaction marker');
+    assert.match(stderrLine, /Invalid API key/, 'non-secret context is preserved');
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prev;
+  }
+});
+
+test('issue9: longest-first ordering — a longer key overlapping a shorter one is fully scrubbed (no orphan)', async () => {
+  // Design §7.1: secrets are matched longest-first so scrubbing a shorter key that is a prefix of a
+  // longer key cannot orphan the longer key's suffix. Here QWEN key is a prefix of the DEEPSEEK key.
+  const shortKey = 'sk-common-prefix-1234';          // 21 chars, >= MIN_SECRET_LENGTH
+  const longKey  = 'sk-common-prefix-1234-SUFFIX-XYZ789'; // longKey starts with shortKey
+  const env = { QWEN_API_KEY: shortKey, DEEPSEEK_API_KEY: longKey };
+  const out = await scrubMessage(`upstream rejected ${longKey} at edge`, env);
+  assert.equal(out.includes(longKey), false, 'the full long key must be removed');
+  assert.equal(out.includes('SUFFIX-XYZ789'), false, 'no orphaned suffix of the long key may survive');
+});
+
+test('issue9: MIN_SECRET_LENGTH guard — a sub-8-char value is NOT used as a scrub token (no over-scrub)', async () => {
+  const tiny = 'abc12';   // 5 chars, below MIN_SECRET_LENGTH (8)
+  const env = { DEEPSEEK_API_KEY: tiny, QWEN_API_KEY: '' };
+  const out = await scrubMessage(`benign text abc12 and abc12345 tail`, env);
+  assert.equal(out.includes('abc12'), true, 'a below-threshold value must not redact its occurrences');
+  assert.doesNotMatch(out, /redacted:own-key-/, 'no redaction should occur for a sub-threshold secret');
+});
+
+test('issue9: scrub uses the INVOCATION env, not process.env — a secret only in the injected env is scrubbed', async () => {
+  // Regression for the redactor Codex review (BLOCKED): logAttemptResult/logError scrubbed against
+  // process.env, but ocask invokes providers with an injected env (e.g. the generated opencode server
+  // password). A secret present ONLY in that injected env must still be scrubbed in the local record.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-scrubenv-'));
+  const prevXdg = process.env.XDG_DATA_HOME, prevKey = process.env.DEEPSEEK_API_KEY;
+  process.env.XDG_DATA_HOME = dir;
+  delete process.env.DEEPSEEK_API_KEY; // ensure the secret is NOT in process.env
+  try {
+    const FAKE = 'sk-only-injected-env-99887766';
+    await startRun({ model: 'deepseek-v4-pro' });
+    await logAttemptResult({
+      provider: 'opencode', model: 'deepseek-v4-pro', attemptIndex: 0, outcome: 'failed',
+      durationMs: 5, reasonCode: 'AUTH_FAILURE', mechanismMessage: `401 body echoed ${FAKE}`,
+      scrubEnv: { DEEPSEEK_API_KEY: FAKE },
+    });
+    const rec = (await readLog()).find(e => e.event === 'attempt.result');
+    assert.equal(JSON.stringify(rec).includes(FAKE), false, 'injected-env secret must not persist in the record');
+    assert.match(rec.mechanism_message, /redacted:own-key-/);
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = prevXdg;
+    if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;
+  }
 });

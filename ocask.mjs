@@ -15,7 +15,7 @@ import {
 } from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
   logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun,
-  classifyFailure, unwrapOrigin } from './logging.mjs';
+  classifyFailure, unwrapOrigin, scrubMessage } from './logging.mjs';
 import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
 import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 
@@ -444,7 +444,7 @@ export async function runAsk({
         provider: failProvider, model: failedModel, attemptIndex: attemptIdx,
         outcome: 'failed', durationMs: Date.now() - t0, timeoutMs: attemptTimeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
-        classification,
+        classification, mechanismMessage: error?.message, scrubEnv: env,
       });
       throw error;
     }
@@ -459,7 +459,12 @@ export async function runAsk({
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const primaryClass = classifyFailure(primaryError, { timeoutMs });
       const primaryProvider = unwrapOrigin(primaryError)?.provider || provider || defaultProvider(model) || 'unknown';
-      await logError({ model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown', errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass });
+      await logError({
+        model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown',
+        errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex,
+        durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass,
+        mechanismMessage: primaryError?.message, scrubEnv: env,
+      });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
     metadata.fallback_used = true;
@@ -470,7 +475,12 @@ export async function runAsk({
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const fbClass = classifyFailure(fbError, { timeoutMs });
       const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
-      await logError({ model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown', errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: fbClass });
+      await logError({
+        model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown',
+        errorClass: fbError?.constructor?.name, attemptCount: attemptIndex,
+        durationMs: metadata.duration_ms, timeoutMs, classification: fbClass,
+        mechanismMessage: fbError?.message, scrubEnv: env,
+      });
       fbError.ocaskMetadata = metadata; throw fbError;
     }
   }
@@ -715,7 +725,9 @@ export async function runMain(
     const classification = classifyFailure(error);
     const descriptor = describeOutcome({ verdict: null, output: null, classification, failed: true });
     process.exitCode = descriptor.exit_code;
-    writeStderr(`ocask error: ${cause}`); // human line retained for non-json callers
+    // Domain 3 (stderr) must carry no raw provider message: a 401 body etc. can echo our own
+    // key. Scrub the human cause line the same way the local log record is scrubbed (#9).
+    writeStderr(`ocask error: ${await scrubMessage(cause, env)}`); // human line retained for non-json callers
     if (argv.includes('--json')) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
     if (args?.metadata && error?.ocaskMetadata) {
       await writeAtomicPrivate(args.metadata, JSON.stringify(error.ocaskMetadata) + '\n').catch(() => {});

@@ -6,13 +6,112 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { locusFromStatus } from './system.mjs';
 
 export { locusFromStatus };
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB before rotation
 const ROTATION_KEEP = 2; // keep this many rotated files
+const MIN_SECRET_LENGTH = 8;
+export const MAX_MECHANISM_MSG_LENGTH = 200;
+const REDACTED_MECHANISM_PLACEHOLDER = '[scrubbed:unavailable]';
+const TRUNCATION_MARKER = '…[truncated]';
+
+const SCRUB_DEPS = {
+  readFile: (value) => fs.readFile(value, 'utf8'),
+  createHashImpl: createHash,
+};
+
+function _resolveRuntimeDir(env = process.env) {
+  if (env?.XDG_RUNTIME_DIR) return path.join(env.XDG_RUNTIME_DIR, 'ocask');
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 'user';
+  return path.join(os.tmpdir(), `ocask-${uid}`);
+}
+
+async function _readTrimmedText(filePath, readFileImpl) {
+  const raw = await readFileImpl(filePath);
+  return raw.trim();
+}
+
+async function _safeReadOptionalText(filePath, readFileImpl) {
+  try { return await _readTrimmedText(filePath, readFileImpl); }
+  catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EACCES' || error?.code === 'EISDIR') return null;
+    throw error;
+  }
+}
+
+function _sanitizeSecrets(values) {
+  const normalized = values
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter((value) => value.length >= MIN_SECRET_LENGTH);
+  return Array.from(new Set(normalized)).sort((a, b) => b.length - a.length || b.localeCompare(a));
+}
+
+function _sha256Trunc8(value, createHashImpl) {
+  return createHashImpl('sha256').update(value).digest('hex').slice(0, 8);
+}
+
+export async function gatherSecretValues(env = process.env, deps = {}) {
+  if (!env || typeof env !== 'object') {
+    throw new TypeError('env must be an object');
+  }
+  const { readFile = SCRUB_DEPS.readFile } = deps;
+  const homeDir = os.homedir();
+
+  const deepFile = await _safeReadOptionalText(path.join(homeDir, '.deepseek-key'), readFile);
+  const qwenFile = await _safeReadOptionalText(path.join(homeDir, '.qwen-key'), readFile);
+  const opencodeGoFile = await _safeReadOptionalText(path.join(homeDir, '.opencode-go-key'), readFile);
+  const statePath = path.join(_resolveRuntimeDir(env), 'server-state.json');
+  let statePassword = null;
+  try {
+    const rawState = await _safeReadOptionalText(statePath, readFile);
+    if (rawState) {
+      const state = JSON.parse(rawState);
+      statePassword = typeof state?.password === 'string' ? state.password.trim() : null;
+    }
+  } catch (error) {
+    if (error?.name !== 'SyntaxError') throw error;
+  }
+
+  return _sanitizeSecrets([
+    env.DEEPSEEK_API_KEY, env.QWEN_API_KEY, env.OPENCODE_SERVER_PASSWORD,
+    deepFile, qwenFile, opencodeGoFile, statePassword,
+  ]);
+}
+
+export function scrubSecrets(text, secrets, deps = {}) {
+  const { createHashImpl = SCRUB_DEPS.createHashImpl } = deps;
+  if (typeof text !== 'string') return text;
+  const values = Array.isArray(secrets) ? secrets : [];
+  let scrubbed = text;
+  for (const secret of values) {
+    if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) continue;
+    const marker = `[redacted:own-key-${_sha256Trunc8(secret, createHashImpl)}]`;
+    scrubbed = scrubbed.split(secret).join(marker);
+  }
+  return scrubbed;
+}
+
+export function boundMessage(text, maxLen = MAX_MECHANISM_MSG_LENGTH) {
+  if (typeof text !== 'string') return '';
+  if (text.length <= maxLen) return text;
+  if (maxLen <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, maxLen);
+  return text.slice(0, maxLen - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
+}
+
+export async function scrubMessage(rawMessage, env = process.env, deps = {}) {
+  if (rawMessage == null || rawMessage === '') return '';
+  if (typeof rawMessage !== 'string') return '';
+  try {
+    const secrets = await gatherSecretValues(env, deps);
+    const scrubbed = scrubSecrets(rawMessage, secrets, deps);
+    return boundMessage(scrubbed, MAX_MECHANISM_MSG_LENGTH);
+  } catch {
+    return REDACTED_MECHANISM_PLACEHOLDER;
+  }
+}
 
 // Resolve the log location at CALL time (not import time) so the path reflects
 // the live XDG_DATA_HOME — this lets tests redirect the log to a temp dir and
@@ -280,7 +379,8 @@ export async function logAttemptStart({ provider, model, attemptIndex }) {
 }
 
 export async function logAttemptResult({ provider, model, attemptIndex, outcome, durationMs,
-  timeoutMs = 0, reasonCode, outputBytes, tokensUsed, errorClass, classification = null }) {
+  timeoutMs = 0, reasonCode, outputBytes, tokensUsed, errorClass, classification = null,
+  mechanismMessage = '', scrubEnv = process.env }) {
   const record = {
     run_id: _currentRunId,
     provider,
@@ -293,6 +393,7 @@ export async function logAttemptResult({ provider, model, attemptIndex, outcome,
     output_bytes: outputBytes || 0,
     tokens_used: tokensUsed,
     error_class: errorClass || null,
+    mechanism_message: await scrubMessage(mechanismMessage, scrubEnv),
   };
   // Failure-record taxonomy (#2/#3): class/subclass/locus/mechanism/censored/...
   const cf = _classificationFields(classification);
@@ -324,7 +425,7 @@ export async function logVerdict({ verdict, model, provider, lens, durationMs, b
 }
 
 export async function logError({ model, provider, errorCode, errorClass, attemptCount, durationMs,
-  timeoutMs = 0, classification = null }) {
+  timeoutMs = 0, classification = null, mechanismMessage = '', scrubEnv = process.env }) {
   const record = {
     run_id: _currentRunId,
     model,
@@ -334,6 +435,7 @@ export async function logError({ model, provider, errorCode, errorClass, attempt
     attempts_exhausted: attemptCount,
     duration_ms: durationMs,
     timeout_ms: timeoutMs || 0,
+    mechanism_message: await scrubMessage(mechanismMessage, scrubEnv),
   };
   // Failure-record taxonomy (#2/#3): the true mechanism + class/subclass/locus.
   const cf = _classificationFields(classification);
