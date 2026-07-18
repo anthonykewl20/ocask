@@ -9,6 +9,7 @@ import test from 'node:test';
 import {
   buildPrompt,
   buildJsonResponse,
+  computeConsensus,
   defaultFallbackModel,
   describeOutcome,
   exitCodeForOutcome,
@@ -20,8 +21,10 @@ import {
   promptHash,
   readExistingPathOrLiteral,
   remainingBudget,
+  resolvePanelMembers,
   runAsk,
   runMain,
+  runPanel,
   resolveTimeout,
   validateAssistantOutput,
 } from './ocask.mjs';
@@ -49,6 +52,7 @@ import {
 import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
+const QWEN_MAX_MODEL = 'qwen3.7-max';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
 const DEEPSEEK_PRO_MODEL = 'deepseek-v4-pro';
 
@@ -58,6 +62,7 @@ async function makeFakeOpenCodeCli(mode = 'success') {
   const homeDir = path.join(root, 'home');
   const tracePath = path.join(root, 'opencode-args.json');
   const metadataPath = path.join(root, 'metadata.json');
+  const ocaskPath = path.join(root, 'ocask');
   await fs.mkdir(binDir);
   await fs.mkdir(homeDir);
   const executable = path.join(binDir, 'opencode');
@@ -71,11 +76,16 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'swap-failure' && route.startsWith('alibaba/')) {
   process.stderr.write('controlled qwen transport failure\\n');
   process.exitCode = 1;
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'slow') {
+  setTimeout(() => process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Late response.'})}}) + '\\n'), 1000);
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'cross' && route.startsWith('deepseek/')) {
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:'VERDICT: APPROVED\\n\\nRationale: buddy concurs.'}}) + '\\n');
 } else {
   process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Real factory path reached OpenCode.'})}}) + '\\n');
 }
 `);
   await fs.chmod(executable, 0o755);
+  await fs.symlink(fileURLToPath(new URL('ocask.mjs', import.meta.url)), ocaskPath);
   const env = {
     ...process.env,
     HOME: homeDir,
@@ -87,7 +97,7 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
     DEEPSEEK_API_KEY: '',
     QWEN_API_KEY: '',
   };
-  return { root, tracePath, metadataPath, env };
+  return { root, tracePath, metadataPath, ocaskPath, env };
 }
 
 async function readOpenCodeTrace(tracePath) {
@@ -112,8 +122,258 @@ test('paid-model gate rejects free and unknown models', () => {
 });
 
 test('default fallback is deterministic and from opposite family', () => {
-  assert.equal(defaultFallbackModel(DEEPSEEK_MODEL), 'qwen3.7-plus');
-  assert.equal(defaultFallbackModel('qwen3.7-max'), DEEPSEEK_MODEL);
+  assert.equal(defaultFallbackModel(DEEPSEEK_MODEL), 'qwen3.7-max');
+  assert.equal(defaultFallbackModel('qwen3.7-max'), DEEPSEEK_PRO_MODEL);
+});
+
+// ── Verify panel (#23) ──
+test('resolvePanelMembers selects a cross-family deepseek-pro + qwen-max panel', () => {
+  const members = resolvePanelMembers({
+    model: DEEPSEEK_PRO_MODEL,
+    noFallback: false,
+    preferredProvider: 'opencode',
+    env: process.env,
+  });
+  assert.deepEqual(members.map(member => member.model), [DEEPSEEK_PRO_MODEL, QWEN_MAX_MODEL]);
+  assert.deepEqual(members.map(member => member.family), ['deepseek', 'qwen']);
+  assert.deepEqual(members.map(member => member.transport), ['opencode', 'opencode']);
+  assert.equal(new Set(members.map(member => member.family)).size, 2);
+});
+
+test('resolvePanelMembers leaves an unsupported member transport empty for runtime abstention', () => {
+  const members = resolvePanelMembers({
+    model: DEEPSEEK_PRO_MODEL,
+    noFallback: false,
+    preferredProvider: 'deepseek',
+    env: process.env,
+  });
+  assert.equal(members[0].transport, 'deepseek');
+  assert.equal(members[1].transport, null);
+  assert.deepEqual(members[1].provider_chain, []);
+});
+
+test('resolvePanelMembers --no-fallback admits only identity-preserving transports', () => {
+  const members = resolvePanelMembers({ model: DEEPSEEK_PRO_MODEL, noFallback: true, env: process.env });
+  assert.equal(members.length, 2);
+  for (const member of members) {
+    assert.ok(member.provider_chain.length > 0);
+    assert.ok(member.provider_chain.every(transport => isIdentityPreservingTransport(member.model, transport)));
+  }
+});
+
+const panelJudgment = (model, verdict) => ({
+  model,
+  verdict,
+  classification: classifyFailure(null, { verdict }),
+});
+const panelAbstention = (model, mechanism = 'TIMEOUT') => ({
+  model,
+  verdict: null,
+  classification: classifyFailure(Object.assign(new ProviderError(mechanism, mechanism), { code: mechanism })),
+});
+
+test('computeConsensus returns unanimous APPROVED and counts only real judgments', () => {
+  const consensus = computeConsensus({
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'APPROVED')],
+    k: 2,
+  });
+  assert.equal(consensus.consensus_verdict, 'APPROVED');
+  assert.equal(consensus.agreement, true);
+  assert.equal(consensus.judgments_count, 2);
+  assert.equal(consensus.abstentions_count, 0);
+  assert.equal(consensus.degraded, false);
+});
+
+test('computeConsensus uses conservative WARNING/BLOCKED split tiebreakers', () => {
+  const warning = computeConsensus({
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'WARNING')],
+    k: 2,
+  });
+  assert.equal(warning.consensus_verdict, 'WARNING');
+  assert.equal(warning.agreement, false);
+
+  const blocked = computeConsensus({
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'BLOCKED')],
+    k: 2,
+  });
+  assert.equal(blocked.consensus_verdict, 'BLOCKED');
+  assert.equal(blocked.agreement, false);
+});
+
+test('computeConsensus never turns all abstentions into a verdict or agreement', () => {
+  const consensus = computeConsensus({
+    memberResults: [panelAbstention(DEEPSEEK_PRO_MODEL), panelAbstention(QWEN_MAX_MODEL, 'AUTH_FAILURE')],
+    k: 2,
+  });
+  assert.equal(consensus.consensus_verdict, null);
+  assert.equal(consensus.agreement, false);
+  assert.equal(consensus.judgments_count, 0);
+  assert.equal(consensus.abstentions_count, 2);
+  assert.equal(consensus.degraded, true);
+});
+
+test('computeConsensus returns quorum failure when one of two members abstains', () => {
+  const consensus = computeConsensus({
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelAbstention(QWEN_MAX_MODEL)],
+    k: 2,
+  });
+  assert.equal(consensus.consensus_verdict, null);
+  assert.equal(consensus.agreement, false);
+  assert.equal(consensus.judgments_count, 1);
+  assert.equal(consensus.abstentions_count, 1);
+  assert.equal(consensus.degraded, true);
+  assert.equal(consensus.member_verdicts[1].verdict, null);
+});
+
+test('runPanel launches members in parallel with one shared absolute deadline', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const calls = [];
+  const absoluteDeadlineMs = Date.now() + 1000;
+  const result = await runPanel({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    provider: 'opencode',
+    timeoutMs: 1000,
+    absoluteDeadlineMs,
+    run_id: 'panel-parallel-test',
+    invokeWithFallbackFn: async ({ model, timeoutMs }) => {
+      calls.push({ model, timeoutMs, startedAt: Date.now() });
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      active--;
+      return { provider: 'opencode', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: ok.' };
+    },
+  });
+  assert.equal(maxActive, 2, 'both panel members must overlap');
+  assert.deepEqual(new Set(calls.map(call => call.model)), new Set([DEEPSEEK_PRO_MODEL, QWEN_MAX_MODEL]));
+  assert.ok(calls.every(call => call.timeoutMs > 0 && call.timeoutMs <= 1000));
+  assert.ok(calls.every(call => call.startedAt + call.timeoutMs <= absoluteDeadlineMs + 5));
+  assert.equal(result.verdict, 'APPROVED');
+  assert.equal(result.consensus.judgments_count, 2);
+});
+
+test('runPanel classifies one member timeout as an abstention and fails K=2 quorum', async () => {
+  const result = await runPanel({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    provider: 'opencode',
+    timeoutMs: 1000,
+    absoluteDeadlineMs: Date.now() + 1000,
+    run_id: 'panel-abstention-test',
+    invokeWithFallbackFn: async ({ model }) => {
+      if (model === QWEN_MAX_MODEL) throw Object.assign(new ProviderError('timed out', 'TIMEOUT'), { code: 'TIMEOUT', provider: 'opencode' });
+      return { provider: 'opencode', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: ok.' };
+    },
+  });
+  assert.equal(result.verdict, null);
+  assert.equal(result.failed, true);
+  assert.equal(result.classification.mechanism, 'PANEL_QUORUM_FAILURE');
+  assert.equal(result.consensus.judgments_count, 1);
+  assert.equal(result.consensus.abstentions_count, 1);
+  assert.equal(result.members.find(member => member.model === QWEN_MAX_MODEL).classification.class, 'no-judgment');
+});
+
+test('runPanel turns a preferred provider incompatibility into NO_PROVIDER abstention', async () => {
+  const calls = [];
+  const result = await runPanel({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    provider: 'deepseek',
+    absoluteDeadlineMs: Date.now() + 1000,
+    run_id: 'panel-no-provider-test',
+    invokeWithFallbackFn: async ({ model }) => {
+      calls.push(model);
+      return { provider: 'deepseek', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: ok.' };
+    },
+  });
+  assert.deepEqual(calls, [DEEPSEEK_PRO_MODEL]);
+  assert.equal(result.verdict, null);
+  const abstention = result.members.find(member => member.model === QWEN_MAX_MODEL);
+  assert.equal(abstention.classification.class, 'no-judgment');
+  assert.equal(abstention.classification.mechanism, 'NO_PROVIDER');
+});
+
+test('runPanel uses the caller deadline and does not invoke after it expires', async () => {
+  let calls = 0;
+  const result = await runPanel({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    provider: 'opencode',
+    timeoutMs: 1000,
+    absoluteDeadlineMs: Date.now() - 1,
+    run_id: 'panel-expired-test',
+    invokeWithFallbackFn: async () => { calls++; throw new Error('must not run'); },
+  });
+  assert.equal(calls, 0);
+  assert.equal(result.verdict, null);
+  assert.equal(result.consensus.judgments_count, 0);
+  assert.equal(result.consensus.abstentions_count, 2);
+  assert.ok(result.members.every(member => member.classification.mechanism === 'TIMEOUT'));
+});
+
+test('runAsk --panel skips the primary/fallback/buddy flow and returns split WARNING consensus', async () => {
+  const calls = [];
+  const result = await runAsk({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    panel: true,
+    provider: 'opencode',
+    invokeWithFallbackFn: async ({ model }) => {
+      calls.push(model);
+      const verdict = model === DEEPSEEK_PRO_MODEL ? 'APPROVED' : 'WARNING';
+      return { provider: 'opencode', model_used: model, commandOutput: `VERDICT: ${verdict}\n\nRationale: independent review.` };
+    },
+  });
+  assert.deepEqual(new Set(calls), new Set([DEEPSEEK_PRO_MODEL, QWEN_MAX_MODEL]));
+  assert.equal(calls.length, 2, 'panel members are the only model invocations');
+  assert.equal(result.verdict, 'WARNING');
+  assert.equal(result.failed, false);
+  assert.equal(result.cross_verify, null);
+  assert.equal(result.metadata.panel.k, 2);
+});
+
+test('runPanel logs panel.result and keeps scrubbed mechanism messages local-only', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-panel-log-'));
+  const previousXdg = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = tmp;
+  const secret = 'sk-panel-injected-secret-123456789';
+  try {
+    const result = await runPanel({
+      model: DEEPSEEK_PRO_MODEL,
+      taskText: 'Review.',
+      requireVerdict: true,
+      provider: 'opencode',
+      absoluteDeadlineMs: Date.now() + 1000,
+      run_id: 'panel-log-test',
+      env: { ...process.env, DEEPSEEK_API_KEY: secret },
+      invokeWithFallbackFn: async () => {
+        throw Object.assign(new ProviderError(`provider echoed ${secret}`, 'AUTH_FAILURE'), { code: 'AUTH_FAILURE', provider: 'opencode' });
+      },
+    });
+    assert.equal(JSON.stringify(result).includes(secret), false, 'mechanism text must not enter the panel envelope');
+    const entries = await readLog();
+    const panelRecord = entries.find(entry => entry.event === 'panel.result' && entry.run_id === 'panel-log-test');
+    assert.ok(panelRecord);
+    assert.equal(panelRecord.verdict, null);
+    assert.equal(panelRecord.judgments_count, 0);
+    assert.equal(panelRecord.abstentions_count, 2);
+    assert.equal(panelRecord.degraded, true);
+    const attempts = entries.filter(entry => entry.event === 'attempt.result' && entry.run_id === 'panel-log-test');
+    assert.equal(attempts.length, 2);
+    assert.ok(attempts.every(entry => !entry.mechanism_message.includes(secret)));
+    assert.ok(attempts.every(entry => /redacted:own-key-/.test(entry.mechanism_message)));
+  } finally {
+    if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 test('same-family fallback rejects', () => {
@@ -791,6 +1051,64 @@ test('buildJsonResponse: first-class machine fields + output, exit_code agrees w
   assert.equal(json.exit_code, d.exit_code);
 });
 
+test('runMain rejects conflicting panel modes before any invocation', async () => {
+  let invoked = false;
+  const both = await runFakeMain(
+    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--cross-verify'],
+    async () => { invoked = true; },
+  );
+  assert.equal(both.exitCode, 30);
+  assert.match(both.stderr, /mutually exclusive/);
+
+  const fallback = await runFakeMain(
+    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--fallback-model', QWEN_MAX_MODEL],
+    async () => { invoked = true; },
+  );
+  assert.equal(fallback.exitCode, 30);
+  assert.match(fallback.stderr, /cannot be combined/);
+  assert.equal(invoked, false);
+});
+
+test('runMain panel consensus composes with WARNING and BLOCKED exit bands', async () => {
+  const warningResult = fakePanelEnvelope({ verdict: 'WARNING', judgments: 2, abstentions: 0 });
+  const warning = await runFakeMain(
+    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--json'],
+    async () => warningResult,
+  );
+  const warningJson = JSON.parse(warning.stdout);
+  assert.equal(warning.exitCode, 0);
+  assert.equal(warningJson.outcome, 'judgment');
+  assert.equal(warningJson.verdict, 'WARNING');
+  assert.equal(warningJson.consensus.judgments_count, 2);
+
+  const blockedResult = fakePanelEnvelope({ verdict: 'BLOCKED', judgments: 2, abstentions: 0 });
+  const blocked = await runFakeMain(
+    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--json'],
+    async () => blockedResult,
+  );
+  assert.equal(blocked.exitCode, 20);
+  assert.equal(JSON.parse(blocked.stdout).verdict, 'BLOCKED');
+});
+
+test('runMain panel quorum failure is no-judgment exit 30 with structured panel evidence', async () => {
+  for (const [judgments, abstentions] of [[0, 2], [1, 1]]) {
+    const result = fakePanelEnvelope({ verdict: null, judgments, abstentions });
+    const run = await runFakeMain(
+      ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--json'],
+      async () => result,
+    );
+    const response = JSON.parse(run.stdout);
+    assert.equal(run.exitCode, 30);
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.verdict, null);
+    assert.equal(response.reason, 'quorum_failure');
+    assert.equal(response.mechanism, 'PANEL_QUORUM_FAILURE');
+    assert.equal(response.consensus.judgments_count, judgments);
+    assert.equal(response.consensus.abstentions_count, abstentions);
+    assert.match(run.stderr, /ocask error: panel quorum failure/);
+  }
+});
+
 test('real CLI: --no-fallback missing native key falls through to OpenCode with identity preserved', async () => {
   const fixture = await makeFakeOpenCodeCli();
   try {
@@ -850,12 +1168,12 @@ test('real CLI: default-mode model swap is surfaced and flips identity_preserved
     const traces = await readOpenCodeTrace(fixture.tracePath);
     assert.equal(response.verdict, 'APPROVED');
     assert.equal(metadata.fallback_used, true);
-    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_model, QWEN_MAX_MODEL);
     assert.equal(metadata.actual_transport, 'opencode');
     assert.equal(metadata.identity_preserved, false);
     assert.deepEqual(traces.map(args => args[args.indexOf('--model') + 1]), [
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
-      identityTransportRoute(QWEN_MODEL, 'opencode'),
+      `alibaba/${QWEN_MAX_MODEL}`,
     ]);
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
@@ -876,9 +1194,79 @@ test('real CLI: failed default-mode model swap remains identity_preserved=false'
     assert.equal(response.outcome, 'no-judgment');
     assert.equal(response.verdict, null);
     assert.equal(metadata.fallback_used, true);
-    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_model, QWEN_MAX_MODEL);
     assert.equal(metadata.actual_transport, 'opencode');
     assert.equal(metadata.identity_preserved, false);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: --panel emits unanimous cross-family consensus and is never silent', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    const run = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Output exactly a valid approved verdict with rationale.',
+      '--require-verdict', '--panel', '--provider', 'opencode', '--json',
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.ok(Buffer.byteLength(run.stdout, 'utf8') + Buffer.byteLength(run.stderr, 'utf8') > 0, 'rc=0 must never be silent');
+    const response = JSON.parse(run.stdout);
+    assert.equal(response.outcome, 'judgment');
+    assert.equal(response.verdict, 'APPROVED');
+    assert.equal(response.consensus.agreement, true);
+    assert.equal(response.consensus.judgments_count, 2);
+    assert.deepEqual(new Set(response.members.map(member => member.model)), new Set([DEEPSEEK_PRO_MODEL, QWEN_MAX_MODEL]));
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      `alibaba/${QWEN_MAX_MODEL}`,
+    ]));
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('installed-symlink CLI: --panel timeout shares one wall-clock and returns quorum failure', async () => {
+  const fixture = await makeFakeOpenCodeCli('slow');
+  try {
+    const startedAt = Date.now();
+    const run = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict after waiting.',
+      '--require-verdict', '--panel', '--provider', 'opencode', '--timeout-ms', '100', '--json',
+    ], { encoding: 'utf8', env: fixture.env });
+    const durationMs = Date.now() - startedAt;
+    assert.equal(run.status, 30, `exit ${run.status}: ${run.stderr}`);
+    assert.ok(durationMs < 900, `parallel panel exceeded shared deadline: ${durationMs}ms`);
+    const response = JSON.parse(run.stdout);
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.reason, 'quorum_failure');
+    assert.equal(response.consensus.judgments_count, 0);
+    assert.equal(response.consensus.abstentions_count, 2);
+    assert.match(run.stderr, /ocask error: panel quorum failure/);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('installed-symlink CLI: existing --cross-verify buddy path remains operational', async () => {
+  const fixture = await makeFakeOpenCodeCli('cross');
+  try {
+    const run = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', QWEN_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.ok(Buffer.byteLength(run.stdout, 'utf8') > 0);
+    assert.equal(JSON.parse(run.stdout).verdict, 'APPROVED');
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
+      identityTransportRoute(QWEN_MODEL, 'opencode'),
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+    ]));
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
@@ -930,6 +1318,42 @@ function fakeJudgment(verdict, text) {
     classification: { class: 'judgment', subclass: null, locus: null, mechanism: null },
     metadata: {}, run_id: 'fake',
   });
+}
+
+function fakePanelEnvelope({ verdict, judgments, abstentions }) {
+  const failed = verdict === null;
+  const classification = failed
+    ? { class: 'no-judgment', subclass: 'indeterminate', locus: null, mechanism: 'PANEL_QUORUM_FAILURE' }
+    : classifyFailure(null, { verdict });
+  const members = [
+    {
+      model: DEEPSEEK_PRO_MODEL, transport: 'opencode',
+      verdict: judgments >= 1 ? (verdict || 'APPROVED') : null,
+      classification: judgments >= 1 ? classifyFailure(null, { verdict: verdict || 'APPROVED' }) : panelAbstention(DEEPSEEK_PRO_MODEL).classification,
+      output_preview: '',
+    },
+    {
+      model: QWEN_MAX_MODEL, transport: 'opencode',
+      verdict: judgments >= 2 ? (verdict || 'APPROVED') : null,
+      classification: judgments >= 2 ? classifyFailure(null, { verdict: verdict || 'APPROVED' }) : panelAbstention(QWEN_MAX_MODEL).classification,
+      output_preview: '',
+    },
+  ];
+  return {
+    ok: true,
+    failed,
+    output: verdict ? `VERDICT: ${verdict}\n\nPanel consensus.` : 'PANEL NO-JUDGMENT\n\nReason: quorum_failure.',
+    verdict,
+    classification,
+    consensus: {
+      verdict, agreement: verdict !== null, judgments_count: judgments,
+      abstentions_count: abstentions, degraded: failed, k: 2, n: 2,
+    },
+    members,
+    metadata: {},
+    run_id: 'fake-panel',
+    cross_verify: null,
+  };
 }
 
 async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }, env = process.env) {

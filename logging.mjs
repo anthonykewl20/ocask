@@ -424,6 +424,21 @@ export async function logVerdict({ verdict, model, provider, lens, durationMs, b
   });
 }
 
+export async function logPanelResult({ runId, verdict, k, n, judgmentsCount,
+  abstentionsCount, degraded, agreement, memberVerdicts }) {
+  await logEvent('panel.result', {
+    run_id: runId || _currentRunId,
+    verdict: verdict ?? null,
+    k,
+    n,
+    judgments_count: judgmentsCount,
+    abstentions_count: abstentionsCount,
+    degraded: Boolean(degraded),
+    agreement: Boolean(agreement),
+    member_verdicts: memberVerdicts,
+  });
+}
+
 export async function logError({ model, provider, errorCode, errorClass, attemptCount, durationMs,
   timeoutMs = 0, classification = null, mechanismMessage = '', scrubEnv = process.env }) {
   const record = {
