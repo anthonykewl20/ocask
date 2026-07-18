@@ -33,7 +33,7 @@ import {
   startRun,
 } from './logging.mjs';
 import { ProviderError } from './providers/factory.mjs';
-import { connectivityStatusFromHttp } from './system.mjs';
+import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
@@ -973,4 +973,36 @@ test('issue10: locusFromStatus mapping', () => {
   assert.equal(locusFromStatus(503), 'their-side');
   assert.equal(locusFromStatus(504), 'their-side');
   assert.equal(locusFromStatus(200), null);
+});
+
+test('issue10: summarizeChecks keeps pass+warn+fail === total and counts a status-less ok check as pass', () => {
+  // Regression: the log-file check is pushed with { ok: true } and NO status. Previously the
+  // top-level counts skipped it (no status) while category aggregation defaulted it to fail,
+  // so pass+warn+fail < total and "checks passed" was under-counted. Every check must map to
+  // exactly one tri-state.
+  const checks = [
+    { category: 'dependencies', name: 'node', ok: true, status: 'pass' },
+    { category: 'auth', name: 'deepseek-auth', ok: false, status: 'fail' },
+    { category: 'connectivity', name: 'deepseek-connectivity', ok: false, status: 'warn' },
+    { category: 'data', name: 'log-file', ok: true }, // no explicit status → derived from ok
+  ];
+  const { status, summary } = summarizeChecks(checks);
+  assert.equal(summary.pass + summary.warn + summary.fail, summary.total, 'tri-state must partition all checks');
+  assert.equal(summary.total, 4);
+  assert.equal(summary.pass, 2, 'the status-less ok check counts as pass, not fail');
+  assert.equal(summary.warn, 1);
+  assert.equal(summary.fail, 1);
+  // the data category's single ok check is pass, never fail
+  assert.equal(summary.categories.data.status.pass, 1);
+  assert.equal(summary.categories.data.status.fail, 0);
+  // any fail → unhealthy overall
+  assert.equal(status, 'unhealthy');
+});
+
+test('issue10: summarizeChecks — warn (no fail) is degraded, all pass is healthy', () => {
+  assert.equal(summarizeChecks([{ category: 'a', name: 'x', ok: true, status: 'pass' }]).status, 'healthy');
+  assert.equal(summarizeChecks([
+    { category: 'a', name: 'x', ok: true, status: 'pass' },
+    { category: 'c', name: 'y', ok: false, status: 'warn' },
+  ]).status, 'degraded');
 });

@@ -145,6 +145,31 @@ async function findOnPath(name) {
   return null;
 }
 
+// Roll a check list into a tri-state summary. Every check maps to EXACTLY one of
+// pass/warn/fail — an explicit `status` if present, else derived from `ok` — so
+// `pass + warn + fail === total` holds even for checks pushed directly (not via run()),
+// and per-category counts use the same derivation. Overall: any fail → unhealthy;
+// else any warn → degraded; else healthy.
+export function summarizeChecks(checks) {
+  const effStatus = (c) => c.status || (c.ok ? 'pass' : 'fail');
+  const ok = checks.filter(c => c.ok).length;
+  const total = checks.length;
+  const pass = checks.filter(c => effStatus(c) === 'pass').length;
+  const warn = checks.filter(c => effStatus(c) === 'warn').length;
+  const fail = checks.filter(c => effStatus(c) === 'fail').length;
+  const categories = {};
+  for (const c of checks) {
+    if (!categories[c.category]) categories[c.category] = { ok: 0, total: 0, status: { pass: 0, warn: 0, fail: 0 } };
+    categories[c.category].total++;
+    if (c.ok) categories[c.category].ok++;
+    categories[c.category].status[effStatus(c)] += 1;
+  }
+  let status = 'healthy';
+  if (fail > 0) status = 'unhealthy';
+  else if (warn > 0) status = 'degraded';
+  return { status, summary: { ok, total, pass, warn, fail, categories, by_status: { pass, warn, fail } } };
+}
+
 // ── Full system health report ──
 export async function systemHealth() {
   const checks = [];
@@ -168,38 +193,13 @@ export async function systemHealth() {
     const logDir = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'ocask');
     const logPath = path.join(logDir, 'log.jsonl');
     const stat = await fs.stat(logPath).catch(() => null);
-    checks.push({ category: 'data', name: 'log-file', ok: true, detail: stat ? `${(stat.size / 1024).toFixed(1)} KB` : 'no log yet' });
+    checks.push({ category: 'data', name: 'log-file', ok: true, status: 'pass', detail: stat ? `${(stat.size / 1024).toFixed(1)} KB` : 'no log yet' });
   } catch {
-    checks.push({ category: 'data', name: 'log-file', ok: true, detail: 'no log yet' });
+    checks.push({ category: 'data', name: 'log-file', ok: true, status: 'pass', detail: 'no log yet' });
   }
 
-  const ok = checks.filter(c => c.ok).length;
-  const total = checks.length;
-  const pass = checks.filter(c => c.status === 'pass').length;
-  const warn = checks.filter(c => c.status === 'warn').length;
-  const fail = checks.filter(c => c.status === 'fail').length;
-  const categories = {};
-  for (const c of checks) {
-    if (!categories[c.category]) categories[c.category] = { ok: 0, total: 0 };
-    categories[c.category].total++;
-    if (c.ok) categories[c.category].ok++;
-    if (!categories[c.category].status) categories[c.category].status = { pass: 0, warn: 0, fail: 0 };
-    categories[c.category].status[c.status || 'fail'] = (categories[c.category].status[c.status || 'fail'] || 0) + 1;
-  }
-
-  let status = 'healthy';
-  if (fail > 0) status = 'unhealthy';
-  else if (warn > 0) status = 'degraded';
-
-  return {
-    status,
-    checks,
-    summary: {
-      ok, total, pass, warn, fail,
-      categories,
-      by_status: { pass, warn, fail },
-    },
-  };
+  const { status, summary } = summarizeChecks(checks);
+  return { status, checks, summary };
 }
 
 // ── Formatting ──
