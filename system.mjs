@@ -12,8 +12,22 @@ const MIN_NODE_MAJOR = 20;
 
 // ── Check runner ──
 async function run(name, fn) {
-  try { const r = await fn(); return { ok: r !== false, name, detail: r === false ? 'not configured' : (typeof r === 'string' ? r : (r?.detail || 'ok')) }; }
-  catch (e) { return { ok: false, name, detail: e?.message || 'check failed' }; }
+  try {
+    const r = await fn();
+    if (r && typeof r === 'object' && typeof r.status === 'string') {
+      const status = r.status;
+      return {
+        ok: status === 'pass',
+        status,
+        name,
+        detail: typeof r.detail === 'string' ? r.detail : 'ok',
+      };
+    }
+    if (r === false) return { ok: false, status: 'fail', name, detail: 'not configured' };
+    return { ok: r !== false, status: r !== false ? 'pass' : 'fail', name, detail: r === false ? 'not configured' : (typeof r === 'string' ? r : (r?.detail || 'ok')) };
+  } catch (e) {
+    return { ok: false, status: 'fail', name, detail: e?.message || 'check failed' };
+  }
 }
 
 // ── Dependency checks ──
@@ -80,6 +94,23 @@ async function checkProviderAuth(provider) {
   }
 }
 
+export function locusFromStatus(httpStatus) {
+  if (!Number.isInteger(httpStatus)) return null;
+  if (httpStatus >= 200 && httpStatus < 300) return null;
+  if (httpStatus >= 400 && httpStatus <= 499) return 'our-side';
+  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
+  return null;
+}
+
+export function connectivityStatusFromHttp(httpStatus, trialed = false) {
+  if (!Number.isInteger(httpStatus)) return { status: 'fail', locus: null, reason: 'unreachable' };
+  const locus = locusFromStatus(httpStatus);
+  if (httpStatus >= 200 && httpStatus < 300) {
+    return { status: trialed ? 'pass' : 'warn', locus: null, reason: 'reachable; usability unverified (ping only)' };
+  }
+  return { status: 'warn', locus, reason: `reachable but ${httpStatus}` };
+}
+
 // ── API connectivity probe ──
 async function probeEndpoint(url, label) {
   const controller = new AbortController();
@@ -88,10 +119,10 @@ async function probeEndpoint(url, label) {
     const start = Date.now();
     const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
     const latency = Date.now() - start;
-    if (!res.ok) return `${label}: ${res.status} (${latency}ms)`;
-    return `${label}: reachable (${latency}ms)`;
+    const state = connectivityStatusFromHttp(res.status, false);
+    return { status: state.status, locus: state.locus, detail: `${label}: ${res.status} (${latency}ms); ${state.reason}` };
   } catch (e) {
-    return e.name === 'AbortError' ? `${label}: timeout` : `${label}: ${e.message}`;
+    return { status: 'fail', detail: e.name === 'AbortError' ? `${label}: timeout` : `${label}: ${e.message}`, locus: null };
   } finally { clearTimeout(timer); }
 }
 
@@ -112,6 +143,31 @@ async function findOnPath(name) {
     try { await fs.access(cand, fsSync.constants.X_OK); return cand; } catch { /* continue */ }
   }
   return null;
+}
+
+// Roll a check list into a tri-state summary. Every check maps to EXACTLY one of
+// pass/warn/fail — an explicit `status` if present, else derived from `ok` — so
+// `pass + warn + fail === total` holds even for checks pushed directly (not via run()),
+// and per-category counts use the same derivation. Overall: any fail → unhealthy;
+// else any warn → degraded; else healthy.
+export function summarizeChecks(checks) {
+  const effStatus = (c) => c.status || (c.ok ? 'pass' : 'fail');
+  const ok = checks.filter(c => c.ok).length;
+  const total = checks.length;
+  const pass = checks.filter(c => effStatus(c) === 'pass').length;
+  const warn = checks.filter(c => effStatus(c) === 'warn').length;
+  const fail = checks.filter(c => effStatus(c) === 'fail').length;
+  const categories = {};
+  for (const c of checks) {
+    if (!categories[c.category]) categories[c.category] = { ok: 0, total: 0, status: { pass: 0, warn: 0, fail: 0 } };
+    categories[c.category].total++;
+    if (c.ok) categories[c.category].ok++;
+    categories[c.category].status[effStatus(c)] += 1;
+  }
+  let status = 'healthy';
+  if (fail > 0) status = 'unhealthy';
+  else if (warn > 0) status = 'degraded';
+  return { status, summary: { ok, total, pass, warn, fail, categories, by_status: { pass, warn, fail } } };
 }
 
 // ── Full system health report ──
@@ -137,25 +193,13 @@ export async function systemHealth() {
     const logDir = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'ocask');
     const logPath = path.join(logDir, 'log.jsonl');
     const stat = await fs.stat(logPath).catch(() => null);
-    checks.push({ category: 'data', name: 'log-file', ok: true, detail: stat ? `${(stat.size / 1024).toFixed(1)} KB` : 'no log yet' });
+    checks.push({ category: 'data', name: 'log-file', ok: true, status: 'pass', detail: stat ? `${(stat.size / 1024).toFixed(1)} KB` : 'no log yet' });
   } catch {
-    checks.push({ category: 'data', name: 'log-file', ok: true, detail: 'no log yet' });
+    checks.push({ category: 'data', name: 'log-file', ok: true, status: 'pass', detail: 'no log yet' });
   }
 
-  const ok = checks.filter(c => c.ok).length;
-  const total = checks.length;
-  const categories = {};
-  for (const c of checks) {
-    if (!categories[c.category]) categories[c.category] = { ok: 0, total: 0 };
-    categories[c.category].total++;
-    if (c.ok) categories[c.category].ok++;
-  }
-
-  return {
-    status: ok === total ? 'healthy' : ok > total * 0.5 ? 'degraded' : 'unhealthy',
-    checks,
-    summary: { ok, total, categories },
-  };
+  const { status, summary } = summarizeChecks(checks);
+  return { status, checks, summary };
 }
 
 // ── Formatting ──
@@ -163,15 +207,24 @@ export function formatSystemHealth(report) {
   const lines = [`ocask system health: ${report.status.toUpperCase()}`];
   lines.push('');
   let lastCat = '';
+  const statusTag = {
+    pass: 'pass',
+    warn: 'warn',
+    fail: 'fail',
+  };
   for (const c of report.checks) {
     if (c.category !== lastCat) { lines.push(`  ${c.category}:`); lastCat = c.category; }
-    const mark = c.ok ? '✓' : '✗';
-    lines.push(`    ${mark} ${c.name}: ${c.detail}`);
+    const st = c.status || (c.ok ? 'pass' : 'fail');
+    lines.push(`    ${statusTag[st] || 'fail'} ${c.name}: ${c.detail}`);
   }
   lines.push('');
-  lines.push(`  ${report.summary.ok}/${report.summary.total} checks passed`);
+  lines.push(`  ${report.summary.pass}/${report.summary.total} checks passed`);
+  lines.push(`  ${report.summary.warn} checks warn, ${report.summary.fail} checks fail`);
   for (const [cat, s] of Object.entries(report.summary.categories)) {
-    lines.push(`  ${cat}: ${s.ok}/${s.total}`);
+    const passCount = s.status?.pass || 0;
+    const warnCount = s.status?.warn || 0;
+    const failCount = s.status?.fail || 0;
+    lines.push(`  ${cat}: ${passCount} pass, ${warnCount} warn, ${failCount} fail`);
   }
   return lines.join('\n');
 }
