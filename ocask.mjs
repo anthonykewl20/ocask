@@ -22,9 +22,10 @@ import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 const DEFAULT_TIMEOUT_MS = 170_000;
 const HARD_CEIL_MS = 300_000;
+const REVIEW_HARD_CEIL_MS = 900_000;
 
 // ── USAGE ──
-export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
+export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] (review ops --require-verdict may use up to 900_000ms; plain delegation hard-capped at 300_000ms) [--fallback-model <id>]';
 
 const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify', 'panel']);
 const VALUE_ARGS = new Set([
@@ -463,7 +464,11 @@ export async function runPanel({
   run_id, invokeWithFallbackFn = invokeWithFallback,
 }) {
   parseTemperature(String(temperature));
-  const deadlineMs = absoluteDeadlineMs ?? (Date.now() + resolveTimeout(timeoutMs));
+  const deadlineMs = absoluteDeadlineMs ?? (
+    Date.now() + resolveTimeout(timeoutMs, {
+      hardCeilMs: requireVerdict ? REVIEW_HARD_CEIL_MS : HARD_CEIL_MS,
+    })
+  );
   const members = resolvePanelMembers({ model, noFallback, preferredProvider: provider, env });
   const k = Math.floor(members.length / 2) + 1; // strict majority: N=2 requires both judgments
   const prompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
@@ -595,7 +600,9 @@ export async function runAsk({
   startRun(runId);
   parseTemperature(String(temperature));
   guardAllowedModels({ model, fallbackModel });
-  timeoutMs = resolveTimeout(timeoutMs);
+  timeoutMs = resolveTimeout(timeoutMs, {
+    hardCeilMs: requireVerdict ? REVIEW_HARD_CEIL_MS : HARD_CEIL_MS,
+  });
 
   const selectedFallback = panel ? null : (noFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null)));
   if (selectedFallback) guardAllowedModels({ model, fallbackModel: selectedFallback });
@@ -928,7 +935,10 @@ export async function runMain(
     const temperature = parseTemperature(args.temperature);
     const maxTokens = parsePositiveInt(args['max-tokens'], '--max-tokens', undefined);
     const requestedTimeoutMs = parseTimeoutArg(args['timeout-ms'], '--timeout-ms');
-    const timeoutMs = resolveTimeout(requestedTimeoutMs);
+    const requireVerdict = args['require-verdict'] === true;
+    const timeoutMs = resolveTimeout(requestedTimeoutMs, {
+      hardCeilMs: requireVerdict ? REVIEW_HARD_CEIL_MS : HARD_CEIL_MS,
+    });
     const noFallback = args['no-fallback'] === true;
     const panel = args.panel === true;
     if (panel && args['cross-verify'] === true) throw new Error('--panel and --cross-verify are mutually exclusive');
@@ -954,7 +964,7 @@ export async function runMain(
     const runAskFn = providedRunAsk || runAsk;
     const result = await runAskFn({
       model: args.model, taskText, systemText, contextText,
-      jsonMode: args.json === true, requireVerdict: args['require-verdict'] === true,
+      jsonMode: args.json === true, requireVerdict,
       noFallback, crossVerify: args['cross-verify'] === true, panel,
       lens, provider, temperature, maxTokens, timeoutMs,
       fallbackModel: args['fallback-model'], cwd, env,
