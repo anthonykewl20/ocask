@@ -85,6 +85,8 @@ ocask --model <id>
       [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general]
       [--require-verdict]
       [--no-fallback]
+      [--panel]
+      [--risk auto|trivial|default|high]
       [--json]
       [--metadata <path>]
       [--timeout-ms N]
@@ -99,10 +101,12 @@ ocask --model <id>
 | `--context` | — | Additional context file or text |
 | `--lens` | `general` | Audit framework to inject into the prompt |
 | `--require-verdict` | off | Enforce APPROVED/WARNING/BLOCKED contract |
-| `--no-fallback` | off | Pin exact model; disable opposite-family retry |
+| `--no-fallback` | off | Pin model identity via the trust table; transport fallback only across same-weights transports |
+| `--panel` | off | Cross-family consensus panel (DeepSeek + Qwen), K-of-N majority |
+| `--risk` | `auto` | Panel risk tier (with `--panel`): `trivial`→solo check, `default`/`high`→panel |
 | `--json` | off | JSON object output (not prose) |
 | `--metadata` | — | Path for privacy-safe attempt report (mode 0600) |
-| `--timeout-ms` | 0 (none) | Timeout per provider attempt |
+| `--timeout-ms` | 170000 | Per-run absolute deadline (300000 hard ceiling; review ops up to 900000) |
 | `--max-tokens` | — | Advisory response token limit |
 
 ## Models
@@ -176,7 +180,47 @@ Two independent layers:
    Only for `--require-verdict` tasks (read-only, safe to replay).
 
 Use `--no-fallback` for mandatory audit gates where the primary model's
-verdict is the acceptance requirement.
+verdict is the acceptance requirement. Under `--no-fallback`, ocask pins model
+**identity** via a curated trust table — transport fallback still proceeds
+across declared same-weights transports (e.g. DeepSeek's native API and the
+OpenCode CLI route), but a DeepSeek model never routes to the Qwen provider.
+
+## Consensus verify-panel
+
+`--panel` replaces the single-model verdict with a **cross-family consensus
+panel** — the requested model plus its opposite-family counterpart
+(DeepSeek ↔ Qwen). Every member runs the same task under one shared absolute
+deadline, then the verdicts combine:
+
+- **K-of-N majority** — for the default two-member panel, both members must
+  agree (`K = 2`). With no majority, a conservative tiebreaker applies: any
+  `BLOCKED` vote blocks the run, otherwise the result is `WARNING`.
+- **Abstention ≠ dissent** — a member that returns no usable verdict (timeout,
+  auth failure, malformed reply) is an **abstention**, not a vote. Too many
+  abstentions to reach quorum fail closed to **no-judgment** (exit 30) rather
+  than a false agreement.
+
+`--risk auto|trivial|default|high` (default `auto`) selects how much scrutiny a
+task gets:
+
+| `--risk` | Behavior |
+|----------|----------|
+| `trivial` | Solo check — the primary model alone, no panel |
+| `default` | Two-member cross-family panel |
+| `high` | Panel with identity pinning (`--no-fallback` implied) and a combined `security` + `code-review` + `architecture` lens set |
+| `auto` | Detect from a unified-diff `--context`: small/clean diffs → `trivial`, sensitive paths (`auth`, `crypto`, `payment`, `migrat`, …) or large diffs → `high`, else `default`; non-diff context → `default` |
+
+```bash
+# Two-member panel, risk auto-detected from the diff
+git diff main | ocask --model deepseek-v4-pro --task - --require-verdict --panel --lens code-review
+
+# Force the highest scrutiny: pinned identity + security/code/architecture lenses
+ocask --model deepseek-v4-pro --task ./auth.diff --require-verdict --panel --risk high
+```
+
+Panel runs are review ops, so they may use up to the 900000ms timeout ceiling,
+and that deadline is shared across all members (see the `--timeout-ms` row
+above).
 
 ## Observability
 
@@ -211,8 +255,14 @@ ocask upgrade
 
 Each invocation logs: model, provider, lens, attempt chain (which providers
 tried, what errors, durations), token usage, verdict, and root cause for
-failures. The doctor detects flakes (intermittent failures that recover on
-retry), high-latency providers, and auth/rate-limit patterns.
+failures. The doctor reports per-provider health as **PASS/WARN/FAIL** (a 401
+connectivity probe is WARN, not a green ✓), detects flakes (intermittent
+failures that recover on retry), high-latency providers (excluding censored,
+timed-out runs), and auth/rate-limit patterns. Cause attribution follows the
+**entailment rule**: a cause is named only when the failure record entails it —
+routing on the true `mechanism` and `locus` — otherwise it reports
+`undetermined` plus the observed symptom, so a hang is never misdiagnosed as
+missing credentials, and a hang's advice never tells you to raise the timeout.
 
 ## Configuration
 

@@ -130,6 +130,52 @@ Two independent layers:
    numbers-only) retries the opposite model family once. Only for
    `--require-verdict` tasks (read-only, safe to replay).
 
+**Identity pinning (`--no-fallback`).** `--no-fallback` pins the model's
+*identity*, not a transport. The factory carries a curated **identity trust
+table** (`IDENTITY_TRANSPORT_TRUST` in `factory.mjs`): a human-asserted
+declaration of which transports serve the same weights
+(`deepseek-v4-pro → {deepseek, opencode}`, `qwen3.7-plus → {qwen, opencode}`).
+Under the pin the resolver admits only the native family transport or an
+explicitly declared same-weights transport, so a DeepSeek model can fall back
+from the native API to the OpenCode CLI route but never to the Qwen provider
+(hard reject via `providerSupportsModel` + `isIdentityPreservingTransport`).
+Each run records `identity_preserved` in its metadata. The table is a
+*declaration*, not a cryptographic verification: a non-null `snapshotId` would
+be the wire model ID and supersede the mutable alias; today every entry is
+`vendor-exposes-no-snapshot`, so equivalence rests on the declaration.
+
+### Consensus Panel (`ocask.mjs` — `runPanel`)
+
+`--panel` elevates a single verdict to a **cross-family consensus panel**: the
+requested model plus its opposite-family counterpart (DeepSeek ↔ Qwen, resolved
+through the trust table above). All members share **one absolute deadline** —
+the budget is not per-attempt; primary, fallback, and every panel member draw
+from the same clock, so a slow member cannot extend the run past the ceiling.
+
+Consensus is fail-closed by construction:
+
+- **K-of-N majority.** Quorum is `k = ⌊N/2⌋ + 1` — for the two-member panel,
+  both members must agree. With no majority, a conservative tiebreaker applies:
+  any `BLOCKED` vote blocks the run, otherwise the verdict is `WARNING`.
+- **Abstention ≠ dissent.** A member counts as a judgment only when its
+  classification is `judgment` *and* it carries a canonical verdict. Anything
+  else — timeout, auth failure, malformed reply, no verdict — is an
+  **abstention**, not a vote. If judgments fall below quorum, the panel returns
+  **no-judgment** (`PANEL_QUORUM_FAILURE`, exit 30) rather than agreeing on the
+  survivors. A panel can therefore never report a false consensus.
+
+Risk selection (`--risk`) chooses the panel shape: `trivial` → a solo check
+(no panel), `default`/`high` → the cross-family panel, and `high` additionally
+pins identity and applies a combined `security` + `code-review` + `architecture`
+lens set to each member. `auto` classifies a unified-diff `--context` to pick.
+
+**Absolute-deadline model.** The default timeout is 170000ms (measured P95)
+with a 300000ms hard ceiling, enforced as a single absolute deadline shared
+across primary + fallback + cross-verify + panel. Review/analysis ops
+(`--require-verdict`, `--panel`, `--lens`) may raise the ceiling to 900000ms;
+plain delegation stays capped at 300000ms. A timed-out run records
+`duration_censored: true` so its duration is excluded from latency statistics.
+
 ### 6. Output Validation (`ocask.mjs` — `validateAssistantOutput`)
 
 - Text + verdict: exactly one `VERDICT: APPROVED|WARNING|BLOCKED` line
@@ -153,10 +199,20 @@ Every `runAsk` invocation writes structured events to
 Log file auto-rotates at 10MB (keeps 2 backups).
 
 **Doctor** (`ocask doctor`): reads the log and produces:
-- Provider health: success rate, avg latency, error breakdown per provider/model
+- Provider health: PASS/WARN/FAIL per provider/model — success rate, avg latency
+  (censored timed-out runs excluded), and error breakdown. A connectivity probe
+  that returns 401 is WARN, not a pass.
 - Flake detection: intermittent failures that recover on retry (same run)
 - Top errors: most common error codes with counts
 - Suggestions: high-severity anomalies (low success rate, auth failures, timeouts)
+
+**Entailment rule.** The doctor names a *cause* only when the failure record
+*entails* it — it routes on the true `mechanism` and `locus`, never on a
+collapsed wrapper. When the record does not entail a specific cause, it reports
+`undetermined` alongside the observed symptom. This is why a timeout is no
+longer misdiagnosed as "no credentials": a hang (timed out, censored, duration
+≥ 2× the healthy p99) is attributed to the provider, and its advice explicitly
+says *not* to raise `--timeout-ms`.
 
 **Diagnose** (`ocask diagnose --run-id <id>`): for a specific run:
 - Full attempt chain with durations and error codes
