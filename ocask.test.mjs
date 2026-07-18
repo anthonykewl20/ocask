@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,7 @@ import {
   guardAllowedModels,
   parseArgs,
   parseOpenCodeJsonl,
+  promptHash,
   readExistingPathOrLiteral,
   remainingBudget,
   runAsk,
@@ -25,16 +27,70 @@ import {
 } from './ocask.mjs';
 import {
   classifyFailure,
-  unwrapOrigin,
+  generateSuggestions,
+  doctorReport,
+  _inferRootCause,
+  locusFromStatus,
   logAttemptResult,
+  unwrapOrigin,
   readLog,
   startRun,
 } from './logging.mjs';
-import { ProviderError } from './providers/factory.mjs';
+import {
+  ProviderError,
+  isIdentityPreservingTransport,
+  identityTransportRoute,
+  identityTransportTrustTable,
+  invokeWithFallback,
+  resolveProviderChain,
+} from './providers/factory.mjs';
+import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
 const DEEPSEEK_PRO_MODEL = 'deepseek-v4-pro';
+
+async function makeFakeOpenCodeCli(mode = 'success') {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-identity-'));
+  const binDir = path.join(root, 'bin');
+  const homeDir = path.join(root, 'home');
+  const tracePath = path.join(root, 'opencode-args.json');
+  const metadataPath = path.join(root, 'metadata.json');
+  await fs.mkdir(binDir);
+  await fs.mkdir(homeDir);
+  const executable = path.join(binDir, 'opencode');
+  await fs.writeFile(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.OCASK_TEST_OPENCODE_TRACE, JSON.stringify(args) + '\\n');
+const route = args[args.indexOf('--model') + 1];
+if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith('deepseek/')) {
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({reason:'Primary deliberately omitted its verdict.'})}}) + '\\n');
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'swap-failure' && route.startsWith('alibaba/')) {
+  process.stderr.write('controlled qwen transport failure\\n');
+  process.exitCode = 1;
+} else {
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Real factory path reached OpenCode.'})}}) + '\\n');
+}
+`);
+  await fs.chmod(executable, 0o755);
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    PATH: `${binDir}:${process.env.PATH || ''}`,
+    XDG_DATA_HOME: path.join(root, 'data'),
+    OCASK_DISABLE_SERVER: '1',
+    OCASK_TEST_OPENCODE_TRACE: tracePath,
+    OCASK_TEST_OPENCODE_MODE: mode,
+    DEEPSEEK_API_KEY: '',
+    QWEN_API_KEY: '',
+  };
+  return { root, tracePath, metadataPath, env };
+}
+
+async function readOpenCodeTrace(tracePath) {
+  return (await fs.readFile(tracePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+}
 
 // ── Arg parsing ──
 test('parseArgs handles supported booleans and rejects unknown legacy flags', () => {
@@ -109,6 +165,35 @@ test('all lenses produce valid prompts', () => {
     assert.match(prompt, /## AUDIT FRAMEWORK/, `${lens} lens`);
     assert.ok(prompt.length > 200, `${lens} prompt too short`);
   }
+});
+
+// ── prompt_hash (#9): deterministic one-way digest of the prompt ──
+// The prompt hash lets failures be correlated by task. These properties MUST hold.
+// (They FAIL against the old randomBytes-based promptHash: two identical prompts
+// previously hashed differently, so correlation was impossible.)
+test('promptHash is stable: identical prompt text → identical hash (correlation)', () => {
+  const text = 'Review the auth module for injection surfaces.';
+  const a = promptHash(text);
+  const b = promptHash(text);
+  assert.equal(a, b, 'identical prompt text must produce an identical hash');
+  assert.match(a, /^[0-9a-f]{16}$/, 'digest is a 16-char lowercase-hex prefix');
+});
+
+test('promptHash discriminates: different prompt text → different hash', () => {
+  const h1 = promptHash('Review the auth module for injection surfaces.');
+  const h2 = promptHash('Review the auth module for privilege escalation.');
+  assert.notEqual(h1, h2, 'different prompt text must produce a different hash');
+});
+
+test('promptHash never contains prompt text — it is a pure hex digest', () => {
+  const distinctive = 'SUPERCALIFRAGILISTIC-secret-token-9876543210';
+  const text = `Please audit ${distinctive} carefully.`;
+  const h = promptHash(text);
+  assert.match(h, /^[0-9a-f]+$/, 'a digest contains only hex characters');
+  assert.ok(!h.includes(distinctive), 'distinctive input substring must not appear in the digest');
+  // Cross-check against an independently computed SHA-256 prefix: pins both the
+  // algorithm and the 16-char truncation.
+  assert.equal(h, createHash('sha256').update(text).digest('hex').slice(0, 16));
 });
 
 // ── Output validation ──
@@ -270,6 +355,123 @@ test('availableProviders lists all', async () => {
   assert.ok(providers.includes('qwen'));
 });
 
+test('resolveProviderChain enforces the identity-trust transport set', async () => {
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true }), ['deepseek', 'opencode']);
+  assert.deepEqual(resolveProviderChain({ model: QWEN_MODEL, noFallback: true }), ['qwen', 'opencode']);
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'deepseek' }), ['deepseek']);
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'opencode' }), ['opencode']);
+  assert.ok(!resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: false }).includes('qwen'));
+  assert.ok(!resolveProviderChain({ model: QWEN_MODEL, noFallback: false }).includes('deepseek'));
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, chain: { deepseek: ['qwen', 'opencode', 'deepseek'] } }),
+    ['opencode', 'deepseek'],
+    'configured chains receive the same final serving filter',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: QWEN_MODEL, chain: { qwen: ['deepseek', 'opencode', 'qwen'] } }),
+    ['opencode', 'qwen'],
+    'the final serving filter is symmetric for qwen-family models',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, preferredProvider: 'qwen' }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: QWEN_MODEL, preferredProvider: 'deepseek' }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true, chain: { deepseek: ['opencode'] } }),
+    [],
+    'an unlisted transport is not implicitly trusted under the identity pin',
+  );
+});
+
+test('identity pin always admits a model native provider without weakening family isolation', async () => {
+  const unlistedQwenModel = 'qwen3.7-max';
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true }),
+    ['deepseek'],
+    'an unlisted DeepSeek model retains its native transport',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'deepseek', noFallback: true }),
+    ['deepseek'],
+    'an explicitly pinned native transport is accepted',
+  );
+  assert.equal(isIdentityPreservingTransport(DEEPSEEK_MODEL, 'deepseek'), true);
+  assert.deepEqual(
+    resolveProviderChain({ model: unlistedQwenModel, noFallback: true }),
+    ['qwen'],
+    'an unlisted Qwen model retains its native transport',
+  );
+  assert.equal(isIdentityPreservingTransport(unlistedQwenModel, 'qwen'), true);
+  assert.ok(
+    !resolveProviderChain({
+      model: DEEPSEEK_MODEL,
+      noFallback: true,
+      chain: { deepseek: ['qwen', 'deepseek'] },
+    }).includes('qwen'),
+    'a DeepSeek model never crosses into the Qwen provider',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'qwen', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: unlistedQwenModel, preferredProvider: 'deepseek', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+});
+
+test('identity trust declarations are explicit, auditable, and provide executable routes', () => {
+  const table = identityTransportTrustTable();
+  for (const [model, entries] of Object.entries(table)) {
+    for (const entry of entries) {
+      assert.equal(entry.equivalence, 'declared', `${model}/${entry.provider}`);
+      assert.match(entry.declaration, /Human-curated declaration/);
+      assert.equal(entry.provenance, '.evidence/issue5-nofallback-decision.md');
+      assert.ok(Object.hasOwn(entry, 'snapshotId'));
+      assert.equal(entry.snapshotId, null);
+      assert.equal(entry.snapshotStatus, 'vendor-exposes-no-snapshot');
+      assert.equal(identityTransportRoute(model, entry.provider), entry.modelRoute);
+    }
+  }
+});
+
+test('explicit qwen provider for a deepseek model hard-rejects before invocation', async () => {
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetchCalls++; throw new Error('must not be called'); };
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'never sent',
+        preferredProvider: 'qwen',
+        env: { ...process.env, QWEN_API_KEY: 'would-attempt-if-routing-were-wrong' },
+      }),
+      error => error.code === 'MODEL_NOT_FOUND' && error.provider === 'qwen',
+    );
+    assert.equal(fetchCalls, 0, 'the incompatible provider was never attempted');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('unlisted transport under the identity pin fails our-side without invocation', async () => {
+  await assert.rejects(
+    invokeWithFallback({
+      model: DEEPSEEK_MODEL,
+      prompt: 'never sent',
+      noFallback: true,
+      chain: { deepseek: ['opencode'] },
+      env: { ...process.env, PATH: '' },
+    }),
+    error => error.code === 'NO_PROVIDER',
+  );
+});
+
 // install.sh installs the CLI as a symlink, so argv[1] is the link path while
 // import.meta.url is the resolved target. `pricing` is local-only: no network,
 // no spend. A silent exit 0 here is the exact shape of the outage this guards.
@@ -413,7 +615,7 @@ test('HTTP status and retry-after propagate from the originating cause', () => {
   );
   const cls = classifyFailure(wrapAsExhausted(origin));
   assert.equal(cls.mechanism, 'RATE_LIMITED');
-  assert.equal(cls.locus, 'their-side');
+  assert.equal(cls.locus, 'our-side');
   assert.equal(cls.http_status, 429);
   assert.equal(cls.retry_after, '42');
 });
@@ -538,6 +740,137 @@ test('buildJsonResponse: first-class machine fields + output, exit_code agrees w
   assert.equal(json.exit_code, d.exit_code);
 });
 
+test('real CLI: --no-fallback missing native key falls through to OpenCode with identity preserved', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--no-fallback', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    const [opencodeArgs] = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(response.verdict, 'APPROVED');
+    assert.equal(metadata.actual_model, DEEPSEEK_PRO_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, true);
+    assert.equal(opencodeArgs[opencodeArgs.indexOf('--model') + 1], identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'));
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: pinned native wire with missing key is no-judgment our-side', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--provider', 'deepseek', '--require-verdict', '--no-fallback', '--json',
+      '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 30, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.verdict, null);
+    assert.equal(response.locus, 'our-side');
+    assert.equal(response.mechanism, 'AUTH_FAILURE');
+    assert.equal(metadata.identity_preserved, false, 'no model ran, so identity cannot be claimed');
+    await assert.rejects(fs.access(fixture.tracePath), error => error.code === 'ENOENT');
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: default-mode model swap is surfaced and flips identity_preserved', async () => {
+  const fixture = await makeFakeOpenCodeCli('swap-success');
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(response.verdict, 'APPROVED');
+    assert.equal(metadata.fallback_used, true);
+    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, false);
+    assert.deepEqual(traces.map(args => args[args.indexOf('--model') + 1]), [
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(QWEN_MODEL, 'opencode'),
+    ]);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: failed default-mode model swap remains identity_preserved=false', async () => {
+  const fixture = await makeFakeOpenCodeCli('swap-failure');
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 30, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.verdict, null);
+    assert.equal(metadata.fallback_used, true);
+    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, false);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('post-invocation validation failure retains the actual provider attribution', async () => {
+  await assert.rejects(
+    runAsk({
+      model: DEEPSEEK_PRO_MODEL,
+      taskText: 'Return a verdict.',
+      requireVerdict: true,
+      noFallback: true,
+      invokeWithFallbackFn: async () => ({
+        provider: 'opencode',
+        model_used: DEEPSEEK_PRO_MODEL,
+        stdout: JSON.stringify({ type: 'text', part: { type: 'text', text: 'missing verdict' }, timestamp: Date.now() }),
+      }),
+    }),
+    error => {
+      assert.equal(error.ocaskMetadata.actual_model, DEEPSEEK_PRO_MODEL);
+      assert.equal(error.ocaskMetadata.actual_transport, 'opencode');
+      assert.equal(error.ocaskMetadata.identity_preserved, true);
+      return true;
+    },
+  );
+});
+
+test('successful but untrusted transport is never attributed as identity-preserving', async () => {
+  const result = await runAsk({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Return a verdict.',
+    requireVerdict: true,
+    noFallback: false,
+    invokeWithFallbackFn: async () => ({
+      provider: 'misconfigured-transport',
+      model_used: DEEPSEEK_PRO_MODEL,
+      stdout: JSON.stringify({ type: 'text', part: { type: 'text', text: 'VERDICT: APPROVED\n\nUntrusted path.' }, timestamp: Date.now() }),
+      stderr: '',
+    }),
+  });
+  assert.equal(result.metadata.identity_preserved, false);
+});
+
 // A runAsk fake shaped exactly like the real success envelope: output + verdict +
 // classification + metadata + run_id. main() never calls a provider.
 function fakeJudgment(verdict, text) {
@@ -646,4 +979,423 @@ test('main(): freeform success (no --require-verdict) -> exit 0, verdict:null, n
   assert.equal(obj.verdict, null);
   assert.equal(obj.exit_code, 0);
   assert.equal(obj.reason, null);
+});
+
+// ── issue #10 entailment + tri-state health behavior ──
+
+test('issue10: timeout is inferred as timeout/hang, never credentials auth', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL,
+    mechanism: 'TIMEOUT', class: 'no-judgment', subclass: 'reply-absent',
+    locus: 'their-side', duration_ms: 12000, duration_censored: true,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause.includes('credentials'), false);
+  assert.match(root.cause, /deadline|hang|timeout/);
+  assert.match(root.fix ?? '', /timeout|hang|investigate|trial|swit/);
+});
+
+test('issue10: a classified HTTP 429 is inferred as rate-limited on our side', () => {
+  const origin = Object.assign(
+    new ProviderError('rate limited', 'RATE_LIMITED'),
+    { code: 'RATE_LIMITED', provider: 'qwen', status: 429 },
+  );
+  const classification = classifyFailure(wrapAsExhausted(origin));
+  const attempts = [{
+    outcome: 'failed', provider: 'qwen', model: QWEN_MODEL,
+    ...classification,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(classification.locus, 'our-side');
+  assert.match(root.cause, /rate-limited \(our-side\)/i);
+  assert.notEqual(root.cause, 'undetermined');
+});
+
+test('issue10: billing cause requires ENTITLEMENT/402 evidence for that provider only', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 0,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000], durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const timeoutSuggestion = generateSuggestions([provider], []);
+  assert.ok(timeoutSuggestion.some(a => /timeout/.test(a.action) && !/billing|quota|credits/.test(a.action)));
+
+  const billed = {
+    ...provider,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'ENTITLEMENT_UNAVAILABLE', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'our-side', http_status: 402,
+      count: 1, maxDurationMs: 0, avgDurationMs: 0, durationSamples: [], durationCensored: 0, evidenceCount: 1,
+    }],
+  };
+  const billingSuggestion = generateSuggestions([billed], []);
+  assert.ok(billingSuggestion.some(a => /billing\/quota/.test(a.action) || /billing/.test(a.action)));
+});
+
+test('issue10: probe status mapping keeps HTTP 401 as warn, 200 as warn (trial-only)', () => {
+  const unauthorized = connectivityStatusFromHttp(401);
+  const ok = connectivityStatusFromHttp(200);
+  assert.equal(unauthorized.status, 'warn');
+  assert.equal(locusFromStatus(401), 'our-side');
+  assert.equal(ok.status, 'warn');
+  assert.equal(ok.locus, null);
+});
+
+test('issue10: timeout hang fix explicitly says do NOT increase timeout', () => {
+  const attempts = [
+    { outcome: 'success', provider: 'deepseek', model: DEEPSEEK_MODEL, duration_ms: 8000 },
+    { outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT',
+      class: 'no-judgment', subclass: 'reply-absent', locus: 'their-side', duration_ms: 300000, duration_censored: true,
+      http_status: null, reason_code: 'TIMEOUT' },
+  ];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause.includes('HANG'), true);
+  assert.match(root.fix, /Do NOT increase --timeout-ms/i);
+});
+
+test('issue10: doctor suggestions path reaches HANG for a censored bucket ≫ P99 (not only diagnoseRun)', () => {
+  // Regression: doctorReport buckets carry maxDurationMs + a censored COUNT, not the
+  // per-attempt duration_ms/duration_censored that _inferFailureFinding reads. Without the
+  // field bridge, generateSuggestions never reaches the hang branch and mis-advises
+  // "Increase --timeout-ms" on a real hang. This asserts the doctor path, not _inferRootCause.
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-pro',
+    total: 1, success: 0, success_rate: '0.0%',
+    avg_latency_ms: 0, uncensored_latency_count: 0,
+    healthy_p99_ms: 109000,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 314359, avgDurationMs: 314359, durationSamples: [314359],
+      durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.ok(suggestions.some(a => /HANG/i.test(a.action)), 'doctor path must classify a censored ≫P99 timeout as HANG');
+  assert.ok(suggestions.some(a => /Do NOT increase --timeout-ms/i.test(a.action)), 'hang advice must forbid increasing the timeout');
+  assert.equal(suggestions.some(a => /HANG/i.test(a.action) && /\bIncrease --timeout-ms\b/.test(a.action)), false);
+});
+
+test('issue10: HANG guidance never coexists with advice to increase timeout', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-pro',
+    total: 2, success: 1, success_rate: '50.0%',
+    avg_latency_ms: 45000, uncensored_latency_count: 1,
+    healthy_p99_ms: 10000,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000],
+      durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  const hangAction = suggestions.find(a => /Do NOT increase --timeout-ms/i.test(a.action));
+  assert.ok(hangAction);
+  assert.equal(suggestions.some(a => a !== hangAction && /increase\b.*timeout|increasing timeout/i.test(a.action)), false);
+});
+
+test('issue10: latency advice excludes censored samples from averaged advice threshold', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 45000,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000], durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /uncensored avg latency/i.test(a.action)), false);
+});
+
+test('issue10: no cross-provider billing hint for deepseek failure', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 1000,
+    uncensored_latency_count: 1,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 1000, avgDurationMs: 1000, durationSamples: [1000], durationCensored: 0, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /OpenCode Go/i.test(a.action)), false);
+});
+
+test('issue10: mixed failure set is bucketed and not collapsed', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 2,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 1000,
+    uncensored_latency_count: 1,
+    healthy_p99_ms: 800,
+    failure_buckets: [
+      {
+        provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+        subclass: 'reply-absent', locus: 'their-side', http_status: null,
+        count: 1, maxDurationMs: 1000, avgDurationMs: 1000, durationSamples: [1000], durationCensored: 1, evidenceCount: 1,
+      },
+      {
+        provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'AUTH_FAILURE', class: 'no-judgment',
+        subclass: 'reply-absent', locus: 'our-side', http_status: 401,
+        count: 1, maxDurationMs: 100, avgDurationMs: 100, durationSamples: [100], durationCensored: 0, evidenceCount: 1,
+      },
+    ],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  const timeoutRows = suggestions.filter(a => /TIMEOUT|deadline|hang|timeout/i.test(a.action)).length;
+  const authRows = suggestions.filter(a => /AUTH_FAILURE|auth|credentials|api key/i.test(a.action)).length;
+  assert.ok(timeoutRows >= 1, 'timeout failure should produce a timeout finding');
+  assert.ok(authRows >= 1, 'auth failure should produce an auth finding');
+  assert.ok(suggestions.length >= 2);
+});
+
+test('issue10: consistency does not imply entailment → undetermined cause', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'PROVIDER_ERROR',
+    class: 'no-judgment', subclass: 'reply-absent', locus: 'their-side', duration_ms: 1500,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /Observed:/);
+});
+
+test('issue10: no evidence does not emit a cause', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL,
+    class: 'no-judgment', subclass: 'indeterminate', locus: null, duration_ms: 0,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+});
+
+test('issue10: no attempt records and no terminal error is undetermined', () => {
+  const root = _inferRootCause([], [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /no attempt records and no terminal error/i);
+});
+
+test('issue10: terminal error without failed attempts is observed but undetermined', () => {
+  const root = _inferRootCause([], [], { error_code: 'SPAWN' }, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /SPAWN/);
+});
+
+test('issue10: _inferRootCause with two distinct mechanisms yields undetermined', () => {
+  const attempts = [
+    {
+      outcome: 'failed',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      mechanism: 'TIMEOUT',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'their-side',
+      duration_ms: 314359,
+      duration_censored: true,
+      http_status: null,
+    },
+    {
+      outcome: 'failed',
+      provider: 'qwen',
+      model: QWEN_MODEL,
+      mechanism: 'AUTH_FAILURE',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'our-side',
+      duration_ms: 1000,
+      duration_censored: false,
+      http_status: 401,
+    },
+  ];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix ?? '', /Observed:/);
+  assert.match(root.fix ?? '', /TIMEOUT/);
+  assert.match(root.fix ?? '', /AUTH_FAILURE/);
+});
+
+test('issue10: INSUFFICIENT_BALANCE without a 402 signal is undetermined, not billing', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 0,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      mechanism: 'INSUFFICIENT_BALANCE',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'our-side',
+      http_status: null,
+      count: 1,
+      maxDurationMs: 0,
+      avgDurationMs: 0,
+      durationSamples: [0],
+      durationCensored: 0,
+      evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /billing|quota|credit/i.test(a.action)), false);
+  assert.equal(suggestions.some(a => /undetermined/i.test(a.action)), true);
+});
+
+test('issue10: doctorReport end-to-end pipeline reaches HANG through real buckets', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-doctor-report-'));
+  const prevXdg = process.env.XDG_DATA_HOME;
+  const logDir = path.join(tmp, 'ocask');
+  const logPath = path.join(logDir, 'log.jsonl');
+  process.env.XDG_DATA_HOME = tmp;
+
+  const lines = [
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 95000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 100000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 109000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'failed',
+      mechanism: 'TIMEOUT',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'their-side',
+      duration_ms: 314359,
+      duration_censored: true,
+      http_status: null,
+      tokens_used: null,
+    },
+  ];
+
+  const payload = lines.map((x) => JSON.stringify(x)).join('\n');
+  try {
+    await fs.mkdir(logDir, { recursive: true });
+    await fs.writeFile(logPath, payload, 'utf8');
+
+    const report = await doctorReport({ system: false });
+    const deepseekProvider = report.providers.find((p) => p.provider === 'deepseek' || `${p.provider_model ?? ''}`.startsWith('deepseek'));
+    assert.equal(Array.isArray(deepseekProvider?.failure_buckets), true, 'deepseek provider should include failure buckets array');
+    assert.ok(deepseekProvider.failure_buckets.length > 0, 'deepseek failure bucket should exist');
+
+    const suggestions = report.suggestions;
+    assert.ok(
+      suggestions.some((s) => /HANG/i.test(s.action)),
+      'doctor suggestion should classify this as HANG',
+    );
+    assert.ok(
+      suggestions.some((s) => /Do NOT increase --timeout-ms/i.test(s.action)),
+      'hang guidance should avoid increasing timeout',
+    );
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('issue10: locusFromStatus mapping', () => {
+  assert.equal(locusFromStatus(401), 'our-side');
+  assert.equal(locusFromStatus(403), 'our-side');
+  assert.equal(locusFromStatus(429), 'our-side');
+  assert.equal(locusFromStatus(503), 'their-side');
+  assert.equal(locusFromStatus(504), 'their-side');
+  assert.equal(locusFromStatus(200), null);
+});
+
+test('issue10: summarizeChecks keeps pass+warn+fail === total and counts a status-less ok check as pass', () => {
+  // Regression: the log-file check is pushed with { ok: true } and NO status. Previously the
+  // top-level counts skipped it (no status) while category aggregation defaulted it to fail,
+  // so pass+warn+fail < total and "checks passed" was under-counted. Every check must map to
+  // exactly one tri-state.
+  const checks = [
+    { category: 'dependencies', name: 'node', ok: true, status: 'pass' },
+    { category: 'auth', name: 'deepseek-auth', ok: false, status: 'fail' },
+    { category: 'connectivity', name: 'deepseek-connectivity', ok: false, status: 'warn' },
+    { category: 'data', name: 'log-file', ok: true }, // no explicit status → derived from ok
+  ];
+  const { status, summary } = summarizeChecks(checks);
+  assert.equal(summary.pass + summary.warn + summary.fail, summary.total, 'tri-state must partition all checks');
+  assert.equal(summary.total, 4);
+  assert.equal(summary.pass, 2, 'the status-less ok check counts as pass, not fail');
+  assert.equal(summary.warn, 1);
+  assert.equal(summary.fail, 1);
+  // the data category's single ok check is pass, never fail
+  assert.equal(summary.categories.data.status.pass, 1);
+  assert.equal(summary.categories.data.status.fail, 0);
+  // any fail → unhealthy overall
+  assert.equal(status, 'unhealthy');
+});
+
+test('issue10: summarizeChecks — warn (no fail) is degraded, all pass is healthy', () => {
+  assert.equal(summarizeChecks([{ category: 'a', name: 'x', ok: true, status: 'pass' }]).status, 'healthy');
+  assert.equal(summarizeChecks([
+    { category: 'a', name: 'x', ok: true, status: 'pass' },
+    { category: 'c', name: 'y', ok: false, status: 'warn' },
+  ]).status, 'degraded');
 });

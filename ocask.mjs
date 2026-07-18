@@ -3,13 +3,16 @@
 // Supports DeepSeek API, Qwen/Alibaba API, and OpenCode CLI backends.
 // See ARCHITECTURE.md for design rationale.
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isPaidModelAllowed, PAID_MODELS } from './ocverify.mjs';
-import { invokeWithFallback, ProviderError, modelFamily, availableProviders, defaultProvider } from './providers/factory.mjs';
+import {
+  invokeWithFallback, ProviderError, modelFamily, availableProviders,
+  defaultProvider, isIdentityPreservingTransport, resolveProviderChain,
+} from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
   logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun,
   classifyFailure, unwrapOrigin } from './logging.mjs';
@@ -67,6 +70,15 @@ export function resolveTimeout(requestedTimeoutMs, {
 
 export function remainingBudget(deadlineMs, nowMs = Date.now()) {
   return Math.max(0, deadlineMs - nowMs);
+}
+
+// Deterministic one-way digest of the prompt text (#9). Two runs of the IDENTICAL
+// prompt yield the SAME hash so failures can be correlated by task — the old
+// randomBytes() value carried no information (identical prompts hashed differently).
+// SHA-256 hex truncated to a stable 16-char prefix keeps log lines compact, and the
+// output is purely a digest: it never contains prompt text.
+export function promptHash(text) {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 // ── ARG PARSING ──
@@ -343,6 +355,7 @@ export async function runAsk({
   crossVerify = false,
   lens = 'general', temperature = 0, maxTokens, timeoutMs = DEFAULT_TIMEOUT_MS,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
+  invokeWithFallbackFn = invokeWithFallback,
 }) {
   const runId = makeRunId();
   startRun(runId);
@@ -357,10 +370,14 @@ export async function runAsk({
   const options = { jsonMode, requireVerdict };
   const runStarted = Date.now();
   const absoluteDeadlineMs = runStarted + timeoutMs;
-  const metadata = { requested_model: model, actual_model: null, no_fallback: Boolean(noFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'), output_bytes: null, attempts: [], exit_code: null, fallback_used: false };
+  const metadata = {
+    requested_model: model, actual_model: null, actual_transport: null,
+    identity_preserved: false, no_fallback: Boolean(noFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'),
+    output_bytes: null, attempts: [], exit_code: null, fallback_used: false,
+  };
 
   await logRunStart({
-    model, lens, provider, promptHash: randomBytes(8).toString('hex'),
+    model, lens, provider, promptHash: promptHash(originalPrompt),
     inputBytes: metadata.input_bytes, timeoutMs,
   });
 
@@ -375,14 +392,16 @@ export async function runAsk({
     const attemptIdx = attemptIndex++;
     const t0 = Date.now();
     const attemptTimeoutMs = nextAttemptTimeoutMs();
+    let providerResult = null;
     try {
       if (isFallback) {
         await logFallback({ fromModel: model, toModel: askModel, fromProvider: provider || defaultProvider(model), toProvider: provider || defaultProvider(askModel), reason: 'malformed_output' });
       }
-      const result = await invokeWithFallback({
+      providerResult = await invokeWithFallbackFn({
         model: askModel, prompt: DELEGATED_IDENTITY_PREFIX + prompt,
-        timeoutMs: attemptTimeoutMs, env, cwd, preferredProvider: provider, noFallback: true,
+        timeoutMs: attemptTimeoutMs, env, cwd, preferredProvider: provider, noFallback,
       });
+      const result = providerResult;
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
       const out = validateAssistantOutput(raw, options);
       const outBytes = Buffer.byteLength(typeof out === 'string' ? out : JSON.stringify(out), 'utf8');
@@ -391,6 +410,12 @@ export async function runAsk({
       const successClass = localVerdict
         ? classifyFailure(null, { verdict: localVerdict })
         : { class: 'no-judgment', subclass: null, locus: null, mechanism: null, censored: false, http_status: null, retry_after: null };
+      const actualModel = result.model_used || null;
+      const actualTransport = result.provider || null;
+      metadata.actual_model = actualModel;
+      metadata.actual_transport = actualTransport;
+      metadata.identity_preserved = actualModel === model
+        && isIdentityPreservingTransport(actualModel, actualTransport);
       metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'success', reason_code: 'ok', fallback: isFallback, provider: result.provider, class: successClass.class });
       metadata.output_bytes = outBytes;
       await logAttemptResult({
@@ -399,17 +424,24 @@ export async function runAsk({
         outputBytes: outBytes, tokensUsed: result.tokensUsed || null,
         classification: successClass,
       });
-      return out;
+      return { output: out, modelUsed: actualModel, provider: actualTransport };
     } catch (error) {
       // Classify from the TRUE (unwrapped) mechanism; attribute the real provider
       // that failed via the originating cause — never the wrapper, never 'unknown'
       // when the cause carries a provider.
       const classification = classifyFailure(error, { timeoutMs });
       const code = classification.mechanism || 'unknown';
-      const failProvider = unwrapOrigin(error)?.provider || provider || defaultProvider(askModel) || 'unknown';
-      metadata.attempts.push({ model: askModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback, provider: failProvider, class: classification.class, subclass: classification.subclass, locus: classification.locus, mechanism: code });
+      const failProvider = providerResult?.provider
+        || unwrapOrigin(error)?.provider || provider || defaultProvider(askModel) || 'unknown';
+      const failedModel = providerResult?.model_used || askModel;
+      metadata.actual_model = failedModel;
+      metadata.actual_transport = failProvider;
+      metadata.identity_preserved = Boolean(providerResult)
+        && failedModel === model
+        && isIdentityPreservingTransport(failedModel, failProvider);
+      metadata.attempts.push({ model: failedModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback, provider: failProvider, class: classification.class, subclass: classification.subclass, locus: classification.locus, mechanism: code });
       await logAttemptResult({
-        provider: failProvider, model: askModel, attemptIndex: attemptIdx,
+        provider: failProvider, model: failedModel, attemptIndex: attemptIdx,
         outcome: 'failed', durationMs: Date.now() - t0, timeoutMs: attemptTimeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
         classification,
@@ -420,10 +452,9 @@ export async function runAsk({
 
   let result;
   try {
-    const out = await timeAttempt(model, originalPrompt, false);
-    result = { ok: true, output: out, model }; metadata.actual_model = model;
+    const attempt = await timeAttempt(model, originalPrompt, false);
+    result = { ok: true, output: attempt.output, model: attempt.modelUsed };
   } catch (primaryError) {
-    metadata.actual_model = model;
     if (!selectedFallback || !isFallbackEligible(primaryError)) {
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const primaryClass = classifyFailure(primaryError, { timeoutMs });
@@ -431,11 +462,12 @@ export async function runAsk({
       await logError({ model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown', errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
+    metadata.fallback_used = true;
     try {
-      const fbOut = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(primaryError)}`, true);
-      result = { ok: true, output: fbOut, model: selectedFallback }; metadata.actual_model = selectedFallback; metadata.fallback_used = true;
+      const attempt = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(primaryError)}`, true);
+      result = { ok: true, output: attempt.output, model: attempt.modelUsed };
     } catch (fbError) {
-      metadata.actual_model = selectedFallback; metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
+      metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const fbClass = classifyFailure(fbError, { timeoutMs });
       const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
       await logError({ model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown', errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: fbClass });
@@ -642,6 +674,7 @@ export async function runMain(
 
     const provider = args.provider || null;
     if (provider && !availableProviders().includes(provider)) throw new Error(`--provider must be one of: ${availableProviders().join(', ')}`);
+    if (provider) resolveProviderChain({ model: args.model, preferredProvider: provider, noFallback });
 
     const [taskText, systemText, contextText] = await Promise.all([
       readExistingPathOrLiteral(args.task, stdin),
