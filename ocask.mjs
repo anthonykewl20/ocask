@@ -20,6 +20,8 @@ import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCo
 import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 
 const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
+const DEFAULT_TIMEOUT_MS = 170_000;
+const HARD_CEIL_MS = 300_000;
 
 // ── USAGE ──
 export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
@@ -42,12 +44,32 @@ function parsePositiveInt(value, label, fallback) {
   return parsed;
 }
 
+function parseTimeoutArg(value, label) {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed)) throw new Error(`${label} must be a non-negative integer`);
+  return parsed;
+}
+
 function parseTemperature(value) {
   if (value === undefined) return 0;
   const t = Number(value);
   if (!Number.isFinite(t)) throw new Error('--temperature must be 0');
   if (t !== 0) throw new Error('--temperature only supports 0');
   return t;
+}
+
+export function resolveTimeout(requestedTimeoutMs, {
+  defaultTimeoutMs = DEFAULT_TIMEOUT_MS,
+  hardCeilMs = HARD_CEIL_MS,
+} = {}) {
+  const normalized = requestedTimeoutMs == null || requestedTimeoutMs === 0 ? defaultTimeoutMs : requestedTimeoutMs;
+  if (!Number.isSafeInteger(normalized) || normalized <= 0) throw new Error('timeout-ms must be a positive integer');
+  return Math.min(normalized, hardCeilMs);
+}
+
+export function remainingBudget(deadlineMs, nowMs = Date.now()) {
+  return Math.max(0, deadlineMs - nowMs);
 }
 
 // Deterministic one-way digest of the prompt text (#9). Two runs of the IDENTICAL
@@ -331,7 +353,7 @@ export async function runAsk({
   model, taskText, systemText = '', contextText = '',
   jsonMode = false, requireVerdict = false, noFallback = false,
   crossVerify = false,
-  lens = 'general', temperature = 0, maxTokens, timeoutMs = 0,
+  lens = 'general', temperature = 0, maxTokens, timeoutMs = DEFAULT_TIMEOUT_MS,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
   invokeWithFallbackFn = invokeWithFallback,
 }) {
@@ -339,6 +361,7 @@ export async function runAsk({
   startRun(runId);
   parseTemperature(String(temperature));
   guardAllowedModels({ model, fallbackModel });
+  timeoutMs = resolveTimeout(timeoutMs);
 
   const selectedFallback = noFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null));
   if (selectedFallback) guardAllowedModels({ model, fallbackModel: selectedFallback });
@@ -346,6 +369,7 @@ export async function runAsk({
   const originalPrompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
   const options = { jsonMode, requireVerdict };
   const runStarted = Date.now();
+  const absoluteDeadlineMs = runStarted + timeoutMs;
   const metadata = {
     requested_model: model, actual_model: null, actual_transport: null,
     identity_preserved: false, no_fallback: Boolean(noFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'),
@@ -358,9 +382,16 @@ export async function runAsk({
   });
 
   let attemptIndex = 0;
+  const remainingAttemptBudget = () => remainingBudget(absoluteDeadlineMs, Date.now());
+  const nextAttemptTimeoutMs = () => {
+    const budgetMs = remainingAttemptBudget();
+    if (budgetMs <= 0) throw Object.assign(new ProviderError('ocask budget exhausted before this attempt', 'TIMEOUT'), { code: 'TIMEOUT' });
+    return budgetMs;
+  };
   const timeAttempt = async (askModel, prompt, isFallback = false) => {
     const attemptIdx = attemptIndex++;
     const t0 = Date.now();
+    const attemptTimeoutMs = nextAttemptTimeoutMs();
     let providerResult = null;
     try {
       if (isFallback) {
@@ -368,7 +399,7 @@ export async function runAsk({
       }
       providerResult = await invokeWithFallbackFn({
         model: askModel, prompt: DELEGATED_IDENTITY_PREFIX + prompt,
-        timeoutMs, env, cwd, preferredProvider: provider, noFallback,
+        timeoutMs: attemptTimeoutMs, env, cwd, preferredProvider: provider, noFallback,
       });
       const result = providerResult;
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
@@ -389,7 +420,7 @@ export async function runAsk({
       metadata.output_bytes = outBytes;
       await logAttemptResult({
         provider: result.provider || 'unknown', model: askModel, attemptIndex: attemptIdx,
-        outcome: 'success', durationMs: Date.now() - t0, timeoutMs, reasonCode: 'ok',
+        outcome: 'success', durationMs: Date.now() - t0, timeoutMs: attemptTimeoutMs, reasonCode: 'ok',
         outputBytes: outBytes, tokensUsed: result.tokensUsed || null,
         classification: successClass,
       });
@@ -411,7 +442,7 @@ export async function runAsk({
       metadata.attempts.push({ model: failedModel, duration_ms: Date.now() - t0, outcome: 'failed', reason_code: code, fallback: isFallback, provider: failProvider, class: classification.class, subclass: classification.subclass, locus: classification.locus, mechanism: code });
       await logAttemptResult({
         provider: failProvider, model: failedModel, attemptIndex: attemptIdx,
-        outcome: 'failed', durationMs: Date.now() - t0, timeoutMs, reasonCode: code,
+        outcome: 'failed', durationMs: Date.now() - t0, timeoutMs: attemptTimeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
         classification,
       });
@@ -476,9 +507,10 @@ export async function runAsk({
     });
 
     try {
+      const buddyTimeoutMs = nextAttemptTimeoutMs();
       const buddyResult = await invokeWithFallback({
         model: buddyModel, prompt: DELEGATED_IDENTITY_PREFIX + buddyPrompt,
-        timeoutMs, env, cwd, noFallback: true,
+        timeoutMs: buddyTimeoutMs, env, cwd, noFallback: true,
       });
       const buddyRaw = buddyResult.commandOutput || parseOpenCodeJsonl(buddyResult.stdout);
       const buddyOut = validateAssistantOutput(buddyRaw, { requireVerdict: true });
@@ -487,7 +519,7 @@ export async function runAsk({
 
       await logAttemptResult({
         provider: buddyResult.provider || 'unknown', model: buddyModel, attemptIndex: attemptIndex++,
-        outcome: 'success', durationMs: 0, timeoutMs, reasonCode: 'ok',
+        outcome: 'success', durationMs: 0, timeoutMs: buddyTimeoutMs, reasonCode: 'ok',
         outputBytes: Buffer.byteLength(buddyOutput, 'utf8'), tokensUsed: buddyResult.tokensUsed || null,
         classification: buddyVerdict
           ? classifyFailure(null, { verdict: buddyVerdict })
@@ -629,7 +661,8 @@ export async function runMain(
 
     const temperature = parseTemperature(args.temperature);
     const maxTokens = parsePositiveInt(args['max-tokens'], '--max-tokens', undefined);
-    const timeoutMs = parsePositiveInt(args['timeout-ms'], '--timeout-ms', 0);
+    const requestedTimeoutMs = parseTimeoutArg(args['timeout-ms'], '--timeout-ms');
+    const timeoutMs = resolveTimeout(requestedTimeoutMs);
     const noFallback = args['no-fallback'] === true;
     if (noFallback && args['fallback-model']) throw new Error('--no-fallback cannot be combined with --fallback-model');
 
