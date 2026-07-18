@@ -381,7 +381,7 @@ export async function runAsk({
         provider: failProvider, model: askModel, attemptIndex: attemptIdx,
         outcome: 'failed', durationMs: Date.now() - t0, timeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
-        classification, mechanismMessage: error?.message,
+        classification, mechanismMessage: error?.message, scrubEnv: env,
       });
       throw error;
     }
@@ -401,7 +401,7 @@ export async function runAsk({
         model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown',
         errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex,
         durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass,
-        mechanismMessage: primaryError?.message,
+        mechanismMessage: primaryError?.message, scrubEnv: env,
       });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
@@ -416,7 +416,7 @@ export async function runAsk({
         model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown',
         errorClass: fbError?.constructor?.name, attemptCount: attemptIndex,
         durationMs: metadata.duration_ms, timeoutMs, classification: fbClass,
-        mechanismMessage: fbError?.message,
+        mechanismMessage: fbError?.message, scrubEnv: env,
       });
       fbError.ocaskMetadata = metadata; throw fbError;
     }
@@ -661,7 +661,7 @@ export async function runMain(
     process.exitCode = descriptor.exit_code;
     // Domain 3 (stderr) must carry no raw provider message: a 401 body etc. can echo our own
     // key. Scrub the human cause line the same way the local log record is scrubbed (#9).
-    writeStderr(`ocask error: ${await scrubMessage(cause)}`); // human line retained for non-json callers
+    writeStderr(`ocask error: ${await scrubMessage(cause, env)}`); // human line retained for non-json callers
     if (argv.includes('--json')) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
     if (args?.metadata && error?.ocaskMetadata) {
       await writeAtomicPrivate(args.metadata, JSON.stringify(error.ocaskMetadata) + '\n').catch(() => {});

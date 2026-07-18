@@ -1134,3 +1134,28 @@ test('issue9: MIN_SECRET_LENGTH guard — a sub-8-char value is NOT used as a sc
   assert.equal(out.includes('abc12'), true, 'a below-threshold value must not redact its occurrences');
   assert.doesNotMatch(out, /redacted:own-key-/, 'no redaction should occur for a sub-threshold secret');
 });
+
+test('issue9: scrub uses the INVOCATION env, not process.env — a secret only in the injected env is scrubbed', async () => {
+  // Regression for the redactor Codex review (BLOCKED): logAttemptResult/logError scrubbed against
+  // process.env, but ocask invokes providers with an injected env (e.g. the generated opencode server
+  // password). A secret present ONLY in that injected env must still be scrubbed in the local record.
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-scrubenv-'));
+  const prevXdg = process.env.XDG_DATA_HOME, prevKey = process.env.DEEPSEEK_API_KEY;
+  process.env.XDG_DATA_HOME = dir;
+  delete process.env.DEEPSEEK_API_KEY; // ensure the secret is NOT in process.env
+  try {
+    const FAKE = 'sk-only-injected-env-99887766';
+    await startRun({ model: 'deepseek-v4-pro' });
+    await logAttemptResult({
+      provider: 'opencode', model: 'deepseek-v4-pro', attemptIndex: 0, outcome: 'failed',
+      durationMs: 5, reasonCode: 'AUTH_FAILURE', mechanismMessage: `401 body echoed ${FAKE}`,
+      scrubEnv: { DEEPSEEK_API_KEY: FAKE },
+    });
+    const rec = (await readLog()).find(e => e.event === 'attempt.result');
+    assert.equal(JSON.stringify(rec).includes(FAKE), false, 'injected-env secret must not persist in the record');
+    assert.match(rec.mechanism_message, /redacted:own-key-/);
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = prevXdg;
+    if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;
+  }
+});

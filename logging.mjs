@@ -380,7 +380,7 @@ export async function logAttemptStart({ provider, model, attemptIndex }) {
 
 export async function logAttemptResult({ provider, model, attemptIndex, outcome, durationMs,
   timeoutMs = 0, reasonCode, outputBytes, tokensUsed, errorClass, classification = null,
-  mechanismMessage = '' }) {
+  mechanismMessage = '', scrubEnv = process.env }) {
   const record = {
     run_id: _currentRunId,
     provider,
@@ -393,7 +393,7 @@ export async function logAttemptResult({ provider, model, attemptIndex, outcome,
     output_bytes: outputBytes || 0,
     tokens_used: tokensUsed,
     error_class: errorClass || null,
-    mechanism_message: await scrubMessage(mechanismMessage),
+    mechanism_message: await scrubMessage(mechanismMessage, scrubEnv),
   };
   // Failure-record taxonomy (#2/#3): class/subclass/locus/mechanism/censored/...
   const cf = _classificationFields(classification);
@@ -425,7 +425,7 @@ export async function logVerdict({ verdict, model, provider, lens, durationMs, b
 }
 
 export async function logError({ model, provider, errorCode, errorClass, attemptCount, durationMs,
-  timeoutMs = 0, classification = null, mechanismMessage = '' }) {
+  timeoutMs = 0, classification = null, mechanismMessage = '', scrubEnv = process.env }) {
   const record = {
     run_id: _currentRunId,
     model,
@@ -435,7 +435,7 @@ export async function logError({ model, provider, errorCode, errorClass, attempt
     attempts_exhausted: attemptCount,
     duration_ms: durationMs,
     timeout_ms: timeoutMs || 0,
-    mechanism_message: await scrubMessage(mechanismMessage),
+    mechanism_message: await scrubMessage(mechanismMessage, scrubEnv),
   };
   // Failure-record taxonomy (#2/#3): the true mechanism + class/subclass/locus.
   const cf = _classificationFields(classification);
