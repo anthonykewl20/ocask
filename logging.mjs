@@ -7,6 +7,9 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
+import { locusFromStatus } from './system.mjs';
+
+export { locusFromStatus };
 
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB before rotation
 const ROTATION_KEEP = 2; // keep this many rotated files
@@ -118,15 +121,6 @@ function _classificationFields(c) {
   return fields;
 }
 
-export function locusFromStatus(httpStatus) {
-  if (!Number.isInteger(httpStatus)) return null;
-  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 429) return 'our-side';
-  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
-  if (httpStatus >= 200 && httpStatus < 300) return null;
-  if (httpStatus >= 300 && httpStatus <= 599) return 'their-side';
-  return null;
-}
-
 export function _safeObservation({ provider, model, mechanism, className, subclass, locus, httpStatus }) {
   const parts = [
     provider ? `provider=${provider}` : 'provider=unknown',
@@ -142,7 +136,7 @@ export function _safeObservation({ provider, model, mechanism, className, subcla
 
 function _percentile(values, q) {
   if (!values || values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b).filter(n => Number.isFinite(n));
+  const sorted = [...values].filter(n => Number.isFinite(n)).sort((a, b) => a - b);
   if (sorted.length === 0) return null;
   const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1));
   return sorted[idx];
@@ -185,6 +179,7 @@ function _inferFailureFinding(attempt, baselineHealthyP99Ms = null, options = {}
       };
     }
     case 'RATE_LIMITED':
+      if (attempt.locus && attempt.locus !== 'our-side') return { cause: 'undetermined', fix: fallbackAction };
       return {
         cause: `${provider || 'unknown'}: rate-limited (our-side).`,
         fix: 'Back off, reduce concurrency, or check API plan limits.',

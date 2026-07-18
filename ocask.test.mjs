@@ -24,6 +24,7 @@ import {
 import {
   classifyFailure,
   generateSuggestions,
+  doctorReport,
   _inferRootCause,
   locusFromStatus,
   logAttemptResult,
@@ -760,6 +761,162 @@ test('issue10: no evidence does not emit a cause', () => {
   }];
   const root = _inferRootCause(attempts, [], null, {});
   assert.equal(root.cause, 'undetermined');
+});
+
+test('issue10: _inferRootCause with two distinct mechanisms yields undetermined', () => {
+  const attempts = [
+    {
+      outcome: 'failed',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      mechanism: 'TIMEOUT',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'their-side',
+      duration_ms: 314359,
+      duration_censored: true,
+      http_status: null,
+    },
+    {
+      outcome: 'failed',
+      provider: 'qwen',
+      model: QWEN_MODEL,
+      mechanism: 'AUTH_FAILURE',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'our-side',
+      duration_ms: 1000,
+      duration_censored: false,
+      http_status: 401,
+    },
+  ];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix ?? '', /Observed:/);
+  assert.match(root.fix ?? '', /TIMEOUT/);
+  assert.match(root.fix ?? '', /AUTH_FAILURE/);
+});
+
+test('issue10: INSUFFICIENT_BALANCE without a 402 signal is undetermined, not billing', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 0,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      mechanism: 'INSUFFICIENT_BALANCE',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'our-side',
+      http_status: null,
+      count: 1,
+      maxDurationMs: 0,
+      avgDurationMs: 0,
+      durationSamples: [0],
+      durationCensored: 0,
+      evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /billing|quota|credit/i.test(a.action)), false);
+  assert.equal(suggestions.some(a => /undetermined/i.test(a.action)), true);
+});
+
+test('issue10: doctorReport end-to-end pipeline reaches HANG through real buckets', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-doctor-report-'));
+  const prevXdg = process.env.XDG_DATA_HOME;
+  const logDir = path.join(tmp, 'ocask');
+  const logPath = path.join(logDir, 'log.jsonl');
+  process.env.XDG_DATA_HOME = tmp;
+
+  const lines = [
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 95000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 100000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'success',
+      mechanism: 'SUCCESS',
+      class: 'judgment',
+      subclass: 'approved',
+      locus: null,
+      duration_ms: 109000,
+      duration_censored: false,
+      http_status: 200,
+      tokens_used: 42,
+    },
+    {
+      event: 'attempt.result',
+      provider: 'deepseek',
+      model: DEEPSEEK_MODEL,
+      outcome: 'failed',
+      mechanism: 'TIMEOUT',
+      class: 'no-judgment',
+      subclass: 'reply-absent',
+      locus: 'their-side',
+      duration_ms: 314359,
+      duration_censored: true,
+      http_status: null,
+      tokens_used: null,
+    },
+  ];
+
+  const payload = lines.map((x) => JSON.stringify(x)).join('\n');
+  try {
+    await fs.mkdir(logDir, { recursive: true });
+    await fs.writeFile(logPath, payload, 'utf8');
+
+    const report = await doctorReport({ system: false });
+    const deepseekProvider = report.providers.find((p) => p.provider === 'deepseek' || `${p.provider_model ?? ''}`.startsWith('deepseek'));
+    assert.equal(Array.isArray(deepseekProvider?.failure_buckets), true, 'deepseek provider should include failure buckets array');
+    assert.ok(deepseekProvider.failure_buckets.length > 0, 'deepseek failure bucket should exist');
+
+    const suggestions = report.suggestions;
+    assert.ok(
+      suggestions.some((s) => /HANG/i.test(s.action)),
+      'doctor suggestion should classify this as HANG',
+    );
+    assert.ok(
+      suggestions.some((s) => /Do NOT increase --timeout-ms/i.test(s.action)),
+      'hang guidance should avoid increasing timeout',
+    );
+  } finally {
+    if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 test('issue10: locusFromStatus mapping', () => {

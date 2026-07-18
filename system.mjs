@@ -96,10 +96,9 @@ async function checkProviderAuth(provider) {
 
 export function locusFromStatus(httpStatus) {
   if (!Number.isInteger(httpStatus)) return null;
-  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 429) return 'our-side';
-  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
   if (httpStatus >= 200 && httpStatus < 300) return null;
-  if (httpStatus >= 300 && httpStatus <= 599) return 'their-side';
+  if (httpStatus >= 400 && httpStatus <= 499) return 'our-side';
+  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
   return null;
 }
 
@@ -121,7 +120,6 @@ async function probeEndpoint(url, label) {
     const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
     const latency = Date.now() - start;
     const state = connectivityStatusFromHttp(res.status, false);
-    if (state.status === 'pass') return { status: state.status, locus: state.locus, detail: `${label}: ${res.status} (${latency}ms); ${state.reason}` };
     return { status: state.status, locus: state.locus, detail: `${label}: ${res.status} (${latency}ms); ${state.reason}` };
   } catch (e) {
     return { status: 'fail', detail: e.name === 'AbortError' ? `${label}: timeout` : `${label}: ${e.message}`, locus: null };
