@@ -23,12 +23,16 @@ import {
 } from './ocask.mjs';
 import {
   classifyFailure,
-  unwrapOrigin,
+  generateSuggestions,
+  _inferRootCause,
+  locusFromStatus,
   logAttemptResult,
+  unwrapOrigin,
   readLog,
   startRun,
 } from './logging.mjs';
 import { ProviderError } from './providers/factory.mjs';
+import { connectivityStatusFromHttp } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
@@ -581,4 +585,188 @@ test('main(): freeform success (no --require-verdict) -> exit 0, verdict:null, n
   assert.equal(obj.verdict, null);
   assert.equal(obj.exit_code, 0);
   assert.equal(obj.reason, null);
+});
+
+// ── issue #10 entailment + tri-state health behavior ──
+
+test('issue10: timeout is inferred as timeout/hang, never credentials auth', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL,
+    mechanism: 'TIMEOUT', class: 'no-judgment', subclass: 'reply-absent',
+    locus: 'their-side', duration_ms: 12000, duration_censored: true,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause.includes('credentials'), false);
+  assert.match(root.cause, /deadline|hang|timeout/);
+  assert.match(root.fix ?? '', /timeout|hang|investigate|trial|swit/);
+});
+
+test('issue10: billing cause requires ENTITLEMENT/402 evidence for that provider only', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 0,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000], durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const timeoutSuggestion = generateSuggestions([provider], []);
+  assert.ok(timeoutSuggestion.some(a => /timeout/.test(a.action) && !/billing|quota|credits/.test(a.action)));
+
+  const billed = {
+    ...provider,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'ENTITLEMENT_UNAVAILABLE', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'our-side', http_status: 402,
+      count: 1, maxDurationMs: 0, avgDurationMs: 0, durationSamples: [], durationCensored: 0, evidenceCount: 1,
+    }],
+  };
+  const billingSuggestion = generateSuggestions([billed], []);
+  assert.ok(billingSuggestion.some(a => /billing\/quota/.test(a.action) || /billing/.test(a.action)));
+});
+
+test('issue10: probe status mapping keeps HTTP 401 as warn, 200 as warn (trial-only)', () => {
+  const unauthorized = connectivityStatusFromHttp(401);
+  const ok = connectivityStatusFromHttp(200);
+  assert.equal(unauthorized.status, 'warn');
+  assert.equal(locusFromStatus(401), 'our-side');
+  assert.equal(ok.status, 'warn');
+  assert.equal(ok.locus, null);
+});
+
+test('issue10: timeout hang fix explicitly says do NOT increase timeout', () => {
+  const attempts = [
+    { outcome: 'success', provider: 'deepseek', model: DEEPSEEK_MODEL, duration_ms: 8000 },
+    { outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT',
+      class: 'no-judgment', subclass: 'reply-absent', locus: 'their-side', duration_ms: 300000, duration_censored: true,
+      http_status: null, reason_code: 'TIMEOUT' },
+  ];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause.includes('HANG'), true);
+  assert.match(root.fix, /Do NOT increase --timeout-ms/i);
+});
+
+test('issue10: doctor suggestions path reaches HANG for a censored bucket ≫ P99 (not only diagnoseRun)', () => {
+  // Regression: doctorReport buckets carry maxDurationMs + a censored COUNT, not the
+  // per-attempt duration_ms/duration_censored that _inferFailureFinding reads. Without the
+  // field bridge, generateSuggestions never reaches the hang branch and mis-advises
+  // "Increase --timeout-ms" on a real hang. This asserts the doctor path, not _inferRootCause.
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-pro',
+    total: 1, success: 0, success_rate: '0.0%',
+    avg_latency_ms: 0, uncensored_latency_count: 0,
+    healthy_p99_ms: 109000,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 314359, avgDurationMs: 314359, durationSamples: [314359],
+      durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.ok(suggestions.some(a => /HANG/i.test(a.action)), 'doctor path must classify a censored ≫P99 timeout as HANG');
+  assert.ok(suggestions.some(a => /Do NOT increase --timeout-ms/i.test(a.action)), 'hang advice must forbid increasing the timeout');
+  assert.equal(suggestions.some(a => /HANG/i.test(a.action) && /\bIncrease --timeout-ms\b/.test(a.action)), false);
+});
+
+test('issue10: latency advice excludes censored samples from averaged advice threshold', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 45000,
+    uncensored_latency_count: 0,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 120000, avgDurationMs: 120000, durationSamples: [120000], durationCensored: 1, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /uncensored avg latency/i.test(a.action)), false);
+});
+
+test('issue10: no cross-provider billing hint for deepseek failure', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 1,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 1000,
+    uncensored_latency_count: 1,
+    healthy_p99_ms: null,
+    failure_buckets: [{
+      provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+      subclass: 'reply-absent', locus: 'their-side', http_status: null,
+      count: 1, maxDurationMs: 1000, avgDurationMs: 1000, durationSamples: [1000], durationCensored: 0, evidenceCount: 1,
+    }],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  assert.equal(suggestions.some(a => /OpenCode Go/i.test(a.action)), false);
+});
+
+test('issue10: mixed failure set is bucketed and not collapsed', () => {
+  const provider = {
+    provider_model: 'deepseek/deepseek-v4-flash',
+    total: 2,
+    success: 0,
+    success_rate: '0.0%',
+    avg_latency_ms: 1000,
+    uncensored_latency_count: 1,
+    healthy_p99_ms: 800,
+    failure_buckets: [
+      {
+        provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'TIMEOUT', class: 'no-judgment',
+        subclass: 'reply-absent', locus: 'their-side', http_status: null,
+        count: 1, maxDurationMs: 1000, avgDurationMs: 1000, durationSamples: [1000], durationCensored: 1, evidenceCount: 1,
+      },
+      {
+        provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'AUTH_FAILURE', class: 'no-judgment',
+        subclass: 'reply-absent', locus: 'our-side', http_status: 401,
+        count: 1, maxDurationMs: 100, avgDurationMs: 100, durationSamples: [100], durationCensored: 0, evidenceCount: 1,
+      },
+    ],
+  };
+  const suggestions = generateSuggestions([provider], []);
+  const timeoutRows = suggestions.filter(a => /TIMEOUT|deadline|hang|timeout/i.test(a.action)).length;
+  const authRows = suggestions.filter(a => /AUTH_FAILURE|auth|credentials|api key/i.test(a.action)).length;
+  assert.ok(timeoutRows >= 1, 'timeout failure should produce a timeout finding');
+  assert.ok(authRows >= 1, 'auth failure should produce an auth finding');
+  assert.ok(suggestions.length >= 2);
+});
+
+test('issue10: consistency does not imply entailment → undetermined cause', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'PROVIDER_ERROR',
+    class: 'no-judgment', subclass: 'reply-absent', locus: 'their-side', duration_ms: 1500,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+  assert.match(root.fix, /Observed:/);
+});
+
+test('issue10: no evidence does not emit a cause', () => {
+  const attempts = [{
+    outcome: 'failed', provider: 'deepseek', model: DEEPSEEK_MODEL,
+    class: 'no-judgment', subclass: 'indeterminate', locus: null, duration_ms: 0,
+  }];
+  const root = _inferRootCause(attempts, [], null, {});
+  assert.equal(root.cause, 'undetermined');
+});
+
+test('issue10: locusFromStatus mapping', () => {
+  assert.equal(locusFromStatus(401), 'our-side');
+  assert.equal(locusFromStatus(403), 'our-side');
+  assert.equal(locusFromStatus(429), 'our-side');
+  assert.equal(locusFromStatus(503), 'their-side');
+  assert.equal(locusFromStatus(504), 'their-side');
+  assert.equal(locusFromStatus(200), null);
 });

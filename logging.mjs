@@ -118,6 +118,107 @@ function _classificationFields(c) {
   return fields;
 }
 
+export function locusFromStatus(httpStatus) {
+  if (!Number.isInteger(httpStatus)) return null;
+  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 429) return 'our-side';
+  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
+  if (httpStatus >= 200 && httpStatus < 300) return null;
+  if (httpStatus >= 300 && httpStatus <= 599) return 'their-side';
+  return null;
+}
+
+export function _safeObservation({ provider, model, mechanism, className, subclass, locus, httpStatus }) {
+  const parts = [
+    provider ? `provider=${provider}` : 'provider=unknown',
+    model ? `model=${model}` : 'model=unknown',
+    `mechanism=${mechanism ?? 'unknown'}`,
+    `class=${className ?? 'unknown'}`,
+    `subclass=${subclass ?? 'unknown'}`,
+    `locus=${locus ?? 'unknown'}`,
+    `http_status=${httpStatus ?? 'n/a'}`,
+  ];
+  return parts.join(', ');
+}
+
+function _percentile(values, q) {
+  if (!values || values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b).filter(n => Number.isFinite(n));
+  if (sorted.length === 0) return null;
+  const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1));
+  return sorted[idx];
+}
+
+function _inferFailureFinding(attempt, baselineHealthyP99Ms = null, options = {}) {
+  const provider = attempt.provider;
+  const isOpencode = provider === 'opencode';
+  const mechanism = attempt.mechanism || null;
+  const durationMs = attempt.duration_ms != null ? Number(attempt.duration_ms) : null;
+  const timedOut = mechanism === 'TIMEOUT';
+  const durationCensored = Boolean(attempt.duration_censored);
+  const providerLabel = (provider || 'unknown').toUpperCase();
+
+  const observation = {
+    provider,
+    model: attempt.model,
+    className: attempt.class,
+    mechanism,
+    subclass: attempt.subclass,
+    locus: attempt.locus,
+    httpStatus: attempt.http_status,
+  };
+  const symptom = _safeObservation(observation);
+
+  const fallbackAction = `Observed symptom: ${symptom}.`;
+
+  if (!mechanism) {
+    return { cause: 'undetermined', fix: fallbackAction };
+  }
+
+  switch (mechanism) {
+    case 'AUTH_FAILURE': {
+      if (attempt.locus && attempt.locus !== 'our-side') return { cause: 'undetermined', fix: fallbackAction };
+      return {
+        cause: `${provider || 'unknown'}: auth/config failure (our-side).`,
+        fix: isOpencode
+          ? `Ensure OpenCode CLI is installed and operational for ${provider || 'that provider'}.`
+          : `Set ${providerLabel}_API_KEY or use --provider with another configured provider.`,
+      };
+    }
+    case 'RATE_LIMITED':
+      return {
+        cause: `${provider || 'unknown'}: rate-limited (our-side).`,
+        fix: 'Back off, reduce concurrency, or check API plan limits.',
+      };
+    case 'ENTITLEMENT_UNAVAILABLE':
+    case 'INSUFFICIENT_BALANCE':
+      if (options.requireExplicitEntitlement && attempt.mechanism !== 'ENTITLEMENT_UNAVAILABLE' && attempt.http_status !== 402) {
+        return { cause: 'undetermined', fix: fallbackAction };
+      }
+      return {
+        cause: `${provider || 'unknown'}: billing/quota issue for this provider.`,
+        fix: `Check ${provider || 'that provider'} billing/quota and enable sufficient credits.`,
+      };
+    case 'TIMEOUT': {
+      const p99 = baselineHealthyP99Ms;
+      if (timedOut && durationCensored && Number.isFinite(durationMs) && p99 && durationMs >= 2 * p99) {
+        return {
+          cause: `${provider || 'unknown'}: likely HANG (their-side).`,
+          fix: `Do NOT increase --timeout-ms. Investigate stuck call timing, payload size, and downstream hangs before retrying.`,
+        };
+      }
+      if (timedOut) {
+        return {
+          cause: `${provider || 'unknown'}: deadline exceeded (their-side).`,
+          fix: `Increase --timeout-ms or hedge with a fallback provider.`,
+        };
+      }
+      return { cause: 'undetermined', fix: fallbackAction };
+    }
+    default:
+      return { cause: 'undetermined', fix: fallbackAction };
+  }
+}
+
 // ── Rotation ──
 async function maybeRotate() {
   const LOG_PATH = logPath();
@@ -303,12 +404,58 @@ export async function doctorReport(options = {}) {
   for (const e of entries) {
     if (e.event !== 'attempt.result') continue;
     const pkey = `${e.provider}/${e.model}`;
-    if (!providerStats[pkey]) providerStats[pkey] = { total: 0, success: 0, errors: {}, totalMs: 0, tokens: 0 };
+    if (!providerStats[pkey]) providerStats[pkey] = {
+      total: 0,
+      success: 0,
+      errorBreakdown: {},
+      latencyMsTotal: 0,
+      latencySamples: [],
+      successLatencySamples: [],
+      tokens: 0,
+      failureBuckets: {},
+    };
     providerStats[pkey].total++;
-    providerStats[pkey].totalMs += e.duration_ms || 0;
+    const durationMs = Number(e.duration_ms) || 0;
+    const durationCensored = Boolean(e.duration_censored);
+    if (durationMs > 0 && !durationCensored) {
+      providerStats[pkey].latencySamples.push(durationMs);
+      providerStats[pkey].latencyMsTotal += durationMs;
+      if (e.outcome === 'success') providerStats[pkey].successLatencySamples.push(durationMs);
+    }
     providerStats[pkey].tokens += (e.tokens_used?.total || e.tokens_used || 0);
     if (e.outcome === 'success') providerStats[pkey].success++;
-    else providerStats[pkey].errors[e.reason_code || 'unknown'] = (providerStats[pkey].errors[e.reason_code || 'unknown'] || 0) + 1;
+    else {
+      const evidence = e.mechanism || e.reason_code || 'unknown';
+      providerStats[pkey].errorBreakdown[evidence] = (providerStats[pkey].errorBreakdown[evidence] || 0) + 1;
+      const locus = e.locus ?? locusFromStatus(Number.isInteger(e.http_status) ? e.http_status : null);
+      const bucketKey = `${e.provider || 'unknown'}|${e.model || 'unknown'}|${e.mechanism || 'unknown'}|${locus || 'unknown'}`;
+      if (!providerStats[pkey].failureBuckets[bucketKey]) {
+        providerStats[pkey].failureBuckets[bucketKey] = {
+          provider: e.provider,
+          model: e.model,
+          mechanism: e.mechanism || e.reason_code || 'unknown',
+          class: e.class ?? null,
+          subclass: e.subclass ?? null,
+          locus: locus ?? null,
+          http_status: e.http_status ?? null,
+          count: 0,
+          maxDurationMs: null,
+          avgDurationMs: null,
+          durationSamples: [],
+          durationCensored: 0,
+          evidenceCount: 0,
+        };
+      }
+      const bucket = providerStats[pkey].failureBuckets[bucketKey];
+      bucket.count++;
+      bucket.evidenceCount++;
+      if (durationMs > 0) {
+        bucket.durationSamples.push(durationMs);
+        bucket.avgDurationMs = Math.round(bucket.durationSamples.reduce((s, v) => s + v, 0) / bucket.durationSamples.length);
+        if (bucket.maxDurationMs == null || durationMs > bucket.maxDurationMs) bucket.maxDurationMs = durationMs;
+      }
+      if (durationCensored) bucket.durationCensored++;
+    }
 
     if (!modelStats[e.model]) modelStats[e.model] = { total: 0, success: 0, totalMs: 0, tokens: 0 };
     modelStats[e.model].total++;
@@ -348,8 +495,13 @@ export async function doctorReport(options = {}) {
     provider_model: key,
     total: s.total, success: s.success,
     success_rate: s.total > 0 ? (s.success / s.total * 100).toFixed(1) + '%' : 'N/A',
-    avg_latency_ms: s.total > 0 ? Math.round(s.totalMs / s.total) : 0,
-    error_breakdown: s.errors, total_tokens: s.tokens,
+    avg_latency_ms: s.latencySamples.length > 0 ? Math.round(s.latencyMsTotal / s.latencySamples.length) : 0,
+    total_tokens: s.tokens,
+    error_breakdown: s.errorBreakdown,
+    failure_buckets: Object.values(s.failureBuckets),
+    failure_counts: Object.keys(s.failureBuckets).length,
+    healthy_p99_ms: _percentile(s.successLatencySamples, 0.99),
+    uncensored_latency_count: s.latencySamples.length,
   })).sort((a, b) => b.total - a.total);
 
   // ── Model summary ──
@@ -372,7 +524,7 @@ export async function doctorReport(options = {}) {
   // ── Top errors ──
   const errorCounts = {};
   for (const [, s] of Object.entries(providerStats)) {
-    for (const [code, count] of Object.entries(s.errors)) {
+    for (const [code, count] of Object.entries(s.errorBreakdown)) {
       errorCounts[code] = (errorCounts[code] || 0) + count;
     }
   }
@@ -395,58 +547,77 @@ export async function doctorReport(options = {}) {
     trend,
     flakes: flakes.slice(0, 10),
     top_errors: topErrors,
-    suggestions: generateSuggestions(providers, flakes, topErrors),
+    suggestions: generateSuggestions(providers, flakes),
     system: sysHealth,
   };
 }
 
-function generateSuggestions(providers, flakes, topErrors) {
+export function generateSuggestions(providers, flakes) {
   const suggestions = [];
 
   for (const p of providers) {
-    const rate = parseFloat(p.success_rate);
-    if (rate < 50 && p.total >= 1 && p.total - p.success > 0) {
-      const codes = Object.keys(p.error_breakdown || {});
-      const isAuth = codes.includes('AUTH_FAILURE');
-      const isTimeout = codes.includes('TIMEOUT');
-      const isExhausted = codes.includes('OPencode_EXHAUSTED');
-
-      if (isTimeout && p.avg_latency_ms > 20000) {
+    const failureBuckets = p.failure_buckets || [];
+    if (failureBuckets.length === 0) continue;
+    for (const failure of failureBuckets) {
+      // The bucket aggregates duration as maxDurationMs + a censored COUNT; map those to the
+      // per-attempt shape _inferFailureFinding reads so the hang branch (censored + ≫P99) is
+      // reachable from the doctor path, not only from diagnoseRun. Max duration = worst case.
+      const finding = _inferFailureFinding(
+        { ...failure, duration_ms: failure.maxDurationMs, duration_censored: failure.durationCensored > 0 },
+        p.healthy_p99_ms,
+        { requireExplicitEntitlement: true },
+      );
+      const observation = _safeObservation({
+        provider: failure.provider,
+        model: failure.model,
+        mechanism: failure.mechanism,
+        className: failure.class,
+        subclass: failure.subclass,
+        locus: failure.locus,
+        httpStatus: failure.http_status,
+      });
+      const countText = `${failure.count}x`;
+      if (finding.cause === 'undetermined') {
+        const already = `Observed: ${observation}`;
+        if (failure.mechanism === 'AUTH_FAILURE') {
+          suggestions.push({
+            severity: 'high',
+            action: `Provider ${p.provider_model}: undetermined (${countText}). ${already}. ${finding.fix}`,
+          });
+        } else {
+          suggestions.push({
+            severity: 'medium',
+            action: `Provider ${p.provider_model}: undetermined (${countText}). ${already}. ${finding.fix}`,
+          });
+        }
+      } else {
+        const severity = failure.mechanism === 'TIMEOUT' || failure.mechanism === 'AUTH_FAILURE'
+          ? 'high'
+          : (finding.cause.includes('billing/quota') ? 'high' : 'medium');
         suggestions.push({
-          severity: 'medium',
-          action: `Provider ${p.provider_model}: ${p.total - p.success} timeout(s) at ${p.avg_latency_ms}ms avg. Increase --timeout-ms or check network.`,
-        });
-      } else if (isExhausted && !isAuth) {
-        suggestions.push({
-          severity: 'high',
-          action: `Provider ${p.provider_model}: ${p.total - p.success} exhausted/failures. OpenCode Go may be out of credits — check https://opencode.ai/account.`,
-        });
-      } else if (isAuth || isExhausted) {
-        suggestions.push({
-          severity: 'high',
-          action: `Provider ${p.provider_model}: ${rate}% success. Auth/config issue. Check credentials or use --provider flag.`,
-        });
-      } else if (p.total >= 3) {
-        suggestions.push({
-          severity: 'high',
-          action: `Provider ${p.provider_model}: ${rate}% success over ${p.total} attempts. Consider removing from fallback chain.`,
+          severity,
+          action: `Provider ${p.provider_model}: ${countText} ${finding.cause} ${finding.fix}`,
         });
       }
     }
-    if (p.avg_latency_ms > 30000) {
-      suggestions.push({ severity: 'medium', action: `Provider ${p.provider_model} avg latency ${p.avg_latency_ms}ms. Increase --timeout-ms or switch.` });
-    }
-  }
 
-  // Config mismatch: one provider has auth failures, another works fine
-  const working = providers.filter(p => parseFloat(p.success_rate) >= 50 && p.total >= 1).map(p => p.provider_model);
-  const failing = providers.filter(p => parseFloat(p.success_rate) === 0 && p.total >= 1).map(p => p.provider_model);
-  if (failing.length > 0 && working.length > 0) {
-    for (const f of failing) {
+    if (p.uncensored_latency_count > 0 && p.avg_latency_ms > 30000) {
       suggestions.push({
-        severity: 'high',
-        action: `${f} fails but ${working.join(', ')} works. config mismatch: add API key for ${f} or use --provider ${working[0].split('/')[0]}.`,
+        severity: 'medium',
+        action: `Provider ${p.provider_model}: uncensored avg latency ${p.avg_latency_ms}ms. Consider increasing timeout or provider hedge.`,
       });
+    }
+
+    // Config mismatch: one provider has no successful run while another has 1+ success.
+    const works = providers.filter(other => parseFloat(other.success_rate) >= 50 && other.total >= 1).map(other => other.provider_model);
+    if (parseFloat(p.success_rate) === 0 && works.length > 0) {
+      const replacement = works.find(other => other !== p.provider_model);
+      if (replacement) {
+        suggestions.push({
+          severity: 'high',
+          action: `${p.provider_model} fails while ${replacement} works. Check provider config and credentials for ${p.provider_model}.`,
+        });
+      }
     }
   }
 
@@ -462,19 +633,6 @@ function generateSuggestions(providers, flakes, topErrors) {
         severity: 'medium',
         action: `Flaky provider: ${key} failed (${flakes.find(f => `${f.flaky_provider}/${f.flaky_model}` === key)?.error_code}) then recovered ${count} time(s).`,
       });
-    }
-  }
-
-  // Lower thresholds for immediate feedback
-  for (const e of topErrors) {
-    if (e.error_code === 'RATE_LIMITED' && e.count >= 1) {
-      suggestions.push({ severity: 'medium', action: `${e.count} rate-limit(s). Check API plan limits.` });
-    }
-    if (e.error_code === 'AUTH_FAILURE' && e.count >= 1) {
-      suggestions.push({ severity: 'high', action: `${e.count} auth failure(s). Check API keys.` });
-    }
-    if (e.error_code === 'TIMEOUT' && e.count >= 2) {
-      suggestions.push({ severity: 'medium', action: `${e.count} timeout(s). Increase --timeout-ms or check connectivity.` });
     }
   }
 
@@ -518,8 +676,14 @@ export async function diagnoseRun(runId) {
     model: a.model,
     outcome: a.outcome,
     duration_ms: a.duration_ms,
+    duration_censored: Boolean(a.duration_censored),
     reason_code: a.reason_code,
+    mechanism: a.mechanism,
     error_class: a.error_class,
+    class: a.class ?? null,
+    subclass: a.subclass ?? null,
+    locus: a.locus ?? null,
+    http_status: a.http_status ?? null,
     tokens: a.tokens_used,
   }));
 
@@ -556,12 +720,18 @@ function _summarizeEvent(e) {
   }
 }
 
-function _inferRootCause(attempts, fallbacks, error, start) {
+export function _inferRootCause(attempts, fallbacks, error, start) {
   if (!error && attempts.every(a => a.outcome === 'success')) {
     return { cause: 'All attempts succeeded — no failure.', fix: null };
   }
 
   const failed = attempts.filter(a => a.outcome === 'failed');
+  const successDurations = attempts
+    .filter(a => a.outcome === 'success' && !a.duration_censored)
+    .map(a => Number(a.duration_ms))
+    .filter(Number.isFinite);
+  const healthyP99Ms = _percentile(successDurations, 0.99);
+
   if (failed.length === 0) {
     return {
       cause: error ? `Terminal error without failed attempts: ${error.error_code}` : 'Unknown failure pattern.',
@@ -569,41 +739,39 @@ function _inferRootCause(attempts, fallbacks, error, start) {
     };
   }
 
-  const codes = [...new Set(failed.map(a => a.reason_code))];
-
-  if (codes.includes('AUTH_FAILURE') || codes.includes('OPencode_EXHAUSTED')) {
-    const missing = failed.find(a => a.provider !== 'unknown' && a.provider !== 'opencode');
-    const worksVia = attempts.find(a => a.outcome === 'success');
-    if (worksVia) {
-      return {
-        cause: `${failed[0].provider}/${failed[0].model}: auth/config failure. The opencode provider works — API keys for native providers not configured.`,
-        fix: `Use --provider ${worksVia.provider} or set ${failed[0].provider?.toUpperCase()}_API_KEY.`,
-      };
+  const signatures = new Map();
+  for (const attempt of failed) {
+    const mechanism = attempt.mechanism || attempt.reason_code || 'unknown';
+    const locus = attempt.locus ?? locusFromStatus(Number.isInteger(attempt.http_status) ? attempt.http_status : null);
+    const key = `${attempt.provider || 'unknown'}|${attempt.model || 'unknown'}|${mechanism}|${locus || 'unknown'}`;
+    if (!signatures.has(key)) {
+      signatures.set(key, {
+        provider: attempt.provider,
+        model: attempt.model,
+        mechanism,
+        class: attempt.class ?? null,
+        subclass: attempt.subclass ?? null,
+        locus,
+        http_status: attempt.http_status ?? null,
+        duration_ms: Number(attempt.duration_ms),
+        duration_censored: Boolean(attempt.duration_censored),
+      });
     }
+  }
+
+  const observations = [...signatures.values()];
+  if (observations.length > 1) {
     return {
-      cause: `Provider ${failed[0].provider} failed: no credentials configured.`,
-      fix: `Set ${failed[0].provider?.toUpperCase()}_API_KEY env var, create ~/.${failed[0].provider}-key file, or use --provider opencode.`,
+      cause: 'undetermined',
+      fix: `Observed: ${observations.map(_safeObservation).join(' | ')}`,
     };
   }
 
-  if (codes.includes('RATE_LIMITED')) {
-    return { cause: 'Provider rate-limited. API quota exhausted or request volume too high.', fix: 'Check API plan limits, add billing, or switch provider.' };
+  const [observation] = observations;
+  const result = _inferFailureFinding(observation, healthyP99Ms, { requireExplicitEntitlement: true });
+  if (result.cause === 'undetermined') {
+    return { cause: 'undetermined', fix: `Observed: ${_safeObservation(observation)}` };
   }
 
-  if (codes.includes('TIMEOUT')) {
-    return { cause: `Request timed out after ${start?.timeoutMs || 'unknown'}ms.`, fix: 'Increase --timeout-ms, check network latency, or switch provider.' };
-  }
-
-  if (codes.includes('MALFORMED_RESPONSE')) {
-    return { cause: 'Provider returned unparseable response.', fix: 'Retry with --no-fallback false to enable opposite-family fallback.' };
-  }
-
-  if (codes.includes('ENTITLEMENT_UNAVAILABLE')) {
-    return { cause: 'API key classified as Lite tier — paid models unavailable.', fix: 'Upgrade API key or use a different provider.' };
-  }
-
-  return {
-    cause: `Multiple failure modes: ${codes.join(', ')}.`,
-    fix: 'Check provider status. Run ocask doctor for health overview.',
-  };
+  return result;
 }

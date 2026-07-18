@@ -12,8 +12,22 @@ const MIN_NODE_MAJOR = 20;
 
 // ── Check runner ──
 async function run(name, fn) {
-  try { const r = await fn(); return { ok: r !== false, name, detail: r === false ? 'not configured' : (typeof r === 'string' ? r : (r?.detail || 'ok')) }; }
-  catch (e) { return { ok: false, name, detail: e?.message || 'check failed' }; }
+  try {
+    const r = await fn();
+    if (r && typeof r === 'object' && typeof r.status === 'string') {
+      const status = r.status;
+      return {
+        ok: status === 'pass',
+        status,
+        name,
+        detail: typeof r.detail === 'string' ? r.detail : 'ok',
+      };
+    }
+    if (r === false) return { ok: false, status: 'fail', name, detail: 'not configured' };
+    return { ok: r !== false, status: r !== false ? 'pass' : 'fail', name, detail: r === false ? 'not configured' : (typeof r === 'string' ? r : (r?.detail || 'ok')) };
+  } catch (e) {
+    return { ok: false, status: 'fail', name, detail: e?.message || 'check failed' };
+  }
 }
 
 // ── Dependency checks ──
@@ -80,6 +94,24 @@ async function checkProviderAuth(provider) {
   }
 }
 
+export function locusFromStatus(httpStatus) {
+  if (!Number.isInteger(httpStatus)) return null;
+  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 429) return 'our-side';
+  if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
+  if (httpStatus >= 200 && httpStatus < 300) return null;
+  if (httpStatus >= 300 && httpStatus <= 599) return 'their-side';
+  return null;
+}
+
+export function connectivityStatusFromHttp(httpStatus, trialed = false) {
+  if (!Number.isInteger(httpStatus)) return { status: 'fail', locus: null, reason: 'unreachable' };
+  const locus = locusFromStatus(httpStatus);
+  if (httpStatus >= 200 && httpStatus < 300) {
+    return { status: trialed ? 'pass' : 'warn', locus: null, reason: 'reachable; usability unverified (ping only)' };
+  }
+  return { status: 'warn', locus, reason: `reachable but ${httpStatus}` };
+}
+
 // ── API connectivity probe ──
 async function probeEndpoint(url, label) {
   const controller = new AbortController();
@@ -88,10 +120,11 @@ async function probeEndpoint(url, label) {
     const start = Date.now();
     const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
     const latency = Date.now() - start;
-    if (!res.ok) return `${label}: ${res.status} (${latency}ms)`;
-    return `${label}: reachable (${latency}ms)`;
+    const state = connectivityStatusFromHttp(res.status, false);
+    if (state.status === 'pass') return { status: state.status, locus: state.locus, detail: `${label}: ${res.status} (${latency}ms); ${state.reason}` };
+    return { status: state.status, locus: state.locus, detail: `${label}: ${res.status} (${latency}ms); ${state.reason}` };
   } catch (e) {
-    return e.name === 'AbortError' ? `${label}: timeout` : `${label}: ${e.message}`;
+    return { status: 'fail', detail: e.name === 'AbortError' ? `${label}: timeout` : `${label}: ${e.message}`, locus: null };
   } finally { clearTimeout(timer); }
 }
 
@@ -144,17 +177,30 @@ export async function systemHealth() {
 
   const ok = checks.filter(c => c.ok).length;
   const total = checks.length;
+  const pass = checks.filter(c => c.status === 'pass').length;
+  const warn = checks.filter(c => c.status === 'warn').length;
+  const fail = checks.filter(c => c.status === 'fail').length;
   const categories = {};
   for (const c of checks) {
     if (!categories[c.category]) categories[c.category] = { ok: 0, total: 0 };
     categories[c.category].total++;
     if (c.ok) categories[c.category].ok++;
+    if (!categories[c.category].status) categories[c.category].status = { pass: 0, warn: 0, fail: 0 };
+    categories[c.category].status[c.status || 'fail'] = (categories[c.category].status[c.status || 'fail'] || 0) + 1;
   }
 
+  let status = 'healthy';
+  if (fail > 0) status = 'unhealthy';
+  else if (warn > 0) status = 'degraded';
+
   return {
-    status: ok === total ? 'healthy' : ok > total * 0.5 ? 'degraded' : 'unhealthy',
+    status,
     checks,
-    summary: { ok, total, categories },
+    summary: {
+      ok, total, pass, warn, fail,
+      categories,
+      by_status: { pass, warn, fail },
+    },
   };
 }
 
@@ -163,15 +209,24 @@ export function formatSystemHealth(report) {
   const lines = [`ocask system health: ${report.status.toUpperCase()}`];
   lines.push('');
   let lastCat = '';
+  const statusTag = {
+    pass: 'pass',
+    warn: 'warn',
+    fail: 'fail',
+  };
   for (const c of report.checks) {
     if (c.category !== lastCat) { lines.push(`  ${c.category}:`); lastCat = c.category; }
-    const mark = c.ok ? '✓' : '✗';
-    lines.push(`    ${mark} ${c.name}: ${c.detail}`);
+    const st = c.status || (c.ok ? 'pass' : 'fail');
+    lines.push(`    ${statusTag[st] || 'fail'} ${c.name}: ${c.detail}`);
   }
   lines.push('');
-  lines.push(`  ${report.summary.ok}/${report.summary.total} checks passed`);
+  lines.push(`  ${report.summary.pass}/${report.summary.total} checks passed`);
+  lines.push(`  ${report.summary.warn} checks warn, ${report.summary.fail} checks fail`);
   for (const [cat, s] of Object.entries(report.summary.categories)) {
-    lines.push(`  ${cat}: ${s.ok}/${s.total}`);
+    const passCount = s.status?.pass || 0;
+    const warnCount = s.status?.warn || 0;
+    const failCount = s.status?.fail || 0;
+    lines.push(`  ${cat}: ${passCount} pass, ${warnCount} warn, ${failCount} fail`);
   }
   return lines.join('\n');
 }
