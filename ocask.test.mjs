@@ -1115,3 +1115,22 @@ test('issue9: stderr cause line is scrubbed of own secrets (Domain 3, ocask.mjs 
     if (prev === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prev;
   }
 });
+
+test('issue9: longest-first ordering — a longer key overlapping a shorter one is fully scrubbed (no orphan)', async () => {
+  // Design §7.1: secrets are matched longest-first so scrubbing a shorter key that is a prefix of a
+  // longer key cannot orphan the longer key's suffix. Here QWEN key is a prefix of the DEEPSEEK key.
+  const shortKey = 'sk-common-prefix-1234';          // 21 chars, >= MIN_SECRET_LENGTH
+  const longKey  = 'sk-common-prefix-1234-SUFFIX-XYZ789'; // longKey starts with shortKey
+  const env = { QWEN_API_KEY: shortKey, DEEPSEEK_API_KEY: longKey };
+  const out = await scrubMessage(`upstream rejected ${longKey} at edge`, env);
+  assert.equal(out.includes(longKey), false, 'the full long key must be removed');
+  assert.equal(out.includes('SUFFIX-XYZ789'), false, 'no orphaned suffix of the long key may survive');
+});
+
+test('issue9: MIN_SECRET_LENGTH guard — a sub-8-char value is NOT used as a scrub token (no over-scrub)', async () => {
+  const tiny = 'abc12';   // 5 chars, below MIN_SECRET_LENGTH (8)
+  const env = { DEEPSEEK_API_KEY: tiny, QWEN_API_KEY: '' };
+  const out = await scrubMessage(`benign text abc12 and abc12345 tail`, env);
+  assert.equal(out.includes('abc12'), true, 'a below-threshold value must not redact its occurrences');
+  assert.doesNotMatch(out, /redacted:own-key-/, 'no redaction should occur for a sub-threshold secret');
+});
