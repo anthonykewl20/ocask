@@ -255,6 +255,25 @@ test('runPanel launches members in parallel with one shared absolute deadline', 
   assert.equal(result.consensus.judgments_count, 2);
 });
 
+test('runPanel uses review hard ceiling when timeout exceeds delegation ceiling', async () => {
+  const calls = [];
+  const result = await runPanel({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Review.',
+    requireVerdict: true,
+    provider: 'opencode',
+    timeoutMs: 1_000_000,
+    run_id: 'panel-ops-ceiling-test',
+    invokeWithFallbackFn: async ({ model, timeoutMs }) => {
+      calls.push(timeoutMs);
+      return { provider: 'opencode', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: enough evidence.' };
+    },
+  });
+  assert.equal(result.verdict, 'APPROVED');
+  assert.ok(calls.every(timeoutMs => timeoutMs > 300000 && timeoutMs <= 900000),
+    `panel members must inherit review ceiling for timeout budgeting (${calls.join(', ')})`);
+});
+
 test('runPanel classifies one member timeout as an abstention and fails K=2 quorum', async () => {
   const result = await runPanel({
     model: DEEPSEEK_PRO_MODEL,
@@ -532,14 +551,37 @@ test('resolveTimeout maps 0 to default timeout and never interprets it as unboun
   assert.equal(resolveTimeout(0), 170000);
 });
 
-test('resolveTimeout caps caller timeout at the hard ceiling', () => {
+test('resolveTimeout caps caller timeout at the delegation hard ceiling', () => {
   assert.equal(resolveTimeout(500000), 300000);
+});
+
+test('resolveTimeout keeps the review ceiling when explicitly requested', () => {
+  assert.equal(resolveTimeout(600000, { hardCeilMs: 900000 }), 600000);
+  assert.equal(resolveTimeout(1_000_000, { hardCeilMs: 900000 }), 900000);
+});
+
+test('resolveTimeout keeps the default timeout when request is omitted even with raised review ceiling', () => {
+  assert.equal(resolveTimeout(0, { hardCeilMs: 900000 }), 170000);
+  assert.equal(resolveTimeout(undefined, { hardCeilMs: 900000 }), 170000);
 });
 
 test('runMain maps absent --timeout-ms to default', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
     ['--model', QWEN_MODEL, '--task', 't', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 170000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain maps absent --timeout-ms to default for review operations', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
       return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
@@ -559,6 +601,32 @@ test('runMain caps explicit --timeout-ms above the hard ceiling', async () => {
     },
   );
   assert.equal(askedTimeoutMs, 300000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain uses review ceiling for --require-verdict workloads', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '600000', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 600000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain caps explicit --timeout-ms above the review ceiling', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '1000000', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 900000);
   assert.equal(exitCode, 0);
 });
 
