@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,9 +17,12 @@ import {
   guardAllowedModels,
   parseArgs,
   parseOpenCodeJsonl,
+  promptHash,
   readExistingPathOrLiteral,
+  remainingBudget,
   runAsk,
   runMain,
+  resolveTimeout,
   validateAssistantOutput,
 } from './ocask.mjs';
 import {
@@ -34,12 +38,61 @@ import {
   scrubMessage,
   MAX_MECHANISM_MSG_LENGTH,
 } from './logging.mjs';
-import { ProviderError } from './providers/factory.mjs';
+import {
+  ProviderError,
+  isIdentityPreservingTransport,
+  identityTransportRoute,
+  identityTransportTrustTable,
+  invokeWithFallback,
+  resolveProviderChain,
+} from './providers/factory.mjs';
 import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
 const DEEPSEEK_PRO_MODEL = 'deepseek-v4-pro';
+
+async function makeFakeOpenCodeCli(mode = 'success') {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-identity-'));
+  const binDir = path.join(root, 'bin');
+  const homeDir = path.join(root, 'home');
+  const tracePath = path.join(root, 'opencode-args.json');
+  const metadataPath = path.join(root, 'metadata.json');
+  await fs.mkdir(binDir);
+  await fs.mkdir(homeDir);
+  const executable = path.join(binDir, 'opencode');
+  await fs.writeFile(executable, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.OCASK_TEST_OPENCODE_TRACE, JSON.stringify(args) + '\\n');
+const route = args[args.indexOf('--model') + 1];
+if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith('deepseek/')) {
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({reason:'Primary deliberately omitted its verdict.'})}}) + '\\n');
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'swap-failure' && route.startsWith('alibaba/')) {
+  process.stderr.write('controlled qwen transport failure\\n');
+  process.exitCode = 1;
+} else {
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Real factory path reached OpenCode.'})}}) + '\\n');
+}
+`);
+  await fs.chmod(executable, 0o755);
+  const env = {
+    ...process.env,
+    HOME: homeDir,
+    PATH: `${binDir}:${process.env.PATH || ''}`,
+    XDG_DATA_HOME: path.join(root, 'data'),
+    OCASK_DISABLE_SERVER: '1',
+    OCASK_TEST_OPENCODE_TRACE: tracePath,
+    OCASK_TEST_OPENCODE_MODE: mode,
+    DEEPSEEK_API_KEY: '',
+    QWEN_API_KEY: '',
+  };
+  return { root, tracePath, metadataPath, env };
+}
+
+async function readOpenCodeTrace(tracePath) {
+  return (await fs.readFile(tracePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+}
 
 // ── Arg parsing ──
 test('parseArgs handles supported booleans and rejects unknown legacy flags', () => {
@@ -116,6 +169,35 @@ test('all lenses produce valid prompts', () => {
   }
 });
 
+// ── prompt_hash (#9): deterministic one-way digest of the prompt ──
+// The prompt hash lets failures be correlated by task. These properties MUST hold.
+// (They FAIL against the old randomBytes-based promptHash: two identical prompts
+// previously hashed differently, so correlation was impossible.)
+test('promptHash is stable: identical prompt text → identical hash (correlation)', () => {
+  const text = 'Review the auth module for injection surfaces.';
+  const a = promptHash(text);
+  const b = promptHash(text);
+  assert.equal(a, b, 'identical prompt text must produce an identical hash');
+  assert.match(a, /^[0-9a-f]{16}$/, 'digest is a 16-char lowercase-hex prefix');
+});
+
+test('promptHash discriminates: different prompt text → different hash', () => {
+  const h1 = promptHash('Review the auth module for injection surfaces.');
+  const h2 = promptHash('Review the auth module for privilege escalation.');
+  assert.notEqual(h1, h2, 'different prompt text must produce a different hash');
+});
+
+test('promptHash never contains prompt text — it is a pure hex digest', () => {
+  const distinctive = 'SUPERCALIFRAGILISTIC-secret-token-9876543210';
+  const text = `Please audit ${distinctive} carefully.`;
+  const h = promptHash(text);
+  assert.match(h, /^[0-9a-f]+$/, 'a digest contains only hex characters');
+  assert.ok(!h.includes(distinctive), 'distinctive input substring must not appear in the digest');
+  // Cross-check against an independently computed SHA-256 prefix: pins both the
+  // algorithm and the 16-char truncation.
+  assert.equal(h, createHash('sha256').update(text).digest('hex').slice(0, 16));
+});
+
 // ── Output validation ──
 test('verdict accepts APPROVED, WARNING, BLOCKED', () => {
   validateAssistantOutput('VERDICT: APPROVED\n\nRationale: correct.', { requireVerdict: true });
@@ -182,6 +264,69 @@ test('runMain rejects missing model or task', async () => {
   process.exitCode = prev;
 });
 
+test('resolveTimeout defaults to measured timeout when caller omits value', () => {
+  assert.equal(resolveTimeout(), 170000);
+});
+
+test('resolveTimeout maps 0 to default timeout and never interprets it as unbounded', () => {
+  assert.equal(resolveTimeout(0), 170000);
+});
+
+test('resolveTimeout caps caller timeout at the hard ceiling', () => {
+  assert.equal(resolveTimeout(500000), 300000);
+});
+
+test('runMain maps absent --timeout-ms to default', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 170000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain caps explicit --timeout-ms above the hard ceiling', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '500000', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 300000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain treats explicit --timeout-ms 0 as default, not unbounded', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '0', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 170000);
+  assert.equal(exitCode, 0);
+});
+
+test('shared deadline math: fallback receives only remaining wall-clock', () => {
+  const start = 1000;
+  const effectiveTimeoutMs = resolveTimeout();
+  const absoluteDeadlineMs = start + effectiveTimeoutMs;
+  const primaryConsumedMs = 50000;
+  const primaryRemainingMs = remainingBudget(absoluteDeadlineMs, start + primaryConsumedMs);
+  const fallbackRemainingMs = remainingBudget(absoluteDeadlineMs, start + primaryConsumedMs + 1000);
+  assert.equal(primaryRemainingMs, 120000);
+  assert.equal(fallbackRemainingMs, 119000);
+  assert.ok(fallbackRemainingMs <= effectiveTimeoutMs - primaryConsumedMs);
+});
+
 // ── Provider factory (unit) ──
 test('modelFamily classification', async () => {
   const { modelFamily } = await import('./providers/factory.mjs');
@@ -210,6 +355,123 @@ test('availableProviders lists all', async () => {
   assert.ok(providers.includes('opencode'));
   assert.ok(providers.includes('deepseek'));
   assert.ok(providers.includes('qwen'));
+});
+
+test('resolveProviderChain enforces the identity-trust transport set', async () => {
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true }), ['deepseek', 'opencode']);
+  assert.deepEqual(resolveProviderChain({ model: QWEN_MODEL, noFallback: true }), ['qwen', 'opencode']);
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'deepseek' }), ['deepseek']);
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'opencode' }), ['opencode']);
+  assert.ok(!resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: false }).includes('qwen'));
+  assert.ok(!resolveProviderChain({ model: QWEN_MODEL, noFallback: false }).includes('deepseek'));
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, chain: { deepseek: ['qwen', 'opencode', 'deepseek'] } }),
+    ['opencode', 'deepseek'],
+    'configured chains receive the same final serving filter',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: QWEN_MODEL, chain: { qwen: ['deepseek', 'opencode', 'qwen'] } }),
+    ['opencode', 'qwen'],
+    'the final serving filter is symmetric for qwen-family models',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, preferredProvider: 'qwen' }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: QWEN_MODEL, preferredProvider: 'deepseek' }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true, chain: { deepseek: ['opencode'] } }),
+    [],
+    'an unlisted transport is not implicitly trusted under the identity pin',
+  );
+});
+
+test('identity pin always admits a model native provider without weakening family isolation', async () => {
+  const unlistedQwenModel = 'qwen3.7-max';
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true }),
+    ['deepseek'],
+    'an unlisted DeepSeek model retains its native transport',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'deepseek', noFallback: true }),
+    ['deepseek'],
+    'an explicitly pinned native transport is accepted',
+  );
+  assert.equal(isIdentityPreservingTransport(DEEPSEEK_MODEL, 'deepseek'), true);
+  assert.deepEqual(
+    resolveProviderChain({ model: unlistedQwenModel, noFallback: true }),
+    ['qwen'],
+    'an unlisted Qwen model retains its native transport',
+  );
+  assert.equal(isIdentityPreservingTransport(unlistedQwenModel, 'qwen'), true);
+  assert.ok(
+    !resolveProviderChain({
+      model: DEEPSEEK_MODEL,
+      noFallback: true,
+      chain: { deepseek: ['qwen', 'deepseek'] },
+    }).includes('qwen'),
+    'a DeepSeek model never crosses into the Qwen provider',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'qwen', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: unlistedQwenModel, preferredProvider: 'deepseek', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+});
+
+test('identity trust declarations are explicit, auditable, and provide executable routes', () => {
+  const table = identityTransportTrustTable();
+  for (const [model, entries] of Object.entries(table)) {
+    for (const entry of entries) {
+      assert.equal(entry.equivalence, 'declared', `${model}/${entry.provider}`);
+      assert.match(entry.declaration, /Human-curated declaration/);
+      assert.equal(entry.provenance, '.evidence/issue5-nofallback-decision.md');
+      assert.ok(Object.hasOwn(entry, 'snapshotId'));
+      assert.equal(entry.snapshotId, null);
+      assert.equal(entry.snapshotStatus, 'vendor-exposes-no-snapshot');
+      assert.equal(identityTransportRoute(model, entry.provider), entry.modelRoute);
+    }
+  }
+});
+
+test('explicit qwen provider for a deepseek model hard-rejects before invocation', async () => {
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetchCalls++; throw new Error('must not be called'); };
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'never sent',
+        preferredProvider: 'qwen',
+        env: { ...process.env, QWEN_API_KEY: 'would-attempt-if-routing-were-wrong' },
+      }),
+      error => error.code === 'MODEL_NOT_FOUND' && error.provider === 'qwen',
+    );
+    assert.equal(fetchCalls, 0, 'the incompatible provider was never attempted');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('unlisted transport under the identity pin fails our-side without invocation', async () => {
+  await assert.rejects(
+    invokeWithFallback({
+      model: DEEPSEEK_MODEL,
+      prompt: 'never sent',
+      noFallback: true,
+      chain: { deepseek: ['opencode'] },
+      env: { ...process.env, PATH: '' },
+    }),
+    error => error.code === 'NO_PROVIDER',
+  );
 });
 
 // install.sh installs the CLI as a symlink, so argv[1] is the link path while
@@ -527,6 +789,137 @@ test('buildJsonResponse: first-class machine fields + output, exit_code agrees w
   assert.equal(json.output, 'VERDICT: BLOCKED\nfix me');
   // Redundant agreeing signal: JSON exit_code == process exit band.
   assert.equal(json.exit_code, d.exit_code);
+});
+
+test('real CLI: --no-fallback missing native key falls through to OpenCode with identity preserved', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--no-fallback', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    const [opencodeArgs] = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(response.verdict, 'APPROVED');
+    assert.equal(metadata.actual_model, DEEPSEEK_PRO_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, true);
+    assert.equal(opencodeArgs[opencodeArgs.indexOf('--model') + 1], identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'));
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: pinned native wire with missing key is no-judgment our-side', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--provider', 'deepseek', '--require-verdict', '--no-fallback', '--json',
+      '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 30, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.verdict, null);
+    assert.equal(response.locus, 'our-side');
+    assert.equal(response.mechanism, 'AUTH_FAILURE');
+    assert.equal(metadata.identity_preserved, false, 'no model ran, so identity cannot be claimed');
+    await assert.rejects(fs.access(fixture.tracePath), error => error.code === 'ENOENT');
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: default-mode model swap is surfaced and flips identity_preserved', async () => {
+  const fixture = await makeFakeOpenCodeCli('swap-success');
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(response.verdict, 'APPROVED');
+    assert.equal(metadata.fallback_used, true);
+    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, false);
+    assert.deepEqual(traces.map(args => args[args.indexOf('--model') + 1]), [
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(QWEN_MODEL, 'opencode'),
+    ]);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('real CLI: failed default-mode model swap remains identity_preserved=false', async () => {
+  const fixture = await makeFakeOpenCodeCli('swap-failure');
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 30, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    assert.equal(response.outcome, 'no-judgment');
+    assert.equal(response.verdict, null);
+    assert.equal(metadata.fallback_used, true);
+    assert.equal(metadata.actual_model, QWEN_MODEL);
+    assert.equal(metadata.actual_transport, 'opencode');
+    assert.equal(metadata.identity_preserved, false);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('post-invocation validation failure retains the actual provider attribution', async () => {
+  await assert.rejects(
+    runAsk({
+      model: DEEPSEEK_PRO_MODEL,
+      taskText: 'Return a verdict.',
+      requireVerdict: true,
+      noFallback: true,
+      invokeWithFallbackFn: async () => ({
+        provider: 'opencode',
+        model_used: DEEPSEEK_PRO_MODEL,
+        stdout: JSON.stringify({ type: 'text', part: { type: 'text', text: 'missing verdict' }, timestamp: Date.now() }),
+      }),
+    }),
+    error => {
+      assert.equal(error.ocaskMetadata.actual_model, DEEPSEEK_PRO_MODEL);
+      assert.equal(error.ocaskMetadata.actual_transport, 'opencode');
+      assert.equal(error.ocaskMetadata.identity_preserved, true);
+      return true;
+    },
+  );
+});
+
+test('successful but untrusted transport is never attributed as identity-preserving', async () => {
+  const result = await runAsk({
+    model: DEEPSEEK_PRO_MODEL,
+    taskText: 'Return a verdict.',
+    requireVerdict: true,
+    noFallback: false,
+    invokeWithFallbackFn: async () => ({
+      provider: 'misconfigured-transport',
+      model_used: DEEPSEEK_PRO_MODEL,
+      stdout: JSON.stringify({ type: 'text', part: { type: 'text', text: 'VERDICT: APPROVED\n\nUntrusted path.' }, timestamp: Date.now() }),
+      stderr: '',
+    }),
+  });
+  assert.equal(result.metadata.identity_preserved, false);
 });
 
 // A runAsk fake shaped exactly like the real success envelope: output + verdict +

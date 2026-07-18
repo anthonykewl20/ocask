@@ -5,7 +5,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { ProviderError, isDeepSeekModel } from './factory.mjs';
+import { ProviderError, identityTransportRoute, isDeepSeekModel } from './factory.mjs';
 
 const BASE_URL = 'https://api.deepseek.com';
 const CHAT_ENDPOINT = '/v1/chat/completions';
@@ -14,7 +14,7 @@ const DEFAULT_MAX_TOKENS = 65536;
 // Read API key: env var takes priority, then key file.
 async function resolveApiKey(env = process.env) {
   if (env.DEEPSEEK_API_KEY) return env.DEEPSEEK_API_KEY;
-  const keyfile = path.join(os.homedir(), '.deepseek-key');
+  const keyfile = path.join(env.HOME || os.homedir(), '.deepseek-key');
   try {
     const key = (await readFile(keyfile, 'utf8')).trim();
     if (key) return key;
@@ -24,14 +24,13 @@ async function resolveApiKey(env = process.env) {
 
 // Map ocask model IDs to DeepSeek API model IDs.
 const MODEL_MAP = {
-  'deepseek-v4-pro': 'deepseek-chat',  // DeepSeek v4 Pro uses deepseek-chat endpoint
   'deepseek-v4-flash': 'deepseek-chat',
   'deepseek-chat': 'deepseek-chat',
   'deepseek-reasoner': 'deepseek-reasoner',
 };
 
 function apiModel(model) {
-  return MODEL_MAP[model] || model;
+  return identityTransportRoute(model, 'deepseek') || MODEL_MAP[model] || model;
 }
 
 function classifyError(status, body) {
@@ -118,9 +117,11 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
 
   const usage = body.usage || {};
   const stderr = `[DeepSeek API] tokens: ${usage.prompt_tokens || 0} in / ${usage.completion_tokens || 0} out / ${usage.total_tokens || 0} total`;
+  const returnedRoute = typeof body.model === 'string' && body.model ? body.model : apiModelId;
+  const modelUsed = returnedRoute === apiModelId ? model : returnedRoute;
 
   return {
-    stdout, stderr, provider: 'deepseek', model_used: apiModelId,
+    stdout, stderr, provider: 'deepseek', model_used: modelUsed, model_route: apiModelId,
     tokensUsed: { input: usage.prompt_tokens || 0, output: usage.completion_tokens || 0, total: usage.total_tokens || 0 },
   };
 }
