@@ -3,7 +3,7 @@
 // Supports DeepSeek API, Qwen/Alibaba API, and OpenCode CLI backends.
 // See ARCHITECTURE.md for design rationale.
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -48,6 +48,15 @@ function parseTemperature(value) {
   if (!Number.isFinite(t)) throw new Error('--temperature must be 0');
   if (t !== 0) throw new Error('--temperature only supports 0');
   return t;
+}
+
+// Deterministic one-way digest of the prompt text (#9). Two runs of the IDENTICAL
+// prompt yield the SAME hash so failures can be correlated by task — the old
+// randomBytes() value carried no information (identical prompts hashed differently).
+// SHA-256 hex truncated to a stable 16-char prefix keeps log lines compact, and the
+// output is purely a digest: it never contains prompt text.
+export function promptHash(text) {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 // ── ARG PARSING ──
@@ -344,7 +353,7 @@ export async function runAsk({
   };
 
   await logRunStart({
-    model, lens, provider, promptHash: randomBytes(8).toString('hex'),
+    model, lens, provider, promptHash: promptHash(originalPrompt),
     inputBytes: metadata.input_bytes, timeoutMs,
   });
 

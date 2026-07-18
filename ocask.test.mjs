@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,7 @@ import {
   guardAllowedModels,
   parseArgs,
   parseOpenCodeJsonl,
+  promptHash,
   readExistingPathOrLiteral,
   runAsk,
   runMain,
@@ -161,6 +163,35 @@ test('all lenses produce valid prompts', () => {
     assert.match(prompt, /## AUDIT FRAMEWORK/, `${lens} lens`);
     assert.ok(prompt.length > 200, `${lens} prompt too short`);
   }
+});
+
+// ── prompt_hash (#9): deterministic one-way digest of the prompt ──
+// The prompt hash lets failures be correlated by task. These properties MUST hold.
+// (They FAIL against the old randomBytes-based promptHash: two identical prompts
+// previously hashed differently, so correlation was impossible.)
+test('promptHash is stable: identical prompt text → identical hash (correlation)', () => {
+  const text = 'Review the auth module for injection surfaces.';
+  const a = promptHash(text);
+  const b = promptHash(text);
+  assert.equal(a, b, 'identical prompt text must produce an identical hash');
+  assert.match(a, /^[0-9a-f]{16}$/, 'digest is a 16-char lowercase-hex prefix');
+});
+
+test('promptHash discriminates: different prompt text → different hash', () => {
+  const h1 = promptHash('Review the auth module for injection surfaces.');
+  const h2 = promptHash('Review the auth module for privilege escalation.');
+  assert.notEqual(h1, h2, 'different prompt text must produce a different hash');
+});
+
+test('promptHash never contains prompt text — it is a pure hex digest', () => {
+  const distinctive = 'SUPERCALIFRAGILISTIC-secret-token-9876543210';
+  const text = `Please audit ${distinctive} carefully.`;
+  const h = promptHash(text);
+  assert.match(h, /^[0-9a-f]+$/, 'a digest contains only hex characters');
+  assert.ok(!h.includes(distinctive), 'distinctive input substring must not appear in the digest');
+  // Cross-check against an independently computed SHA-256 prefix: pins both the
+  // algorithm and the 16-char truncation.
+  assert.equal(h, createHash('sha256').update(text).digest('hex').slice(0, 16));
 });
 
 // ── Output validation ──
