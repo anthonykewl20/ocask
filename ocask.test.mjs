@@ -31,6 +31,8 @@ import {
   unwrapOrigin,
   readLog,
   startRun,
+  scrubMessage,
+  MAX_MECHANISM_MSG_LENGTH,
 } from './logging.mjs';
 import { ProviderError } from './providers/factory.mjs';
 import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
@@ -361,6 +363,9 @@ test('HTTP status and retry-after propagate from the originating cause', () => {
 test('logAttemptResult writes the full failure-record taxonomy to the log', async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-tax-'));
   const prevXdg = process.env.XDG_DATA_HOME;
+  const prevDeepseek = process.env.DEEPSEEK_API_KEY;
+  const mechanismValue = 'sk-live-fake-key-1234567890';
+  process.env.DEEPSEEK_API_KEY = mechanismValue;
   process.env.XDG_DATA_HOME = tmp;
   startRun('tax-test-run');
   try {
@@ -374,12 +379,13 @@ test('logAttemptResult writes the full failure-record taxonomy to the log', asyn
       provider: unwrapOrigin(wrapped).provider, model: 'deepseek-v4-flash',
       attemptIndex: 0, outcome: 'failed', durationMs: 5000, timeoutMs: 5000,
       reasonCode: classification.mechanism, outputBytes: 0, tokensUsed: null,
-      errorClass: 'ProviderError', classification,
+      errorClass: 'ProviderError', classification, mechanismMessage: `timed out with ${mechanismValue}`,
     });
     const entries = await readLog();
     const rec = entries.find(e => e.event === 'attempt.result');
     assert.ok(rec, 'attempt.result record was written');
     assert.equal(rec.provider, 'deepseek', 'real provider, not unknown');
+    assert.equal(rec.mechanism_message.includes('sk-live-fake-key-1234567890'), false);
     assert.equal(rec.class, 'no-judgment');
     assert.equal(rec.subclass, 'reply-absent');
     assert.equal(rec.locus, 'their-side');
@@ -388,8 +394,53 @@ test('logAttemptResult writes the full failure-record taxonomy to the log', asyn
     assert.equal(rec.timeout_ms, 5000);
     assert.equal(rec.reason_code, 'TIMEOUT');
   } finally {
+    if (prevDeepseek === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = prevDeepseek;
     if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = prevXdg;
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('main(): failure metadata never includes mechanism_message (local-only mechanism text)', async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-meta-'));
+  const metadataPath = path.join(tmp, 'metadata.json');
+  const home = path.join(tmp, 'home');
+  await fs.mkdir(home, { recursive: true });
+
+  const prevHome = process.env.HOME;
+  const prevDataHome = process.env.XDG_DATA_HOME;
+  const prevRuntime = process.env.XDG_RUNTIME_DIR;
+
+  process.env.HOME = home;
+  process.env.XDG_DATA_HOME = tmp;
+  process.env.XDG_RUNTIME_DIR = path.join(tmp, 'runtime');
+  try {
+    const { exitCode } = await runFakeMain(
+      ['--model', DEEPSEEK_MODEL, '--task', 'metadata confinement', '--require-verdict', '--json', '--metadata', metadataPath],
+      null,
+      { stdout: [], stderr: [] },
+      {
+        ...process.env,
+        HOME: home,
+        DEEPSEEK_API_KEY: '',
+        QWEN_API_KEY: '',
+        OPENCODE_SERVER_PASSWORD: '',
+      },
+    );
+    assert.equal(exitCode, 30);
+
+    const text = await fs.readFile(metadataPath, 'utf8');
+    const parsed = JSON.parse(text || '{}');
+    assert.equal('mechanism_message' in parsed, false, 'mechanism_message must never be in --metadata object');
+    assert.equal(Array.isArray(parsed.attempts), true);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = prevDataHome;
+    if (prevRuntime === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = prevRuntime;
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
@@ -488,16 +539,56 @@ function fakeJudgment(verdict, text) {
   });
 }
 
-async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }) {
+async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] }, env = process.env) {
   const prev = process.exitCode;
   await runMain(argv,
     (l) => capture.stdout.push(l), (l) => capture.stderr.push(l),
-    process.stdin, process.cwd(), process.env, fakeRunAsk);
+    process.stdin, process.cwd(), env, fakeRunAsk);
   const out = capture.stdout.join('');
   const restored = process.exitCode;
   process.exitCode = prev;
   return { exitCode: restored, stdout: out, stderr: capture.stderr.join('') };
 }
+
+test('scrubMessage strips fake DEEPSEEK_API_KEY from mechanism payload while preserving context', async () => {
+  const secret = 'sk-live-fake-key-1234567890';
+  const text = `DeepSeek API error: invalid credentials ${secret} for model deepseek-v4-flash`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  assert.equal(out.includes(secret), false, 'secret token must be removed');
+  assert.equal(out.includes('DEEPSEEK_API_KEY'), false);
+  assert.match(out, /\[redacted:own-key-[0-9a-f]{8}\]/);
+  assert.match(out, /invalid credentials/);
+  assert.match(out, /deepseek-v4-flash/);
+});
+
+test('scrubMessage returns placeholder when scrubbing fails', async () => {
+  const secret = 'sk-live-fake-key-1234567890';
+  const text = `DeepSeek API error: invalid credentials ${secret}`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' }, {
+    createHashImpl: () => { throw new Error('crypto unavailable'); },
+  });
+  assert.equal(out, '[scrubbed:unavailable]');
+  assert.equal(out.includes(secret), false, 'placeholder must replace raw message');
+});
+
+test('scrubMessage enforces a max mechanism-message length and marks truncation', async () => {
+  const out = await scrubMessage('A'.repeat(250));
+  assert.equal(out.length, MAX_MECHANISM_MSG_LENGTH);
+  assert.equal(out.endsWith('…[truncated]'), true);
+
+  const exactly = 'B'.repeat(MAX_MECHANISM_MSG_LENGTH);
+  const stable = await scrubMessage(exactly);
+  assert.equal(stable.length, MAX_MECHANISM_MSG_LENGTH);
+  assert.equal(stable.endsWith('…[truncated]'), false);
+});
+
+test('scrubMessage strips a secret that straddles the 200-char boundary', async () => {
+  const secret = 'sk-live-fake-boundary-key-123456';
+  const text = `${'A'.repeat(196)}${secret}:tail`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  assert.equal(out.includes(secret), false);
+  assert.equal(out.includes(secret.slice(0, 8)), false);
+});
 
 test('main(): APPROVED verdict -> exit 0 + verdict in json', async () => {
   const { exitCode, stdout } = await runFakeMain(

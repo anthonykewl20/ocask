@@ -381,7 +381,7 @@ export async function runAsk({
         provider: failProvider, model: askModel, attemptIndex: attemptIdx,
         outcome: 'failed', durationMs: Date.now() - t0, timeoutMs, reasonCode: code,
         outputBytes: 0, tokensUsed: null, errorClass: error?.constructor?.name,
-        classification,
+        classification, mechanismMessage: error?.message,
       });
       throw error;
     }
@@ -397,7 +397,12 @@ export async function runAsk({
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const primaryClass = classifyFailure(primaryError, { timeoutMs });
       const primaryProvider = unwrapOrigin(primaryError)?.provider || provider || defaultProvider(model) || 'unknown';
-      await logError({ model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown', errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass });
+      await logError({
+        model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown',
+        errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex,
+        durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass,
+        mechanismMessage: primaryError?.message,
+      });
       primaryError.ocaskMetadata = metadata; throw primaryError;
     }
     try {
@@ -407,7 +412,12 @@ export async function runAsk({
       metadata.actual_model = selectedFallback; metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
       const fbClass = classifyFailure(fbError, { timeoutMs });
       const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
-      await logError({ model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown', errorClass: fbError?.constructor?.name, attemptCount: attemptIndex, durationMs: metadata.duration_ms, timeoutMs, classification: fbClass });
+      await logError({
+        model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown',
+        errorClass: fbError?.constructor?.name, attemptCount: attemptIndex,
+        durationMs: metadata.duration_ms, timeoutMs, classification: fbClass,
+        mechanismMessage: fbError?.message,
+      });
       fbError.ocaskMetadata = metadata; throw fbError;
     }
   }
