@@ -142,7 +142,7 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
       return {
         stdout, stderr: '', provider: 'qwen',
         model_used: returnedRoute === apiModelId ? model : returnedRoute,
-        model_route: apiModelId, provider_model_used: returnedRoute,
+        model_route: apiModelId,
         tokensUsed: { input: 0, output: 0, total: 0 },
       };
     }
@@ -160,7 +160,6 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
 
   return {
     stdout, stderr, provider: 'qwen', model_used: modelUsed, model_route: apiModelId,
-    provider_model_used: returnedRoute,
     tokensUsed: { input: usage.input_tokens || usage.prompt_tokens || 0, output: usage.output_tokens || usage.completion_tokens || 0, total: usage.total_tokens || 0 },
   };
 }

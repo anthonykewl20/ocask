@@ -116,7 +116,6 @@ export function availableProviders() {
 const DEFAULT_FALLBACK_CHAIN = {
   deepseek: ['deepseek', 'qwen', 'opencode'],
   qwen: ['qwen', 'deepseek', 'opencode'],
-  opencode: ['opencode', 'deepseek', 'qwen'],
 };
 
 function uniqueProviders(values) {
@@ -140,7 +139,8 @@ export function identityTransportForModel(model, provider) {
 }
 
 export function isIdentityPreservingTransport(model, provider) {
-  return identityTransportForModel(model, provider)?.equivalence === 'declared';
+  return provider === modelFamily(model)
+    || identityTransportForModel(model, provider)?.equivalence === 'declared';
 }
 
 // Provider modules call this for table-backed models, eliminating route drift.
@@ -152,9 +152,12 @@ export function identityTransportRoute(model, provider) {
 }
 
 function identityTransportProviders(model) {
-  return identityTransportsForModel(model)
+  return uniqueProviders([
+    modelFamily(model),
+    ...identityTransportsForModel(model)
     .filter(entry => entry.equivalence === 'declared')
-    .map(entry => entry.provider);
+    .map(entry => entry.provider),
+  ].filter(Boolean));
 }
 
 export function resolveProviderChain({ model, preferredProvider = null, noFallback = false, chain = null }) {
@@ -175,7 +178,7 @@ export function resolveProviderChain({ model, preferredProvider = null, noFallba
 
   // FINAL, unconditional gates. No preferred provider or configured chain can
   // bypass serving compatibility; an identity pin additionally admits only the
-  // explicitly declared transports in the trust table.
+  // native family transport or explicitly declared additional transports.
   let filtered = uniqueProviders(providers);
   if (noFallback) filtered = filtered.filter(provider => isIdentityPreservingTransport(model, provider));
   filtered = filtered.filter(provider => providerSupportsModel(provider, model));
@@ -188,7 +191,7 @@ export function resolveProviderChain({ model, preferredProvider = null, noFallba
   }
   if (preferredProvider && noFallback && !isIdentityPreservingTransport(model, preferredProvider)) {
     throw Object.assign(
-      new ProviderError(`Provider ${preferredProvider} is not a declared identity transport for ${model}`, 'MODEL_NOT_FOUND'),
+      new ProviderError(`Provider ${preferredProvider} is not an identity-preserving transport for ${model}`, 'MODEL_NOT_FOUND'),
       { provider: preferredProvider },
     );
   }

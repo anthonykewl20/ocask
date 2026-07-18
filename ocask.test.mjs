@@ -30,6 +30,7 @@ import {
 } from './logging.mjs';
 import {
   ProviderError,
+  isIdentityPreservingTransport,
   identityTransportRoute,
   identityTransportTrustTable,
   invokeWithFallback,
@@ -282,6 +283,43 @@ test('resolveProviderChain enforces the identity-trust transport set', async () 
     resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true, chain: { deepseek: ['opencode'] } }),
     [],
     'an unlisted transport is not implicitly trusted under the identity pin',
+  );
+});
+
+test('identity pin always admits a model native provider without weakening family isolation', async () => {
+  const unlistedQwenModel = 'qwen3.7-max';
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true }),
+    ['deepseek'],
+    'an unlisted DeepSeek model retains its native transport',
+  );
+  assert.deepEqual(
+    resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'deepseek', noFallback: true }),
+    ['deepseek'],
+    'an explicitly pinned native transport is accepted',
+  );
+  assert.equal(isIdentityPreservingTransport(DEEPSEEK_MODEL, 'deepseek'), true);
+  assert.deepEqual(
+    resolveProviderChain({ model: unlistedQwenModel, noFallback: true }),
+    ['qwen'],
+    'an unlisted Qwen model retains its native transport',
+  );
+  assert.equal(isIdentityPreservingTransport(unlistedQwenModel, 'qwen'), true);
+  assert.ok(
+    !resolveProviderChain({
+      model: DEEPSEEK_MODEL,
+      noFallback: true,
+      chain: { deepseek: ['qwen', 'deepseek'] },
+    }).includes('qwen'),
+    'a DeepSeek model never crosses into the Qwen provider',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'qwen', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
+  );
+  assert.throws(
+    () => resolveProviderChain({ model: unlistedQwenModel, preferredProvider: 'deepseek', noFallback: true }),
+    error => error.code === 'MODEL_NOT_FOUND',
   );
 });
 

@@ -122,7 +122,6 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
 
   return {
     stdout, stderr, provider: 'deepseek', model_used: modelUsed, model_route: apiModelId,
-    provider_model_used: returnedRoute,
     tokensUsed: { input: usage.prompt_tokens || 0, output: usage.completion_tokens || 0, total: usage.total_tokens || 0 },
   };
 }
