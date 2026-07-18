@@ -14,7 +14,7 @@ import {
   defaultProvider, isIdentityPreservingTransport, resolveProviderChain,
 } from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
-  logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun,
+  logFallback, logVerdict, logPanelResult, logError, currentRunId, readLog, doctorReport, diagnoseRun,
   classifyFailure, unwrapOrigin, scrubMessage } from './logging.mjs';
 import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
 import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
@@ -24,9 +24,9 @@ const DEFAULT_TIMEOUT_MS = 170_000;
 const HARD_CEIL_MS = 300_000;
 
 // ── USAGE ──
-export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
+export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] [--fallback-model <id>]';
 
-const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify']);
+const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify', 'panel']);
 const VALUE_ARGS = new Set([
   'model', 'task', 'system', 'context', 'provider', 'lens',
   'metadata', 'temperature', 'max-tokens', 'timeout-ms', 'fallback-model',
@@ -72,6 +72,14 @@ export function remainingBudget(deadlineMs, nowMs = Date.now()) {
   return Math.max(0, deadlineMs - nowMs);
 }
 
+export function nextAttemptTimeoutMs(absoluteDeadlineMs, nowMs = Date.now()) {
+  const budgetMs = remainingBudget(absoluteDeadlineMs, nowMs);
+  if (budgetMs <= 0) {
+    throw Object.assign(new ProviderError('ocask budget exhausted before this attempt', 'TIMEOUT'), { code: 'TIMEOUT' });
+  }
+  return budgetMs;
+}
+
 // Deterministic one-way digest of the prompt text (#9). Two runs of the IDENTICAL
 // prompt yield the SAME hash so failures can be correlated by task — the old
 // randomBytes() value carried no information (identical prompts hashed differently).
@@ -114,9 +122,35 @@ export function guardAllowedModels({ model, fallbackModel }) {
 }
 
 export function defaultFallbackModel(model) {
-  if (modelFamily(model) === 'deepseek') return 'qwen3.7-plus';
-  if (modelFamily(model) === 'qwen') return 'deepseek-v4-flash';
+  if (modelFamily(model) === 'deepseek') return 'qwen3.7-max';
+  if (modelFamily(model) === 'qwen') return 'deepseek-v4-pro';
   return undefined;
+}
+
+export function resolvePanelMembers({ model, noFallback = false, preferredProvider = null, env = process.env }) {
+  void env; // Required panel seam; resolveProviderChain currently has no env input.
+  const counterpart = defaultFallbackModel(model);
+  const models = [model, counterpart].filter(Boolean);
+  const families = models.map(panelModel => modelFamily(panelModel));
+  if (models.length < 2 || families.some(family => !family) || new Set(families).size < 2) {
+    throw new Error('Panel requires at least 2 distinct model families');
+  }
+
+  return models.map((panelModel, index) => {
+    let providerChain = [];
+    try {
+      providerChain = resolveProviderChain({ model: panelModel, preferredProvider, noFallback });
+    } catch {
+      // Provider incompatibility is a member-level no-judgment, not a panel setup
+      // error. runPanel converts this empty chain into a NO_PROVIDER abstention.
+    }
+    return {
+      model: panelModel,
+      family: families[index],
+      transport: providerChain[0] || null,
+      provider_chain: providerChain,
+    };
+  });
 }
 
 // ── DELEGATED IDENTITY ──
@@ -348,22 +382,222 @@ function retryCorrection(error) { return `## RETRY CORRECTION\nThe prior attempt
 
 function isFallbackEligible(error) { return new Set(['MODEL_OUTPUT']).has(error?.code); }
 
+const PANEL_VERDICTS = new Set(['APPROVED', 'WARNING', 'BLOCKED']);
+function isPanelJudgment(member) {
+  return member?.classification?.class === 'judgment' && PANEL_VERDICTS.has(member?.verdict);
+}
+const PANEL_QUORUM_CLASSIFICATION = Object.freeze({
+  class: 'no-judgment', subclass: 'indeterminate', locus: null,
+  mechanism: 'PANEL_QUORUM_FAILURE', censored: false,
+  http_status: null, retry_after: null,
+});
+
+export function computeConsensus({ memberResults, k }) {
+  if (!Array.isArray(memberResults) || memberResults.length < 2) {
+    throw new Error('Consensus requires at least 2 panel members');
+  }
+  if (!Number.isSafeInteger(k) || k < 2 || k > memberResults.length) {
+    throw new Error('Consensus quorum k must be between 2 and the panel size');
+  }
+
+  // Fail closed: a classification must positively say "judgment" AND carry a
+  // canonical verdict. An inconsistent or malformed member can only abstain.
+  const judgments = memberResults.filter(isPanelJudgment);
+  const judgmentsCount = judgments.length;
+  const abstentionsCount = memberResults.length - judgmentsCount;
+  const degraded = judgmentsCount < k;
+  const memberVerdicts = memberResults.map(member => ({
+    model: member?.model ?? null,
+    transport: member?.transport ?? null,
+    verdict: isPanelJudgment(member) ? member.verdict : null,
+    mechanism: isPanelJudgment(member) ? null : (member?.classification?.mechanism ?? null),
+  }));
+
+  if (degraded) {
+    return {
+      consensus_verdict: null,
+      agreement: false,
+      judgments_count: judgmentsCount,
+      abstentions_count: abstentionsCount,
+      degraded: true,
+      member_verdicts: memberVerdicts,
+    };
+  }
+
+  const counts = new Map([...PANEL_VERDICTS].map(verdict => [verdict, 0]));
+  for (const member of judgments) counts.set(member.verdict, counts.get(member.verdict) + 1);
+  const majority = [...counts.entries()].find(([, count]) => count >= k)?.[0] || null;
+  const consensusVerdict = majority
+    || (counts.get('BLOCKED') > 0 ? 'BLOCKED' : 'WARNING');
+  const agreement = new Set(judgments.map(member => member.verdict)).size === 1;
+
+  return {
+    consensus_verdict: consensusVerdict,
+    agreement,
+    judgments_count: judgmentsCount,
+    abstentions_count: abstentionsCount,
+    degraded: false,
+    member_verdicts: memberVerdicts,
+  };
+}
+
+function formatPanelOutput(consensus, members, k) {
+  const lines = consensus.consensus_verdict
+    ? [`VERDICT: ${consensus.consensus_verdict}`, '', `Panel consensus (${consensus.judgments_count}/${members.length} judgments; quorum ${k}).`]
+    : ['PANEL NO-JUDGMENT', '', `Reason: quorum_failure (${consensus.judgments_count}/${k} required judgments).`];
+  lines.push('', 'Members:');
+  for (const member of members) {
+    const vote = isPanelJudgment(member)
+      ? member.verdict
+      : `ABSTENTION (${member.classification?.mechanism || 'indeterminate'})`;
+    lines.push(`- ${member.model} via ${member.transport || 'unavailable'}: ${vote}`);
+  }
+  return lines.join('\n');
+}
+
+export async function runPanel({
+  model, taskText, systemText = '', contextText = '', jsonMode = false,
+  requireVerdict = false, lens = 'general', temperature = 0, maxTokens,
+  timeoutMs = DEFAULT_TIMEOUT_MS, provider = null, noFallback = false,
+  cwd = process.cwd(), env = process.env, absoluteDeadlineMs,
+  run_id, invokeWithFallbackFn = invokeWithFallback,
+}) {
+  parseTemperature(String(temperature));
+  const deadlineMs = absoluteDeadlineMs ?? (Date.now() + resolveTimeout(timeoutMs));
+  const members = resolvePanelMembers({ model, noFallback, preferredProvider: provider, env });
+  const k = Math.floor(members.length / 2) + 1; // strict majority: N=2 requires both judgments
+  const prompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
+  if (run_id) startRun(run_id);
+
+  const contexts = members.map(() => ({ startedAt: 0, timeoutMs: 0, providerResult: null }));
+  const attempts = members.map(async (member, index) => {
+    const context = contexts[index];
+    context.startedAt = Date.now();
+    const budgetMs = nextAttemptTimeoutMs(deadlineMs, context.startedAt);
+    context.timeoutMs = budgetMs;
+    if (!member.transport || member.provider_chain.length === 0) {
+      throw Object.assign(new ProviderError(`No declared serving providers available for ${member.model}`, 'NO_PROVIDER'), { code: 'NO_PROVIDER' });
+    }
+    const providerResult = await invokeWithFallbackFn({
+      model: member.model,
+      prompt: DELEGATED_IDENTITY_PREFIX + prompt,
+      timeoutMs: budgetMs,
+      env,
+      cwd,
+      preferredProvider: provider,
+      noFallback,
+    });
+    context.providerResult = providerResult;
+    const raw = providerResult.commandOutput || parseOpenCodeJsonl(providerResult.stdout);
+    const output = validateAssistantOutput(raw, { jsonMode, requireVerdict });
+    const verdict = extractVerdict(output);
+    const classification = classifyFailure(null, { verdict });
+    return { output, verdict, classification, providerResult };
+  });
+
+  const settled = await Promise.allSettled(attempts);
+  const memberResults = [];
+  for (let index = 0; index < members.length; index++) {
+    const member = members[index];
+    const context = contexts[index];
+    const outcome = settled[index];
+    const durationMs = Math.max(0, Date.now() - context.startedAt);
+    if (outcome.status === 'fulfilled') {
+      const { output, verdict, classification, providerResult } = outcome.value;
+      const outputText = typeof output === 'string' ? output : JSON.stringify(output);
+      const transport = providerResult.provider || member.transport;
+      const result = {
+        model: member.model,
+        transport,
+        verdict: classification.class === 'judgment' ? verdict : null,
+        classification,
+        output_preview: outputText.slice(0, 200),
+      };
+      memberResults.push(result);
+      await logAttemptResult({
+        provider: transport || 'unknown', model: member.model, attemptIndex: index,
+        outcome: 'success', durationMs, timeoutMs: context.timeoutMs, reasonCode: 'ok',
+        outputBytes: Buffer.byteLength(outputText, 'utf8'), tokensUsed: providerResult.tokensUsed || null,
+        classification,
+      });
+      continue;
+    }
+
+    const error = outcome.reason;
+    const classification = classifyFailure(error, { timeoutMs: context.timeoutMs });
+    const transport = context.providerResult?.provider
+      || unwrapOrigin(error)?.provider || member.transport || null;
+    const result = {
+      model: member.model,
+      transport,
+      verdict: null,
+      classification,
+      output_preview: '',
+    };
+    memberResults.push(result);
+    await logAttemptResult({
+      provider: transport || 'unknown', model: member.model, attemptIndex: index,
+      outcome: 'failed', durationMs, timeoutMs: context.timeoutMs,
+      reasonCode: classification.mechanism || 'unknown', outputBytes: 0,
+      tokensUsed: null, errorClass: error?.constructor?.name,
+      classification, mechanismMessage: error?.message, scrubEnv: env,
+    });
+  }
+
+  const computed = computeConsensus({ memberResults, k });
+  const consensus = {
+    verdict: computed.consensus_verdict,
+    agreement: computed.agreement,
+    judgments_count: computed.judgments_count,
+    abstentions_count: computed.abstentions_count,
+    degraded: computed.degraded,
+    k,
+    n: members.length,
+  };
+  await logPanelResult({
+    runId: run_id,
+    verdict: computed.consensus_verdict,
+    k,
+    n: members.length,
+    judgmentsCount: computed.judgments_count,
+    abstentionsCount: computed.abstentions_count,
+    degraded: computed.degraded,
+    agreement: computed.agreement,
+    memberVerdicts: computed.member_verdicts,
+  });
+
+  const verdict = computed.consensus_verdict;
+  return {
+    ok: true,
+    failed: verdict === null,
+    output: formatPanelOutput(computed, memberResults, k),
+    verdict,
+    classification: verdict ? classifyFailure(null, { verdict }) : { ...PANEL_QUORUM_CLASSIFICATION },
+    consensus,
+    members: memberResults,
+    run_id,
+    cross_verify: null,
+  };
+}
+
 // ── CORE INVOCATION ──
 export async function runAsk({
   model, taskText, systemText = '', contextText = '',
   jsonMode = false, requireVerdict = false, noFallback = false,
-  crossVerify = false,
+  crossVerify = false, panel = false,
   lens = 'general', temperature = 0, maxTokens, timeoutMs = DEFAULT_TIMEOUT_MS,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
   invokeWithFallbackFn = invokeWithFallback,
 }) {
+  if (panel && crossVerify) throw new Error('--panel and --cross-verify are mutually exclusive');
+  if (panel && fallbackModel) throw new Error('--panel cannot be combined with --fallback-model');
   const runId = makeRunId();
   startRun(runId);
   parseTemperature(String(temperature));
   guardAllowedModels({ model, fallbackModel });
   timeoutMs = resolveTimeout(timeoutMs);
 
-  const selectedFallback = noFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null));
+  const selectedFallback = panel ? null : (noFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null)));
   if (selectedFallback) guardAllowedModels({ model, fallbackModel: selectedFallback });
 
   const originalPrompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
@@ -381,17 +615,34 @@ export async function runAsk({
     inputBytes: metadata.input_bytes, timeoutMs,
   });
 
+  if (panel) {
+    const panelResult = await runPanel({
+      model, taskText, systemText, contextText, jsonMode, requireVerdict,
+      lens, temperature, maxTokens, timeoutMs, provider, noFallback, cwd, env,
+      absoluteDeadlineMs, run_id: runId, invokeWithFallbackFn,
+    });
+    metadata.duration_ms = Date.now() - runStarted;
+    metadata.exit_code = exitCodeForOutcome({ verdict: panelResult.verdict, failed: panelResult.failed });
+    metadata.output_bytes = Buffer.byteLength(panelResult.output, 'utf8');
+    metadata.attempts = panelResult.members.map(member => ({
+      model: member.model,
+      provider: member.transport,
+      outcome: isPanelJudgment(member) ? 'success' : 'failed',
+      class: member.classification.class,
+      subclass: member.classification.subclass,
+      locus: member.classification.locus,
+      mechanism: member.classification.mechanism,
+    }));
+    metadata.panel = panelResult.consensus;
+    return { ...panelResult, metadata };
+  }
+
   let attemptIndex = 0;
-  const remainingAttemptBudget = () => remainingBudget(absoluteDeadlineMs, Date.now());
-  const nextAttemptTimeoutMs = () => {
-    const budgetMs = remainingAttemptBudget();
-    if (budgetMs <= 0) throw Object.assign(new ProviderError('ocask budget exhausted before this attempt', 'TIMEOUT'), { code: 'TIMEOUT' });
-    return budgetMs;
-  };
+  const nextAttemptTimeout = () => nextAttemptTimeoutMs(absoluteDeadlineMs, Date.now());
   const timeAttempt = async (askModel, prompt, isFallback = false) => {
     const attemptIdx = attemptIndex++;
     const t0 = Date.now();
-    const attemptTimeoutMs = nextAttemptTimeoutMs();
+    const attemptTimeoutMs = nextAttemptTimeout();
     let providerResult = null;
     try {
       if (isFallback) {
@@ -517,7 +768,7 @@ export async function runAsk({
     });
 
     try {
-      const buddyTimeoutMs = nextAttemptTimeoutMs();
+      const buddyTimeoutMs = nextAttemptTimeout();
       const buddyResult = await invokeWithFallback({
         model: buddyModel, prompt: DELEGATED_IDENTITY_PREFIX + buddyPrompt,
         timeoutMs: buddyTimeoutMs, env, cwd, noFallback: true,
@@ -620,7 +871,9 @@ export function exitCodeForOutcome({ verdict, failed = false }) {
 // contradictory pair outcome:"no-judgment" with exit 0.
 export function describeOutcome({ verdict, output = null, classification = null, failed = false }) {
   const v = (verdict === 'APPROVED' || verdict === 'WARNING' || verdict === 'BLOCKED') ? verdict : null;
-  const reason = failed ? (classification?.subclass ?? null) : null;
+  const reason = failed
+    ? (classification?.mechanism === 'PANEL_QUORUM_FAILURE' ? 'quorum_failure' : (classification?.subclass ?? null))
+    : null;
   const locus = failed ? (classification?.locus ?? null) : null;
   const mechanism = failed ? (classification?.mechanism ?? null) : null;
   return {
@@ -640,7 +893,7 @@ export function describeOutcome({ verdict, output = null, classification = null,
 // under "output" so nothing is lost. exit_code always equals the process exit
 // code (redundant agreeing signal).
 export function buildJsonResponse(descriptor) {
-  return {
+  const response = {
     outcome: descriptor.outcome,
     verdict: descriptor.verdict,
     reason: descriptor.reason,
@@ -649,6 +902,9 @@ export function buildJsonResponse(descriptor) {
     exit_code: descriptor.exit_code,
     output: descriptor.output ?? null,
   };
+  if (descriptor.consensus) response.consensus = descriptor.consensus;
+  if (descriptor.members) response.members = descriptor.members;
+  return response;
 }
 
 // ── MAIN ENTRY POINT ──
@@ -674,6 +930,9 @@ export async function runMain(
     const requestedTimeoutMs = parseTimeoutArg(args['timeout-ms'], '--timeout-ms');
     const timeoutMs = resolveTimeout(requestedTimeoutMs);
     const noFallback = args['no-fallback'] === true;
+    const panel = args.panel === true;
+    if (panel && args['cross-verify'] === true) throw new Error('--panel and --cross-verify are mutually exclusive');
+    if (panel && args['fallback-model']) throw new Error('--panel cannot be combined with --fallback-model');
     if (noFallback && args['fallback-model']) throw new Error('--no-fallback cannot be combined with --fallback-model');
 
     guardAllowedModels({ model: args.model, fallbackModel: args['fallback-model'] });
@@ -684,7 +943,7 @@ export async function runMain(
 
     const provider = args.provider || null;
     if (provider && !availableProviders().includes(provider)) throw new Error(`--provider must be one of: ${availableProviders().join(', ')}`);
-    if (provider) resolveProviderChain({ model: args.model, preferredProvider: provider, noFallback });
+    if (provider && !panel) resolveProviderChain({ model: args.model, preferredProvider: provider, noFallback });
 
     const [taskText, systemText, contextText] = await Promise.all([
       readExistingPathOrLiteral(args.task, stdin),
@@ -696,7 +955,7 @@ export async function runMain(
     const result = await runAskFn({
       model: args.model, taskText, systemText, contextText,
       jsonMode: args.json === true, requireVerdict: args['require-verdict'] === true,
-      noFallback, crossVerify: args['cross-verify'] === true,
+      noFallback, crossVerify: args['cross-verify'] === true, panel,
       lens, provider, temperature, maxTokens, timeoutMs,
       fallbackModel: args['fallback-model'], cwd, env,
     });
@@ -711,9 +970,16 @@ export async function runMain(
       verdict: result.verdict || null,
       output: humanOutput,
       classification: result.classification || null,
-      failed: false,
+      failed: result.failed === true,
     });
+    if (result.consensus) {
+      descriptor.consensus = result.consensus;
+      descriptor.members = result.members || [];
+    }
     process.exitCode = descriptor.exit_code;
+    if (descriptor.outcome === 'no-judgment' && result.consensus) {
+      writeStderr('ocask error: panel quorum failure');
+    }
     if (args.json) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
     else writeStdout(humanOutput);
   } catch (error) {
