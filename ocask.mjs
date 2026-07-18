@@ -23,14 +23,20 @@ const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 const DEFAULT_TIMEOUT_MS = 170_000;
 const HARD_CEIL_MS = 300_000;
 const REVIEW_HARD_CEIL_MS = 900_000;
+const RISK_BOUNDARY_LINES = 400;
+const RISK_BOUNDARY_FILES = 5;
+const TRIVIAL_LINES = 15;
+const TRIVIAL_FILES = 1;
+const RISK_PATH_RE = /(^|\/)(auth|login|secret|crypto|token|password|payment|billing|money|migrat)/i;
+const ALLOWED_RISK = new Set(['auto', 'trivial', 'default', 'high']);
 
 // ── USAGE ──
-export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] (review ops --require-verdict may use up to 900_000ms; plain delegation hard-capped at 300_000ms) [--fallback-model <id>]';
+export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--risk auto|trivial|default|high] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] (review ops --require-verdict may use up to 900_000ms; plain delegation hard-capped at 300_000ms) [--fallback-model <id>]';
 
 const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify', 'panel']);
 const VALUE_ARGS = new Set([
   'model', 'task', 'system', 'context', 'provider', 'lens',
-  'metadata', 'temperature', 'max-tokens', 'timeout-ms', 'fallback-model',
+  'metadata', 'temperature', 'max-tokens', 'timeout-ms', 'fallback-model', 'risk',
 ]);
 
 // ── HELPERS ──
@@ -106,6 +112,62 @@ export function parseArgs(argv) {
   return result;
 }
 
+export function classifyDiffInput(text) {
+  if (!String(text || '').trim()) return 'empty';
+  const lines = String(text).split(/\r?\n/);
+  const hasGitHeaders = lines.some(line => line.startsWith('diff --git '));
+  const hasUnifiedHeaders = lines.some(line => line.startsWith('--- '))
+    && lines.some(line => line.startsWith('+++ '));
+  return hasGitHeaders || hasUnifiedHeaders ? 'diff' : 'prose';
+}
+
+function parseChangedLinesAndFiles(diffText) {
+  const touchedFiles = [];
+  const seen = new Set();
+  let changedLines = 0;
+
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    const gitHeader = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (gitHeader?.[2] && !seen.has(gitHeader[2])) {
+      seen.add(gitHeader[2]);
+      touchedFiles.push(gitHeader[2]);
+      continue;
+    }
+
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) {
+      if (line.startsWith('+++ ')) {
+        let value = line.slice(4).trim();
+        if (value.startsWith('a/') || value.startsWith('b/')) value = value.slice(2);
+        if (value && value !== '/dev/null' && !seen.has(value)) {
+          seen.add(value);
+          touchedFiles.push(value);
+        }
+      }
+      continue;
+    }
+
+    if (line.startsWith('+') || line.startsWith('-')) changedLines++;
+  }
+
+  return { touchedFiles, changedLines };
+}
+
+export function detectRisk(diffText) {
+  const { touchedFiles, changedLines } = parseChangedLinesAndFiles(diffText);
+  if (touchedFiles.some(file => RISK_PATH_RE.test(file))) return 'high';
+  if (changedLines > RISK_BOUNDARY_LINES || touchedFiles.length > RISK_BOUNDARY_FILES) return 'high';
+  if (touchedFiles.length === TRIVIAL_FILES && changedLines <= TRIVIAL_LINES) return 'trivial';
+  return 'default';
+}
+
+export function resolveRisk({ risk = 'auto', contextText = '' } = {}) {
+  if (!ALLOWED_RISK.has(risk)) {
+    throw new Error(`Unsupported risk: ${risk}. Supported: ${[...ALLOWED_RISK].join(', ')}`);
+  }
+  if (risk !== 'auto') return risk;
+  return classifyDiffInput(contextText) === 'diff' ? detectRisk(contextText) : 'default';
+}
+
 // ── MODEL GUARD ──
 function formatAllowedModelError(label, model) {
   const models = PAID_MODELS.filter(c => modelFamily(c));
@@ -128,9 +190,18 @@ export function defaultFallbackModel(model) {
   return undefined;
 }
 
+const PANEL_COUNTERPART_BY_FAMILY = Object.freeze({
+  deepseek: 'qwen3.7-plus',
+  qwen: 'deepseek-v4-pro',
+});
+
+function panelCounterpartModel(model) {
+  return PANEL_COUNTERPART_BY_FAMILY[modelFamily(model)];
+}
+
 export function resolvePanelMembers({ model, noFallback = false, preferredProvider = null, env = process.env }) {
   void env; // Required panel seam; resolveProviderChain currently has no env input.
-  const counterpart = defaultFallbackModel(model);
+  const counterpart = panelCounterpartModel(model);
   const models = [model, counterpart].filter(Boolean);
   const families = models.map(panelModel => modelFamily(panelModel));
   if (models.length < 2 || families.some(family => !family) || new Set(families).size < 2) {
@@ -138,12 +209,20 @@ export function resolvePanelMembers({ model, noFallback = false, preferredProvid
   }
 
   return models.map((panelModel, index) => {
-    let providerChain = [];
+    let providerChain;
     try {
       providerChain = resolveProviderChain({ model: panelModel, preferredProvider, noFallback });
-    } catch {
-      // Provider incompatibility is a member-level no-judgment, not a panel setup
-      // error. runPanel converts this empty chain into a NO_PROVIDER abstention.
+    } catch (error) {
+      throw Object.assign(
+        new Error(`Panel member ${panelModel} has no available serving transport: ${error.message}`),
+        { code: 'NO_PROVIDER', cause: error },
+      );
+    }
+    if (providerChain.length === 0) {
+      throw Object.assign(
+        new Error(`Panel member ${panelModel} has no available serving transport`),
+        { code: 'NO_PROVIDER' },
+      );
     }
     return {
       model: panelModel,
@@ -152,6 +231,27 @@ export function resolvePanelMembers({ model, noFallback = false, preferredProvid
       provider_chain: providerChain,
     };
   });
+}
+
+export function selectPanel(risk, {
+  model, noFallback = false, preferredProvider = null, env = process.env,
+} = {}) {
+  if (!ALLOWED_RISK.has(risk) || risk === 'auto') {
+    throw new Error(`Unsupported risk: ${risk}`);
+  }
+  if (risk === 'trivial') {
+    return { mode: 'solo', members: [model], k: null, noFallback, strict: false };
+  }
+
+  const effectiveNoFallback = risk === 'high' ? true : noFallback;
+  const members = resolvePanelMembers({ model, noFallback: effectiveNoFallback, preferredProvider, env });
+  return {
+    mode: 'panel',
+    members,
+    k: Math.floor(members.length / 2) + 1,
+    noFallback: effectiveNoFallback,
+    strict: risk === 'high',
+  };
 }
 
 // ── DELEGATED IDENTITY ──
@@ -461,6 +561,7 @@ export async function runPanel({
   requireVerdict = false, lens = 'general', temperature = 0, maxTokens,
   timeoutMs = DEFAULT_TIMEOUT_MS, provider = null, noFallback = false,
   cwd = process.cwd(), env = process.env, absoluteDeadlineMs,
+  members: overrideMembers = null, k: overrideK = null,
   run_id, invokeWithFallbackFn = invokeWithFallback,
 }) {
   parseTemperature(String(temperature));
@@ -469,8 +570,8 @@ export async function runPanel({
       hardCeilMs: requireVerdict ? REVIEW_HARD_CEIL_MS : HARD_CEIL_MS,
     })
   );
-  const members = resolvePanelMembers({ model, noFallback, preferredProvider: provider, env });
-  const k = Math.floor(members.length / 2) + 1; // strict majority: N=2 requires both judgments
+  const members = overrideMembers ?? resolvePanelMembers({ model, noFallback, preferredProvider: provider, env });
+  const k = overrideK ?? Math.floor(members.length / 2) + 1; // strict majority: N=2 requires both judgments
   const prompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
   if (run_id) startRun(run_id);
 
@@ -589,7 +690,7 @@ export async function runPanel({
 export async function runAsk({
   model, taskText, systemText = '', contextText = '',
   jsonMode = false, requireVerdict = false, noFallback = false,
-  crossVerify = false, panel = false,
+  crossVerify = false, panel = false, risk = 'auto',
   lens = 'general', temperature = 0, maxTokens, timeoutMs = DEFAULT_TIMEOUT_MS,
   fallbackModel, provider = null, cwd = process.cwd(), env = process.env,
   invokeWithFallbackFn = invokeWithFallback,
@@ -604,7 +705,14 @@ export async function runAsk({
     hardCeilMs: requireVerdict ? REVIEW_HARD_CEIL_MS : HARD_CEIL_MS,
   });
 
-  const selectedFallback = panel ? null : (noFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null)));
+  const panelSelection = panel
+    ? selectPanel(resolveRisk({ risk, contextText }), {
+      model, noFallback, preferredProvider: provider, env,
+    })
+    : null;
+  const usePanel = panelSelection?.mode === 'panel';
+  const effectiveNoFallback = panelSelection?.noFallback ?? noFallback;
+  const selectedFallback = usePanel ? null : (effectiveNoFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null)));
   if (selectedFallback) guardAllowedModels({ model, fallbackModel: selectedFallback });
 
   const originalPrompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
@@ -613,7 +721,7 @@ export async function runAsk({
   const absoluteDeadlineMs = runStarted + timeoutMs;
   const metadata = {
     requested_model: model, actual_model: null, actual_transport: null,
-    identity_preserved: false, no_fallback: Boolean(noFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'),
+    identity_preserved: false, no_fallback: Boolean(effectiveNoFallback), input_bytes: Buffer.byteLength(originalPrompt, 'utf8'),
     output_bytes: null, attempts: [], exit_code: null, fallback_used: false,
   };
 
@@ -622,10 +730,11 @@ export async function runAsk({
     inputBytes: metadata.input_bytes, timeoutMs,
   });
 
-  if (panel) {
+  if (usePanel) {
     const panelResult = await runPanel({
       model, taskText, systemText, contextText, jsonMode, requireVerdict,
-      lens, temperature, maxTokens, timeoutMs, provider, noFallback, cwd, env,
+      lens, temperature, maxTokens, timeoutMs, provider, noFallback: effectiveNoFallback, cwd, env,
+      members: panelSelection.members, k: panelSelection.k,
       absoluteDeadlineMs, run_id: runId, invokeWithFallbackFn,
     });
     metadata.duration_ms = Date.now() - runStarted;
@@ -657,7 +766,7 @@ export async function runAsk({
       }
       providerResult = await invokeWithFallbackFn({
         model: askModel, prompt: DELEGATED_IDENTITY_PREFIX + prompt,
-        timeoutMs: attemptTimeoutMs, env, cwd, preferredProvider: provider, noFallback,
+        timeoutMs: attemptTimeoutMs, env, cwd, preferredProvider: provider, noFallback: effectiveNoFallback,
       });
       const result = providerResult;
       const raw = result.commandOutput || parseOpenCodeJsonl(result.stdout);
@@ -941,6 +1050,9 @@ export async function runMain(
     });
     const noFallback = args['no-fallback'] === true;
     const panel = args.panel === true;
+    const risk = args.risk || 'auto';
+    if (!ALLOWED_RISK.has(risk)) throw new Error(`--risk must be one of: ${[...ALLOWED_RISK].join(', ')}`);
+    if (args.risk !== undefined && !panel) throw new Error('--risk requires --panel');
     if (panel && args['cross-verify'] === true) throw new Error('--panel and --cross-verify are mutually exclusive');
     if (panel && args['fallback-model']) throw new Error('--panel cannot be combined with --fallback-model');
     if (noFallback && args['fallback-model']) throw new Error('--no-fallback cannot be combined with --fallback-model');
@@ -966,6 +1078,7 @@ export async function runMain(
       model: args.model, taskText, systemText, contextText,
       jsonMode: args.json === true, requireVerdict,
       noFallback, crossVerify: args['cross-verify'] === true, panel,
+      risk,
       lens, provider, temperature, maxTokens, timeoutMs,
       fallbackModel: args['fallback-model'], cwd, env,
     });
