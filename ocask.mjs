@@ -374,7 +374,9 @@ LENS_FRAMEWORKS['high-risk-full'] = HIGH_RISK_LENSES
   .map(lens => LENS_FRAMEWORKS[lens])
   .join('\n');
 
-const VALID_LENSES = ['general'].concat(Object.keys(LENS_FRAMEWORKS));
+// 'high-risk-full' is an INTERNAL composite applied to panel members under --risk high; it is not a
+// user-selectable --lens (that would bypass the risk-level intent). Keep it out of VALID_LENSES.
+const VALID_LENSES = ['general'].concat(Object.keys(LENS_FRAMEWORKS).filter(k => k !== 'high-risk-full'));
 
 // ── JSONL PARSING ──
 export function parseOpenCodeJsonl(stdout) {
@@ -721,7 +723,10 @@ export async function runAsk({
   const selectedFallback = usePanel ? null : (effectiveNoFallback ? null : (fallbackModel || (requireVerdict ? defaultFallbackModel(model) : null)));
   if (selectedFallback) guardAllowedModels({ model, fallbackModel: selectedFallback });
 
-  const originalPrompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens });
+  // Under a high-risk panel, members review with the internal multi-lens set; reflect that in the
+  // run-level prompt/metadata (input_bytes, promptHash) so provenance matches what is actually sent.
+  const effectiveLens = usePanel && panelSelection?.strict ? 'high-risk-full' : lens;
+  const originalPrompt = buildPrompt({ taskText, systemText, contextText, jsonMode, requireVerdict, maxTokens, lens: effectiveLens });
   const options = { jsonMode, requireVerdict };
   const runStarted = Date.now();
   const absoluteDeadlineMs = runStarted + timeoutMs;
@@ -732,7 +737,7 @@ export async function runAsk({
   };
 
   await logRunStart({
-    model, lens, provider, promptHash: promptHash(originalPrompt),
+    model, lens: effectiveLens, provider, promptHash: promptHash(originalPrompt),
     inputBytes: metadata.input_bytes, timeoutMs,
   });
 
