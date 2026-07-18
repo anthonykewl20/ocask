@@ -17,8 +17,10 @@ import {
   parseArgs,
   parseOpenCodeJsonl,
   readExistingPathOrLiteral,
+  remainingBudget,
   runAsk,
   runMain,
+  resolveTimeout,
   validateAssistantOutput,
 } from './ocask.mjs';
 import {
@@ -173,6 +175,69 @@ test('runMain rejects missing model or task', async () => {
   assert.ok(stderr.join('').includes('Usage'));
   assert.equal(process.exitCode, 30, 'usage throw is no-judgment band 30, not 1');
   process.exitCode = prev;
+});
+
+test('resolveTimeout defaults to measured timeout when caller omits value', () => {
+  assert.equal(resolveTimeout(), 170000);
+});
+
+test('resolveTimeout maps 0 to default timeout and never interprets it as unbounded', () => {
+  assert.equal(resolveTimeout(0), 170000);
+});
+
+test('resolveTimeout caps caller timeout at the hard ceiling', () => {
+  assert.equal(resolveTimeout(500000), 300000);
+});
+
+test('runMain maps absent --timeout-ms to default', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 170000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain caps explicit --timeout-ms above the hard ceiling', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '500000', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 300000);
+  assert.equal(exitCode, 0);
+});
+
+test('runMain treats explicit --timeout-ms 0 as default, not unbounded', async () => {
+  let askedTimeoutMs;
+  const { exitCode } = await runFakeMain(
+    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '0', '--json'],
+    async ({ timeoutMs }) => {
+      askedTimeoutMs = timeoutMs;
+      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+    },
+  );
+  assert.equal(askedTimeoutMs, 170000);
+  assert.equal(exitCode, 0);
+});
+
+test('shared deadline math: fallback receives only remaining wall-clock', () => {
+  const start = 1000;
+  const effectiveTimeoutMs = resolveTimeout();
+  const absoluteDeadlineMs = start + effectiveTimeoutMs;
+  const primaryConsumedMs = 50000;
+  const primaryRemainingMs = remainingBudget(absoluteDeadlineMs, start + primaryConsumedMs);
+  const fallbackRemainingMs = remainingBudget(absoluteDeadlineMs, start + primaryConsumedMs + 1000);
+  assert.equal(primaryRemainingMs, 120000);
+  assert.equal(fallbackRemainingMs, 119000);
+  assert.ok(fallbackRemainingMs <= effectiveTimeoutMs - primaryConsumedMs);
 });
 
 // ── Provider factory (unit) ──
