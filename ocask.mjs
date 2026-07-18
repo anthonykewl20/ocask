@@ -310,6 +310,8 @@ const EXECUTION_GUIDANCE = {
   default: ['Answer directly. Inspect only the evidence needed, and avoid unrelated discovery or delegation; use available tools when they materially help.'].join('\n'),
 };
 
+const HIGH_RISK_LENSES = ['security', 'code-review', 'architecture'];
+
 const LENS_FRAMEWORKS = {
   'code-review': `
 - **Correctness**: Does the logic hold for all inputs including edge cases and error paths?
@@ -367,6 +369,10 @@ Audit modules for *depth* — the amount of behavior behind a small interface. U
 - **Internal seams**: A deep module can be internally composed of small, mockable parts — they just aren't part of the public interface. Are internal seams testable without leaking into the public contract?
 - **Adapter discipline**: One adapter = hypothetical seam. Two adapters = real one. Don't introduce seams without actual variation.`,
 };
+
+LENS_FRAMEWORKS['high-risk-full'] = HIGH_RISK_LENSES
+  .map(lens => LENS_FRAMEWORKS[lens])
+  .join('\n');
 
 const VALID_LENSES = ['general'].concat(Object.keys(LENS_FRAMEWORKS));
 
@@ -733,7 +739,8 @@ export async function runAsk({
   if (usePanel) {
     const panelResult = await runPanel({
       model, taskText, systemText, contextText, jsonMode, requireVerdict,
-      lens, temperature, maxTokens, timeoutMs, provider, noFallback: effectiveNoFallback, cwd, env,
+      lens: panelSelection.strict ? 'high-risk-full' : lens,
+      temperature, maxTokens, timeoutMs, provider, noFallback: effectiveNoFallback, cwd, env,
       members: panelSelection.members, k: panelSelection.k,
       absoluteDeadlineMs, run_id: runId, invokeWithFallbackFn,
     });
