@@ -1097,3 +1097,21 @@ test('issue10: summarizeChecks — warn (no fail) is degraded, all pass is healt
     { category: 'c', name: 'y', ok: false, status: 'warn' },
   ]).status, 'degraded');
 });
+
+test('issue9: stderr cause line is scrubbed of own secrets (Domain 3, ocask.mjs runMain catch)', async () => {
+  // Regression for the redactor audit: the human "ocask error: <cause>" line written to stderr must
+  // not echo our own key value if a provider error message contains it (e.g. a 401 body). runMain now
+  // routes `cause` through scrubMessage(cause) which reads process.env — so set a synthetic key.
+  const FAKE = 'sk-fake-domain3-secret-0987654321';
+  const prev = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = FAKE;
+  try {
+    const cause = `DeepSeek API error: Invalid API key: ${FAKE} (401)`;
+    const stderrLine = `ocask error: ${await scrubMessage(cause)}`;
+    assert.equal(stderrLine.includes(FAKE), false, 'stderr must not contain the raw key value');
+    assert.match(stderrLine, /redacted:own-key-/, 'the secret must be replaced by the redaction marker');
+    assert.match(stderrLine, /Invalid API key/, 'non-secret context is preserved');
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prev;
+  }
+});

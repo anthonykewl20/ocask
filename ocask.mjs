@@ -12,7 +12,7 @@ import { isPaidModelAllowed, PAID_MODELS } from './ocverify.mjs';
 import { invokeWithFallback, ProviderError, modelFamily, availableProviders, defaultProvider } from './providers/factory.mjs';
 import { logEvent, makeRunId, startRun, logRunStart, logAttemptStart, logAttemptResult,
   logFallback, logVerdict, logError, currentRunId, readLog, doctorReport, diagnoseRun,
-  classifyFailure, unwrapOrigin } from './logging.mjs';
+  classifyFailure, unwrapOrigin, scrubMessage } from './logging.mjs';
 import { getPricing, calculateCost, formatCost, formatPricingTable, cumulativeCost, formatCumulativeCost } from './pricing.mjs';
 import { notifyUpgrade, CURRENT_VERSION } from './version.mjs';
 
@@ -659,7 +659,9 @@ export async function runMain(
     const classification = classifyFailure(error);
     const descriptor = describeOutcome({ verdict: null, output: null, classification, failed: true });
     process.exitCode = descriptor.exit_code;
-    writeStderr(`ocask error: ${cause}`); // human line retained for non-json callers
+    // Domain 3 (stderr) must carry no raw provider message: a 401 body etc. can echo our own
+    // key. Scrub the human cause line the same way the local log record is scrubbed (#9).
+    writeStderr(`ocask error: ${await scrubMessage(cause)}`); // human line retained for non-json callers
     if (argv.includes('--json')) writeStdout(JSON.stringify(buildJsonResponse(descriptor)));
     if (args?.metadata && error?.ocaskMetadata) {
       await writeAtomicPrivate(args.metadata, JSON.stringify(error.ocaskMetadata) + '\n').catch(() => {});
