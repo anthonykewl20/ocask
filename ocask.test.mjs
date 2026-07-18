@@ -1616,7 +1616,7 @@ test('issue10: billing cause requires ENTITLEMENT/402 evidence for that provider
     ...provider,
     failure_buckets: [{
       provider: 'deepseek', model: DEEPSEEK_MODEL, mechanism: 'ENTITLEMENT_UNAVAILABLE', class: 'no-judgment',
-      subclass: 'reply-absent', locus: 'our-side', http_status: 402,
+      subclass: 'reply-absent', locus: 'their-side', http_status: 402,
       count: 1, maxDurationMs: 0, avgDurationMs: 0, durationSamples: [], durationCensored: 0, evidenceCount: 1,
     }],
   };
@@ -1946,6 +1946,8 @@ test('issue10: locusFromStatus mapping', () => {
   assert.equal(locusFromStatus(401), 'our-side');
   assert.equal(locusFromStatus(403), 'our-side');
   assert.equal(locusFromStatus(429), 'our-side');
+  assert.equal(locusFromStatus(402), 'their-side'); // #21: billing/entitlement is provider-side
+  assert.equal(locusFromStatus(404), 'our-side');   // other 4xx stay our-side (client)
   assert.equal(locusFromStatus(503), 'their-side');
   assert.equal(locusFromStatus(504), 'their-side');
   assert.equal(locusFromStatus(200), null);

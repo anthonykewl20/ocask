@@ -97,6 +97,11 @@ async function checkProviderAuth(provider) {
 export function locusFromStatus(httpStatus) {
   if (!Number.isInteger(httpStatus)) return null;
   if (httpStatus >= 200 && httpStatus < 300) return null;
+  // 402 Payment Required is a billing/entitlement signal — the provider's account/entitlement
+  // system, i.e. their-side. This keeps status-derived locus consistent with classifyFailure,
+  // which classes ENTITLEMENT_UNAVAILABLE / INSUFFICIENT_BALANCE as their-side (#21). It stays
+  // distinct from the 4xx→our-side default (401/403/429 auth/rate are our config/usage side).
+  if (httpStatus === 402) return 'their-side';
   if (httpStatus >= 400 && httpStatus <= 499) return 'our-side';
   if (httpStatus >= 500 && httpStatus <= 599) return 'their-side';
   return null;
