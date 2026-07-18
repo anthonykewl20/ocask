@@ -1724,6 +1724,48 @@ test('scrubMessage strips fake DEEPSEEK_API_KEY from mechanism payload while pre
   assert.match(out, /deepseek-v4-flash/);
 });
 
+test('issue22: scrubMessage strips standard base64 derived from a known synthetic secret', async () => {
+  const secret = 'synthetic-ÿÿ-secretx';
+  const encoded = Buffer.from(secret).toString('base64');
+  const out = await scrubMessage(`upstream echoed ${encoded}`, { DEEPSEEK_API_KEY: secret });
+  assert.equal(out.includes(encoded), false, 'known-secret base64 must be removed');
+  assert.match(out, /\[redacted:own-key-[0-9a-f]{8}\]/);
+});
+
+test('issue22: scrubMessage strips padded and unpadded base64url derived from a known synthetic secret', async () => {
+  const secret = 'synthetic-ÿÿ-secretx';
+  const standard = Buffer.from(secret).toString('base64');
+  const padded = standard.replace(/\+/g, '-').replace(/\//g, '_');
+  const unpadded = Buffer.from(secret).toString('base64url');
+  const out = await scrubMessage(`padded=${padded} unpadded=${unpadded}`, { DEEPSEEK_API_KEY: secret });
+  assert.equal(out.includes(padded), false, 'known-secret padded base64url must be removed');
+  assert.equal(out.includes(unpadded), false, 'known-secret unpadded base64url must be removed');
+});
+
+test('issue22: scrubMessage strips encodeURIComponent output and still strips the raw secret', async () => {
+  const secret = 'synthetic secret/value?x=1';
+  const encoded = encodeURIComponent(secret);
+  const out = await scrubMessage(`encoded=${encoded} raw=${secret}`, { DEEPSEEK_API_KEY: secret });
+  assert.equal(out.includes(encoded), false, 'known-secret percent encoding must be removed');
+  assert.equal(out.includes(secret), false, 'known-secret raw value must remain covered');
+});
+
+test('issue22: scrubMessage leaves unrelated novel encodings alone', async () => {
+  const secret = 'synthetic-known-secret-123';
+  const unrelatedEncoding = Buffer.from(secret).toString('hex');
+  const text = `novel=${unrelatedEncoding}`;
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret });
+  assert.equal(out, text, 'only explicitly derived supported encodings are scrubbed');
+});
+
+test('issue22: an encoding failure preserves scrubMessage default-deny behavior', async () => {
+  const invalidForEncodeURIComponent = '\ud800'.repeat(8);
+  const out = await scrubMessage('synthetic provider failure', {
+    DEEPSEEK_API_KEY: invalidForEncodeURIComponent,
+  });
+  assert.equal(out, '[scrubbed:unavailable]');
+});
+
 test('scrubMessage returns placeholder when scrubbing fails', async () => {
   const secret = 'sk-live-fake-key-1234567890';
   const text = `DeepSeek API error: invalid credentials ${secret}`;

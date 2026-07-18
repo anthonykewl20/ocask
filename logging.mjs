@@ -53,6 +53,29 @@ function _sha256Trunc8(value, createHashImpl) {
   return createHashImpl('sha256').update(value).digest('hex').slice(0, 8);
 }
 
+function _secretMatches(secrets, createHashImpl) {
+  const matches = new Map();
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) continue;
+    const marker = `[redacted:own-key-${_sha256Trunc8(secret, createHashImpl)}]`;
+    const standardBase64 = Buffer.from(secret).toString('base64');
+    const variants = new Set([
+      secret,
+      standardBase64,
+      standardBase64.replace(/\+/g, '-').replace(/\//g, '_'),
+      Buffer.from(secret).toString('base64url'),
+      encodeURIComponent(secret),
+    ]);
+    for (const variant of variants) {
+      if (variant.length >= MIN_SECRET_LENGTH && !matches.has(variant)) {
+        matches.set(variant, marker);
+      }
+    }
+  }
+  return Array.from(matches, ([value, marker]) => ({ value, marker }))
+    .sort((a, b) => b.value.length - a.value.length || b.value.localeCompare(a.value));
+}
+
 export async function gatherSecretValues(env = process.env, deps = {}) {
   if (!env || typeof env !== 'object') {
     throw new TypeError('env must be an object');
@@ -86,10 +109,8 @@ export function scrubSecrets(text, secrets, deps = {}) {
   if (typeof text !== 'string') return text;
   const values = Array.isArray(secrets) ? secrets : [];
   let scrubbed = text;
-  for (const secret of values) {
-    if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) continue;
-    const marker = `[redacted:own-key-${_sha256Trunc8(secret, createHashImpl)}]`;
-    scrubbed = scrubbed.split(secret).join(marker);
+  for (const { value, marker } of _secretMatches(values, createHashImpl)) {
+    scrubbed = scrubbed.split(value).join(marker);
   }
   return scrubbed;
 }
