@@ -18,13 +18,29 @@ node --test eval/*.test.mjs
 
 ## Running the live runner (gated)
 
-`eval/run-live.mjs` is present as the harness entrypoint, but this PR only wires the gate and runner contract.
+`eval/run-live.mjs` is the gated live runner entrypoint.
 
 ```
 RUN_LIVE_EVAL=true node eval/run-live.mjs
 ```
 
-The runner exits immediately when `RUN_LIVE_EVAL !== "true"` and does not perform any live calls in this phase.
+The runner exits immediately when `RUN_LIVE_EVAL !== "true"` and does not perform any live calls.
+
+### Live knobs
+
+- `RUN_LIVE_EVAL=true` is required to run live invocations.
+- `EVAL_BUDGET_CAP` sets the USD cap (default `1`).
+- `EVAL_LIVE_CONCURRENCY` sets concurrency (default `5`).
+
+Example:
+
+```
+EVAL_BUDGET_CAP=1 EVAL_LIVE_CONCURRENCY=5 RUN_LIVE_EVAL=true node eval/run-live.mjs
+```
+
+On success, this writes:
+- `eval/baseline/run-live-results.json` (full run payload)
+- `eval/baseline/frozen-baseline.json` (when completion ratio is `>= 0.8`)
 
 ## Budget tracker
 
