@@ -87,6 +87,14 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
   process.exitCode = 1;
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'slow') {
   setTimeout(() => process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Late response.'})}}) + '\\n'), 1000);
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'retry-recovers' && route.startsWith('deepseek/')) {
+  // #45: first same-model attempt omits the verdict (MODEL_OUTPUT); the retry recovers it.
+  const attempts = fs.readFileSync(process.env.OCASK_TEST_OPENCODE_TRACE, 'utf8').trim().split('\\n').filter(Boolean).length;
+  if (attempts <= 1) {
+    process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({reason:'Primary omitted its verdict.'})}}) + '\\n');
+  } else {
+    process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'BLOCKED', reason:'Recovered on same-model retry.'})}}) + '\\n');
+  }
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'cross' && route.startsWith('deepseek/')) {
   process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:'VERDICT: APPROVED\\n\\nRationale: buddy concurs.'}}) + '\\n');
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'blocked') {
@@ -1448,9 +1456,38 @@ test('real CLI: default-mode model swap is surfaced and flips identity_preserved
     assert.equal(metadata.actual_model, QWEN_MAX_MODEL);
     assert.equal(metadata.actual_transport, 'opencode');
     assert.equal(metadata.identity_preserved, false);
+    // #45: a MODEL_OUTPUT failure now triggers MODEL_OUTPUT_RETRIES (2) same-model
+    // retries before the cross-model swap, so the trace is 3x primary then the fallback.
     assert.deepEqual(traces.map(args => args[args.indexOf('--model') + 1]), [
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
       `alibaba/${QWEN_MAX_MODEL}`,
+    ]);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('#45: a transient MODEL_OUTPUT is recovered by a same-model retry (no cross-model swap)', async () => {
+  const fixture = await makeFakeOpenCodeCli('retry-recovers');
+  try {
+    const run = spawnSync(process.execPath, [fileURLToPath(new URL('ocask.mjs', import.meta.url)),
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return a verdict.',
+      '--require-verdict', '--json', '--metadata', fixture.metadataPath,
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 20, `exit ${run.status}: ${run.stderr}`);
+    const response = JSON.parse(run.stdout);
+    const metadata = JSON.parse(await fs.readFile(fixture.metadataPath, 'utf8'));
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(response.verdict, 'BLOCKED');
+    // Same model twice (primary fail + retry success); NO cross-model fallback.
+    assert.equal(metadata.fallback_used, false);
+    assert.equal(metadata.actual_model, DEEPSEEK_PRO_MODEL);
+    assert.deepEqual(traces.map(args => args[args.indexOf('--model') + 1]), [
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
     ]);
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
