@@ -1,0 +1,27 @@
+{
+  "case_id": "gold-approved-clean",
+  "language": "javascript",
+  "arm": "control",
+  "iteration": 1,
+  "ground_truth": "clean",
+  "expected": "APPROVED",
+  "raw_output": {
+    "outcome": "judgment",
+    "verdict": "APPROVED",
+    "reason": "no issues",
+    "locus": null,
+    "mechanism": null,
+    "exit_code": 0,
+    "metadata": {
+      "attempts": [
+        { "tokensUsed": 120 }
+      ]
+    },
+    "output": "VERDICT: APPROVED\nNo obvious security or correctness bug was found in this patch."
+  },
+  "metadata": {
+    "attempts": [
+      { "tokensUsed": 120 }
+    ]
+  }
+}

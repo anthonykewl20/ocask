@@ -23,4 +23,4 @@ jobs:
         with:
           node-version: 22
       - name: Run tests
-        run: node --test ocask.test.mjs
+        run: node --test ocask.test.mjs eval/*.test.mjs

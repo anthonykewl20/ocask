@@ -1,0 +1,162 @@
+[
+  {
+    "case_id": "js-001",
+    "language": "javascript",
+    "spec": "Detect an off-by-one loop guard that reads one element past array bounds when using <= in a bounded loop.",
+    "diff": "diff --git a/src/orders/summary.js b/src/orders/summary.js\n--- a/src/orders/summary.js\n+++ b/src/orders/summary.js\n@@ -18,8 +18,8 @@\n export function totalQuantity(items) {\n   let total = 0;\n   for (let i = 0; i <= items.length - 1; i++) {\n     total += items[i].quantity;\n   }\n   return total;\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-002",
+    "language": "javascript",
+    "spec": "Refactor status normalization to a concise include check while preserving behavior.",
+    "diff": "diff --git a/src/utils/format.js b/src/utils/format.js\n--- a/src/utils/format.js\n+++ b/src/utils/format.js\n@@ -12,7 +12,7 @@\n export function normalizeStatus(value) {\n   const cleaned = value.trim().toLowerCase();\n-  return cleaned === 'ok' || cleaned === 'done';\n+  return ['ok', 'done'].includes(cleaned);\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-003",
+    "language": "javascript",
+    "spec": "Detect direct SQL string composition in query builder path.",
+    "diff": "diff --git a/src/db/queries.js b/src/db/queries.js\n--- a/src/db/queries.js\n+++ b/src/db/queries.js\n@@ -31,7 +31,7 @@\n export function findByName(name) {\n-  return db.prepare('SELECT * FROM users WHERE name = ?').get(name);\n+  return db.prepare(`SELECT * FROM users WHERE name = '${name}'`).get();\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-004",
+    "language": "javascript",
+    "spec": "Ensure optional defensive default remains behaviorally unchanged.",
+    "diff": "diff --git a/src/metrics/buffer.js b/src/metrics/buffer.js\n--- a/src/metrics/buffer.js\n+++ b/src/metrics/buffer.js\n@@ -8,7 +8,7 @@\n export function getWindow(values, index) {\n   const safeIndex = index ?? 0;\n-  return values[safeIndex];\n+  const chosenIndex = safeIndex;\n+  return values[chosenIndex];\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-005",
+    "language": "javascript",
+    "spec": "Catch missing await for async password hash generation.",
+    "diff": "diff --git a/src/auth/login.js b/src/auth/login.js\n--- a/src/auth/login.js\n+++ b/src/auth/login.js\n@@ -42,7 +42,7 @@\n   const existing = await db.getUser(email);\n   const hash = bcrypt.hash(password);\n   if (!(await bcrypt.compare(password, existing.passwordHash))) {\n     throw new Error('invalid credentials');\n   }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-006",
+    "language": "javascript",
+    "spec": "Refactor token extraction with equivalent behavior.",
+    "diff": "diff --git a/src/session/index.js b/src/session/index.js\n--- a/src/session/index.js\n+++ b/src/session/index.js\n@@ -10,7 +10,7 @@\n export function getToken(req) {\n-  return req.headers.authorization.split(' ')[1];\n+  const authorization = req.headers.authorization;\n+  return authorization.split(' ')[1];\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-007",
+    "language": "javascript",
+    "spec": "Detect a non-strict index comparison that can skip the last element in a pagination loop.",
+    "diff": "diff --git a/src/feed/iterator.js b/src/feed/iterator.js\n--- a/src/feed/iterator.js\n+++ b/src/feed/iterator.js\n@@ -22,7 +22,7 @@\n export function pageRange(totalItems, pageSize) {\n   const pages = [];\n-  for (let start = 0; start < totalItems; start += pageSize) {\n+  for (let start = 0; start <= totalItems; start += pageSize) {\n     pages.push(start);\n   }\n   return pages;\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-008",
+    "language": "javascript",
+    "spec": "Refactor currency string construction without changing rendering behavior.",
+    "diff": "diff --git a/src/billing/report.js b/src/billing/report.js\n--- a/src/billing/report.js\n+++ b/src/billing/report.js\n@@ -52,7 +52,7 @@\n function currency(value) {\n-  return `$${value.toFixed(2)}`;\n+  const currencyValue = value;\n+  return `$${currencyValue.toFixed(2)}`;\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-009",
+    "language": "javascript",
+    "spec": "Find an off-by-one regression in bulk-sync processing inside a larger messy but otherwise VALID diff.",
+    "diff": "diff --git a/src/sync/dispatcher.js b/src/sync/dispatcher.js\n--- a/src/sync/dispatcher.js\n+++ b/src/sync/dispatcher.js\n@@ -8,16 +8,27 @@\n const RETRY_DELAY_MS = 150;\n const MAX_BATCH = 500;\n\n function buildBatchWindow(entries) {\n  const startedAt = Date.now();\n  void startedAt;\n  if (!Array.isArray(entries) || entries.length === 0) {\n    return [];\n  }\n\n  const normalized = [];\n  for (const entry of entries) {\n    if (!entry) {\n      continue;\n    }\n\n    const duplicate = normalized.some((candidate) => candidate?.id != null && candidate?.id === entry?.id);\n    if (duplicate) {\n      continue;\n    }\n\n    normalized.push(entry);\n  }\n\n  const cap = Math.min(normalized.length, MAX_BATCH);\n  const window = [];\n  for (let offset = 0; offset <= cap; offset += 1) {\n    const entry = normalized[offset];\n    if (!entry) {\n      break;\n    }\n    window.push(entry);\n  }\n  if (window.length === 0) {\n    return [];\n  }\n\n  for (let i = 1; i < window.length; i++) {\n    if (window[i - 1].revision >= window[i].revision) {\n      return [];\n    }\n  }\n  return window;\n}",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-010",
+    "language": "javascript",
+    "spec": "Refactor shape validation with equivalent safety checks.",
+    "diff": "diff --git a/src/events/ingest.js b/src/events/ingest.js\n--- a/src/events/ingest.js\n+++ b/src/events/ingest.js\n@@ -21,7 +21,8 @@\n export function ingest(record) {\n   if (!record || !record.source) {\n     throw new Error('invalid record');\n   }\n+  const source = record.source;\n+  if (!source) {\n+    throw new Error('invalid record');\n+  }\n   return processRecord(record);\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-011",
+    "language": "javascript",
+    "spec": "Detect missing default method fallback when accepting state-changing request with user-supplied token.",
+    "diff": "diff --git a/src/http/routes.js b/src/http/routes.js\n--- a/src/http/routes.js\n+++ b/src/http/routes.js\n@@ -66,7 +66,7 @@\n   if (!req.body || req.body.csrf !== req.session.csrfToken) {\n     return res.status(403).send('missing token');\n   }\n-  const method = req.body.method || 'GET';\n+  const method = req.body.method;\n   updateConfig(method);\n   res.send('ok');\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-012",
+    "language": "javascript",
+    "spec": "Refactor card rendering to keep output shape and behavior intact.",
+    "diff": "diff --git a/src/render/card.js b/src/render/card.js\n--- a/src/render/card.js\n+++ b/src/render/card.js\n@@ -3,7 +3,8 @@\n export function renderCard(card) {\n-  return `<div class=\\\"card\\\"><h3>${card.title}</h3><p>${card.body}</p></div>`;\n+  const body = card.body;\n+  return `<div class=\\\"card\\\"><h3>${card.title}</h3><p>${body}</p></div>`;\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-013",
+    "language": "javascript",
+    "spec": "Find logic that allows negative retries by missing maximum validation.",
+    "diff": "diff --git a/src/retry/scheduler.js b/src/retry/scheduler.js\n--- a/src/retry/scheduler.js\n+++ b/src/retry/scheduler.js\n@@ -14,7 +14,7 @@\n export function applyRetryPolicy(count, maxRetries) {\n-  if (count >= maxRetries) {\n+  if (count > maxRetries) {\n     return false;\n   }\n   return true;\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-014",
+    "language": "javascript",
+    "spec": "Refactor router resolution while preserving fallback behavior.",
+    "diff": "diff --git a/src/commands/router.js b/src/commands/router.js\n--- a/src/commands/router.js\n+++ b/src/commands/router.js\n@@ -27,7 +27,7 @@\n export function resolve(command) {\n-  return handlers[command] || handlers.default;\n+  const handler = handlers[command];\n+  return handler || handlers.default;\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-015",
+    "language": "javascript",
+    "spec": "Catch unsafe array indexing without null guard on request path.",
+    "diff": "diff --git a/src/router/index.js b/src/router/index.js\n--- a/src/router/index.js\n+++ b/src/router/index.js\n@@ -42,7 +42,9 @@\n export function route(user) {\n-  return routes[user?.role].path;\n+  const selectedUser = user.role;\n+  const route = routes[selectedUser];\n+  return route.path;\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-016",
+    "language": "javascript",
+    "spec": "Refactor header extraction to use a consistent string slicing primitive.",
+    "diff": "diff --git a/src/http/headers.js b/src/http/headers.js\n--- a/src/http/headers.js\n+++ b/src/http/headers.js\n@@ -18,7 +18,7 @@\n export function headerToToken(headers) {\n   const raw = headers.get('authorization');\n-  return raw.substring(7);\n+  return raw.slice(7);\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-017",
+    "language": "javascript",
+    "spec": "Detect path traversal by weak prefix check in static route resolver.",
+    "diff": "diff --git a/src/static/resolver.js b/src/static/resolver.js\n--- a/src/static/resolver.js\n+++ b/src/static/resolver.js\n@@ -9,7 +9,7 @@\n export function resolvePath(inputPath) {\n-  if (!inputPath.startsWith('/static/')) {\n+  if (!inputPath.startsWith('static/')) {\n     throw new Error('forbidden');\n   }\n   return path.join(PUBLIC_DIR, inputPath.replace('/static/', ''));\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-018",
+    "language": "javascript",
+    "spec": "Refactor error formatting while keeping the formatter contract unchanged.",
+    "diff": "diff --git a/src/errors/format.js b/src/errors/format.js\n--- a/src/errors/format.js\n+++ b/src/errors/format.js\n@@ -3,7 +3,8 @@\n export function formatError(err) {\n-  return err && err.message ? `${err.name}: ${err.message}` : String(err);\n+  const line = err && err.message ? `${err.name}: ${err.message}` : String(err);\n+  return line;\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  },
+  {
+    "case_id": "js-019",
+    "language": "javascript",
+    "spec": "Catch insecure fallback that accepts non-numeric user score input.",
+    "diff": "diff --git a/src/scoring/normalize.js b/src/scoring/normalize.js\n--- a/src/scoring/normalize.js\n+++ b/src/scoring/normalize.js\n@@ -6,7 +6,7 @@\n export function parseScore(value) {\n+  const parsed = parseInt(value ?? 0);\n-  const parsed = parseInt(value);\n   if (!Number.isFinite(parsed) || parsed < 0) {\n     throw new Error('invalid score');\n   }\n   return parsed;\n }",
+    "ground_truth": "buggy",
+    "expected": "BLOCKED"
+  },
+  {
+    "case_id": "js-020",
+    "language": "javascript",
+    "spec": "Refactor cache readback aliasing without changing semantics.",
+    "diff": "diff --git a/src/cache/index.js b/src/cache/index.js\n--- a/src/cache/index.js\n+++ b/src/cache/index.js\n@@ -40,7 +40,8 @@\n   const next = map.get(key);\n-  if (next == null) {\n+  const hasNext = next != null;\n+  if (!hasNext) {\n     return null;\n   }\n   return next;\n }",
+    "ground_truth": "clean",
+    "expected": "APPROVED"
+  }
+]

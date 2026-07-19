@@ -1,0 +1,24 @@
+{
+  "case_id": "gold-blocked-buggy",
+  "language": "javascript",
+  "arm": "panel",
+  "iteration": 1,
+  "ground_truth": "buggy",
+  "expected": "BLOCKED",
+  "raw_output": {
+    "outcome": "judgment",
+    "verdict": "BLOCKED",
+    "reason": "out of bounds",
+    "metadata": {
+      "attempts": [
+        { "tokensUsed": 190 }
+      ]
+    },
+    "output": "VERDICT: BLOCKED\nAccess check misses last array element and may read undefined."
+  },
+  "metadata": {
+    "attempts": [
+      { "tokensUsed": 190 }
+    ]
+  }
+}
