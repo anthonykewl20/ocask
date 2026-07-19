@@ -1,0 +1,105 @@
+
+[js-003/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "This diff introduces a **SQL injection vulnerability**. The original code used a parameter..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-002/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff looks correct. The refactoring from two `===` comparisons to `.includes()` is sem..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-004/control] gt=clean
+  strict:    WARNING   X
+  free-form: "The diff looks correct. The change introduces a redundant intermediate variable `chosenInd..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-006/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff is **safe and correct**. Extracting `req.headers.authorization` into a local vari..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   ok
+
+[js-008/control] gt=clean
+  strict:    WARNING   X
+  free-form: "The diff looks correct. The change is purely cosmetic — `currencyValue` is bound to the sa..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-005/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff is a **no-op** — it shows identical code before and after. The bug it was suppose..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-007/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff introduces a defect. Changing `start < totalItems` to `start <= totalItems` produ..."
+  tolerant:  APPROVED   |  two-step: BLOCKED   ok
+
+[js-009/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "The off-by-one is in the window-building loop condition: ```js for (let offset = 0; offset..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+[js-001/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "The diff shows no actual change to the loop guard — both the old and new code are identica..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+[js-011/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff introduces a defect. Removing the `|| 'GET'` default means that if `req.body.meth..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-010/control] gt=clean
+  strict:    WARNING   X
+  free-form: "The diff introduces dead code. The first guard `if (!record || !record.source)` already en..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-014/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff looks correct. Extracting `handlers[command]` into a local variable before the `|..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-012/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "This diff looks correct. Extracting `card.body` into a local `const body` variable before ..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-016/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff looks correct. `substring(7)` and `slice(7)` are semantically equivalent for a po..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-015/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "This diff introduces a **regression**. The original code uses `user?.role` (optional chain..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-018/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff looks correct. The refactoring extracts the ternary result into a `line` variable..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-013/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff introduces a defect. Changing `count >= maxRetries` to `count > maxRetries` is an..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-017/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "This diff introduces a **path traversal vulnerability** due to a mismatch between the guar..."
+  tolerant:  none   |  two-step: BLOCKED   ok  <-- RECOVERED
+
+[js-020/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff looks correct. The refactoring extracts the `== null` guard into a named boolean ..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-019/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "This diff introduces a defect. The change replaces `parseInt(value)` with `parseInt(value ..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+===== SUMMARY (20 case/arm pairs: 10 buggy, 10 clean) =====
+strict abstentions: 3  |  of those RECOVERED correctly by two-step: 1
+buggy recall:  strict 7/10  ->  two-step 7/10
+clean FP:      strict 3/10  ->  two-step 0/10

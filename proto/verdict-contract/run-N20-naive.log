@@ -1,0 +1,105 @@
+
+[js-003/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "..."
+  tolerant:  none   |  two-step: APPROVED   X
+
+[js-002/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The refactored `normalizeStatus` function is already in place at `src/utils/format.js:14`...."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-004/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The change is behaviorally unchanged. The original code already performed the defensive de..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-001/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "No off-by-one error exists here. The loop guard `i <= items.length - 1` is functionally id..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+[js-006/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The refactored `getToken` function was applied to `src/session/index.js:10` — the `req.hea..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-008/control] gt=clean
+  strict:    WARNING   X
+  free-form: "The refactoring is correct and preserves rendering behavior. The local variable `currencyV..."
+  tolerant:  APPROVED   |  two-step: APPROVED   ok
+
+[js-005/control] gt=buggy
+  strict:    WARNING   ok
+  free-form: "The bug is a missing `await` on line 42: `bcrypt.hash(password)` returns a Promise, but wi..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+[js-012/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The refactor has been applied. `card.body` is extracted into a local `body` constant befor..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-011/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff removes the `|| 'GET'` default fallback for `req.body.method` on a CSRF-protected..."
+  tolerant:  APPROVED   |  two-step: WARNING   ok
+
+[js-009/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "The off-by-one regression is in the loop condition `offset <= cap`. Since `cap` equals `Ma..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   X
+
+[js-010/control] gt=clean
+  strict:    WARNING   X
+  free-form: "The refactor is already applied in `src/events/ingest.js`. The original single guard `if (..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   ok
+
+[js-014/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The file `src/commands/router.js` does not exist in this repository. The diff describes ex..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-007/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The non-strict comparison `<=` in the proposed change is the fix. The original strict `<` ..."
+  tolerant:  none   |  two-step: APPROVED   X
+
+[js-015/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "The diff shown does not actually catch the unsafe array indexing. It removes the optional ..."
+  tolerant:  none   |  two-step: BLOCKED   ok  <-- RECOVERED
+
+[js-016/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "Done. The refactor has been applied: `substring(7)` replaced with `slice(7)` in the `heade..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-018/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The file doesn't exist yet. Since the diff shows the refactored version as the target, I'l..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   ok
+
+[js-020/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The workspace contains no `src/cache/` directory or `index.js` file, so the diff cannot be..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-013/control] gt=buggy
+  strict:    ABSTAINED   X
+  free-form: "The function `applyRetryPolicy` validates whether the retry count has exceeded the configu..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok  <-- RECOVERED
+
+[js-017/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The diff shown does **not** detect or fix the path traversal vulnerability. The only chang..."
+  tolerant:  none   |  two-step: BLOCKED   ok
+
+[js-019/control] gt=buggy
+  strict:    WARNING   ok
+  free-form: "The diff does **not** correctly catch the insecure fallback. It only guards against `null`..."
+  tolerant:  none   |  two-step: BLOCKED   ok
+
+===== SUMMARY (20 case/arm pairs: 10 buggy, 10 clean) =====
+strict abstentions: 4  |  of those RECOVERED correctly by two-step: 2
+buggy recall:  strict 6/10  ->  two-step 5/10
+clean FP:      strict 2/10  ->  two-step 0/10

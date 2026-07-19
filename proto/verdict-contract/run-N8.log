@@ -1,0 +1,45 @@
+
+[js-009/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The off-by-one regression is in the batch window loop where `offset < cap` was changed to ..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-011/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The removed `|| 'GET'` fallback means that when `req.body.method` is falsy (missing, undef..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-019/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "Created `src/scoring/normalize.js` with the fix applied: `parseInt(value ?? 0)` replaces t..."
+  tolerant:  none   |  two-step: APPROVED   X
+
+[js-001/lens] gt=buggy
+  strict:    WARNING   ok
+  free-form: "..."
+  tolerant:  none   |  two-step: WARNING   ok
+
+[js-014/lens] gt=clean
+  strict:    WARNING   X
+  free-form: "..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+[js-010/control] gt=clean
+  strict:    ABSTAINED   X
+  free-form: "The redundancy is that both `!record.source` (in the compound condition) and `!source` (af..."
+  tolerant:  BLOCKED   |  two-step: APPROVED   ok  <-- RECOVERED
+
+[js-007/control] gt=buggy
+  strict:    BLOCKED   ok
+  free-form: "The proposed change from `<` to `<=` is incorrect and would introduce an off-by-one regres..."
+  tolerant:  BLOCKED   |  two-step: BLOCKED   ok
+
+[js-002/control] gt=clean
+  strict:    APPROVED   ok
+  free-form: "The diff has been applied to `src/utils/format.js:15`. The `normalizeStatus` function now ..."
+  tolerant:  none   |  two-step: APPROVED   ok
+
+===== SUMMARY (8 case/arm pairs: 5 buggy, 3 clean) =====
+strict abstentions: 1  |  of those RECOVERED correctly by two-step: 1
+buggy recall:  strict 5/5  ->  two-step 4/5
+clean FP:      strict 2/3  ->  two-step 0/3

@@ -1,0 +1,222 @@
+[
+ {
+  "id": "js-003",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-002",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-004",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "WARNING",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": false,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-006",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-008",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "WARNING",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": false,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-005",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-007",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-009",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": null,
+  "tolerantV": "BLOCKED",
+  "twoStepV": "APPROVED",
+  "strict_ok": false,
+  "twostep_ok": false,
+  "recovered": false
+ },
+ {
+  "id": "js-001",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": null,
+  "tolerantV": "BLOCKED",
+  "twoStepV": "APPROVED",
+  "strict_ok": false,
+  "twostep_ok": false,
+  "recovered": false
+ },
+ {
+  "id": "js-011",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-010",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "WARNING",
+  "tolerantV": null,
+  "twoStepV": "APPROVED",
+  "strict_ok": false,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-014",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-012",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-016",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-015",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-018",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-013",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "BLOCKED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-017",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": null,
+  "tolerantV": null,
+  "twoStepV": "BLOCKED",
+  "strict_ok": false,
+  "twostep_ok": true,
+  "recovered": true
+ },
+ {
+  "id": "js-020",
+  "arm": "control",
+  "gt": "clean",
+  "strictV": "APPROVED",
+  "tolerantV": "APPROVED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": true,
+  "recovered": false
+ },
+ {
+  "id": "js-019",
+  "arm": "control",
+  "gt": "buggy",
+  "strictV": "BLOCKED",
+  "tolerantV": "BLOCKED",
+  "twoStepV": "APPROVED",
+  "strict_ok": true,
+  "twostep_ok": false,
+  "recovered": false
+ }
+]
