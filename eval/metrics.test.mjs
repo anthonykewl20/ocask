@@ -291,3 +291,77 @@ test('aggregate passes through optional total cost', () => {
   );
   assert.equal(out.cost_usd, 12.5);
 });
+
+test('aggregate includes panel_vs_best_member from per-member panel verdicts', () => {
+  const out = aggregate([
+    mkRow({
+      case_id: 'bug-a',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'BLOCKED',
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'APPROVED' }) },
+      ],
+    }),
+    mkRow({
+      case_id: 'bug-a',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'BLOCKED',
+      iteration: 2,
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'APPROVED' }) },
+      ],
+    }),
+    mkRow({
+      case_id: 'bug-a',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'BLOCKED',
+      iteration: 3,
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'WARNING' }) },
+      ],
+    }),
+    mkRow({
+      case_id: 'bug-b',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'APPROVED',
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'APPROVED' }) },
+      ],
+    }),
+    mkRow({
+      case_id: 'bug-b',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'APPROVED',
+      iteration: 2,
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'APPROVED' }) },
+      ],
+    }),
+    mkRow({
+      case_id: 'bug-b',
+      arm: 'panel',
+      ground_truth: 'buggy',
+      verdict: 'APPROVED',
+      iteration: 3,
+      panel_members: [
+        { model: 'deepseek-v4-pro', output: JSON.stringify({ verdict: 'BLOCKED' }) },
+        { model: 'qwen', output: JSON.stringify({ verdict: 'APPROVED' }) },
+      ],
+    }),
+  ]);
+
+  assert.equal(out.panel_vs_best_member.consensus_recall, 0.5);
+  assert.equal(out.panel_vs_best_member.best_member_recall, 1);
+  assert.equal(out.panel_vs_best_member.best_member, 'deepseek-v4-pro');
+  assert.equal(out.panel_vs_best_member.delta, -0.5);
+});

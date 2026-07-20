@@ -1,0 +1,132 @@
+{
+  "frozen_at": "2026-07-19",
+  "phase": "T08",
+  "system_under_test": "ocask.mjs@origin/main",
+  "run": {
+    "cases": 20,
+    "arms": [
+      "control",
+      "lens",
+      "panel"
+    ],
+    "iterations": 3,
+    "completion_ratio": 1,
+    "total_calls": 180,
+    "spent_usd": 0.4213,
+    "cap_usd": 1,
+    "concurrency": 5
+  },
+  "per_arm": {
+    "control": {
+      "lenient_recall": 0.6,
+      "strict_recall": 0.6,
+      "fp_rate": 0.1,
+      "abstention_rate": 0.15,
+      "flip_rate": 0.325,
+      "blocked_rate": 0.6,
+      "tokens_per_case": null,
+      "ter": null
+    },
+    "panel": {
+      "lenient_recall": 0.1,
+      "strict_recall": 0.1,
+      "fp_rate": 0.9,
+      "abstention_rate": 0,
+      "flip_rate": 0.2,
+      "blocked_rate": 0.1,
+      "tokens_per_case": null,
+      "ter": null
+    },
+    "lens": {
+      "lenient_recall": 0.7,
+      "strict_recall": 0.7,
+      "fp_rate": 0.4,
+      "abstention_rate": 0.31666666666666665,
+      "flip_rate": 0.575,
+      "blocked_rate": 0.7,
+      "tokens_per_case": null,
+      "ter": null
+    }
+  },
+  "comparisons_vs_control": {
+    "panel": {
+      "candidate_arm": "panel",
+      "baseline_arm": "control",
+      "lenient_recall": {
+        "baseline": 0.6,
+        "candidate": 0.1,
+        "delta": -0.5,
+        "raw_successes": {
+          "baseline": 6,
+          "candidate": 1
+        },
+        "significant": false
+      },
+      "strict_recall": {
+        "baseline": 0.6,
+        "candidate": 0.1,
+        "delta": -0.5
+      },
+      "fp_rate": {
+        "baseline": 0.1,
+        "candidate": 0.9,
+        "delta": 0.8,
+        "significant": true
+      },
+      "blocked_rate": {
+        "baseline": 0.6,
+        "candidate": 0.1,
+        "delta": -0.5
+      },
+      "tokens_per_case": {
+        "baseline": null,
+        "candidate": null,
+        "delta": null
+      },
+      "ter": null
+    },
+    "lens": {
+      "candidate_arm": "lens",
+      "baseline_arm": "control",
+      "lenient_recall": {
+        "baseline": 0.6,
+        "candidate": 0.7,
+        "delta": 0.09999999999999998,
+        "raw_successes": {
+          "baseline": 6,
+          "candidate": 7
+        },
+        "significant": false
+      },
+      "strict_recall": {
+        "baseline": 0.6,
+        "candidate": 0.7,
+        "delta": 0.09999999999999998
+      },
+      "fp_rate": {
+        "baseline": 0.1,
+        "candidate": 0.4,
+        "delta": 0.30000000000000004,
+        "significant": true
+      },
+      "blocked_rate": {
+        "baseline": 0.6,
+        "candidate": 0.7,
+        "delta": 0.09999999999999998
+      },
+      "tokens_per_case": {
+        "baseline": null,
+        "candidate": null,
+        "delta": null
+      },
+      "ter": null
+    }
+  },
+  "panel_vs_best_member": {
+    "consensus_recall": 0.1,
+    "best_member_recall": 0,
+    "best_member": "deepseek-v4-pro",
+    "delta": 0.1
+  },
+  "notes": "Canonical frozen baseline generated from run-live aggregate metrics."
+}

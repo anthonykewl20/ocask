@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Aggregate recorded ocask eval rows into numeric metrics and guardrails.
 
+import { parseVerdict } from './parse.mjs';
+
 const VALID_VERDICTS = Object.freeze(['APPROVED', 'WARNING', 'BLOCKED']);
 const BASELINE_ARM = 'control';
 const SIGNIFICANCE_ALPHA = 0.15;
@@ -14,6 +16,10 @@ const PANEL_NO_CONSENSUS_MARKERS = Object.freeze([
   'quorum failure',
   'quorum_failure',
 ]);
+
+function requiredConsensus(iterationCount) {
+  return iterationCount <= 1 ? 1 : 2;
+}
 
 function normalizeCost(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -88,6 +94,14 @@ function normalizeRow(row, index) {
     tokens_used: toFinite(row?.tokens_used),
     comparable: row?.comparable === true,
     invoke_error: row?.invoke_error || null,
+    panel_members: Array.isArray(row?.panel_members)
+      ? row.panel_members.map((member) => ({
+        model: typeof member?.model === 'string' ? member.model : null,
+        output: typeof member?.output === 'string'
+          ? member.output
+          : member?.output == null ? null : JSON.stringify(member?.output),
+      }))
+      : [],
   };
 }
 
@@ -288,13 +302,6 @@ function computeArmStats(rows) {
   let rowCount = 0;
   let comparableCount = 0;
 
-  // Case-level collapse contract (per issue #36):
-  // collapse each (case, arm) 3-iteration outcome vector to one outcome:
-  // lenient caught => at least 2 iterations are BLOCKED or WARNING.
-  function requiredConsensus(iterationCount) {
-    return iterationCount <= 1 ? 1 : 2;
-  }
-
   function aggregateCaseOutcome(caseRows) {
     const required = requiredConsensus(caseRows.length);
     const outcomes = caseRows.map(classifyOutcome);
@@ -391,6 +398,107 @@ function computeArmStats(rows) {
     tokens_per_case: totalTokens !== null && caseIds.size > 0 ? totalTokens / caseIds.size : null,
     flip,
     flip_rate: flip.rate,
+  };
+}
+
+function parsePanelMemberVerdict(rawOutput) {
+  const parsed = parseVerdict(rawOutput);
+  return parsed?.verdict ?? null;
+}
+
+function collectPanelMembersByCase(panelRows) {
+  const rowsByCase = new Map();
+  const memberModelsByCase = new Map();
+  const groundTruthByCase = new Map();
+
+  for (const row of panelRows) {
+    if (!row.case_id) continue;
+    if (!rowsByCase.has(row.case_id)) rowsByCase.set(row.case_id, []);
+    rowsByCase.get(row.case_id).push(row);
+
+    if (row.ground_truth) {
+      groundTruthByCase.set(row.case_id, row.ground_truth);
+    }
+
+    const members = memberModelsByCase.get(row.case_id) ?? new Set();
+    for (const member of row.panel_members) {
+      if (typeof member?.model === 'string' && member.model) {
+        members.add(member.model);
+      }
+    }
+    memberModelsByCase.set(row.case_id, members);
+  }
+
+  return { rowsByCase, memberModelsByCase, groundTruthByCase };
+}
+
+function computePanelVsBestMember(panelStats, panelRows) {
+  if (!Array.isArray(panelRows) || panelRows.length === 0) {
+    return {
+      consensus_recall: panelStats?.lenient_recall ?? null,
+      best_member_recall: null,
+      best_member: null,
+      delta: null,
+    };
+  }
+
+  const { rowsByCase, memberModelsByCase, groundTruthByCase } = collectPanelMembersByCase(panelRows);
+  const allMembers = new Set();
+  for (const members of memberModelsByCase.values()) {
+    for (const member of members) {
+      allMembers.add(member);
+    }
+  }
+
+  if (allMembers.size === 0) {
+    return {
+      consensus_recall: panelStats?.lenient_recall ?? null,
+      best_member_recall: null,
+      best_member: null,
+      delta: null,
+    };
+  }
+
+  let bestMember = null;
+  let bestMemberRecall = null;
+
+  for (const member of allMembers) {
+    let buggyTotal = 0;
+    let buggyCaught = 0;
+
+    for (const [caseId, caseRows] of rowsByCase.entries()) {
+      const groundTruth = normalizeGroundTruth(groundTruthByCase.get(caseId));
+      if (!groundTruth) continue;
+
+      const memberOutcome = caseRows.map((row) => {
+        const memberRecord = row.panel_members.find((entry) => entry.model === member);
+        return parsePanelMemberVerdict(memberRecord?.output);
+      });
+
+      const lenientHits = memberOutcome.filter((value) => LENIENT_OUTCOMES.has(value)).length;
+      const lenientCaught = lenientHits >= requiredConsensus(memberOutcome.length);
+
+      if (groundTruth === 'buggy') {
+        buggyTotal += 1;
+        if (lenientCaught) buggyCaught += 1;
+      } else {
+        // Keep FP tracking out of the canonical panel comparison object for now.
+      }
+    }
+
+    const recall = rate(buggyCaught, buggyTotal);
+    const isBetter = bestMember === null || recall > bestMemberRecall || (recall === bestMemberRecall && member < bestMember);
+    if (isBetter) {
+      bestMemberRecall = recall;
+      bestMember = member;
+    }
+  }
+
+  return {
+    consensus_recall: panelStats?.lenient_recall ?? null,
+    best_member_recall: bestMemberRecall,
+    best_member: bestMember,
+    delta: bestMemberRecall === null ? null : (panelStats?.lenient_recall ?? null) - bestMemberRecall,
   };
 }
 
@@ -529,6 +637,7 @@ function makeEmptySummary() {
     abstained_rows: 0,
     abstention_rate: 0,
     cost_usd: null,
+    panel_vs_best_member: null,
     guardrails: {},
   };
 }
@@ -556,6 +665,8 @@ export function aggregate(rows, {
 
   const by_case = summarizeByCase(caseByArm);
   const baselineStats = byArm[BASELINE_ARM];
+  const panelVsBestMember = computePanelVsBestMember(byArm.panel, byArm.panel ? rowsByArm?.get('panel') || [] : []);
+
   if (!baselineStats) {
     return {
       row_count: totalRows,
@@ -568,6 +679,7 @@ export function aggregate(rows, {
       by_case,
       baseline_arm: BASELINE_ARM,
       comparisons: {},
+      panel_vs_best_member: panelVsBestMember,
       flip: {
         by_arm: Object.fromEntries(Object.entries(byArm).map(([arm, stats]) => [arm, stats.flip])),
         total: {
@@ -602,6 +714,7 @@ export function aggregate(rows, {
     by_case,
     baseline_arm: BASELINE_ARM,
     comparisons,
+    panel_vs_best_member: panelVsBestMember,
     flip: {
       by_arm: Object.fromEntries(Object.entries(byArm).map(([arm, stats]) => [arm, {
         flips: stats.flip.flips,
