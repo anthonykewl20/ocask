@@ -127,7 +127,11 @@ Two independent layers:
    Configurable per provider family.
 
 2. **Model-level** (`runAsk` in ocask.mjs): malformed output (missing verdict,
-   numbers-only) retries the opposite model family once. Only for
+   numbers-only → `MODEL_OUTPUT`) first retries the **same** model up to
+   `MODEL_OUTPUT_RETRIES` (2) times — such abstentions are largely transient (#45)
+   — and only then retries the opposite model family once. Same-model retries are
+   deadline-bounded and apply even under `--no-fallback` (same exact model, never a
+   switch); the opposite-family retry stays gated by `--no-fallback`. Only for
    `--require-verdict` tasks (read-only, safe to replay).
 
 **Identity pinning (`--no-fallback`).** `--no-fallback` pins the model's

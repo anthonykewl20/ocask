@@ -23,6 +23,7 @@ const MAX_PLAUSIBLE_PATH_LENGTH = 4096;
 const DEFAULT_TIMEOUT_MS = 170_000;
 const HARD_CEIL_MS = 300_000;
 const REVIEW_HARD_CEIL_MS = 900_000;
+const MODEL_OUTPUT_RETRIES = 2;
 const RISK_BOUNDARY_LINES = 400;
 const RISK_BOUNDARY_FILES = 5;
 const TRIVIAL_LINES = 15;
@@ -834,33 +835,50 @@ export async function runAsk({
     const attempt = await timeAttempt(model, originalPrompt, false);
     result = { ok: true, output: attempt.output, model: attempt.modelUsed };
   } catch (primaryError) {
-    if (!selectedFallback || !isFallbackEligible(primaryError)) {
+    let lastError = primaryError;
+    for (let retry = 0; retry < MODEL_OUTPUT_RETRIES && isFallbackEligible(lastError); retry++) {
+      // Stop retrying if the deadline budget is exhausted (nextAttemptTimeoutMs throws when <= 0).
+      try {
+        nextAttemptTimeoutMs(absoluteDeadlineMs, Date.now());
+      } catch {
+        break;
+      }
+      try {
+        const attempt = await timeAttempt(model, `${originalPrompt}\n\n${retryCorrection(lastError)}`, false);
+        result = { ok: true, output: attempt.output, model: attempt.modelUsed };
+        break;
+      } catch (retryError) {
+        lastError = retryError;
+      }
+    }
+    if (!result && (!selectedFallback || !isFallbackEligible(lastError))) {
       metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
-      const primaryClass = classifyFailure(primaryError, { timeoutMs });
-      const primaryProvider = unwrapOrigin(primaryError)?.provider || provider || defaultProvider(model) || 'unknown';
+      const primaryClass = classifyFailure(lastError, { timeoutMs });
+      const primaryProvider = unwrapOrigin(lastError)?.provider || provider || defaultProvider(model) || 'unknown';
       await logError({
         model, provider: primaryProvider, errorCode: primaryClass.mechanism || 'unknown',
-        errorClass: primaryError?.constructor?.name, attemptCount: attemptIndex,
+        errorClass: lastError?.constructor?.name, attemptCount: attemptIndex,
         durationMs: metadata.duration_ms, timeoutMs, classification: primaryClass,
-        mechanismMessage: primaryError?.message, scrubEnv: env,
+        mechanismMessage: lastError?.message, scrubEnv: env,
       });
-      primaryError.ocaskMetadata = metadata; throw primaryError;
-    }
-    metadata.fallback_used = true;
-    try {
-      const attempt = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(primaryError)}`, true);
-      result = { ok: true, output: attempt.output, model: attempt.modelUsed };
-    } catch (fbError) {
-      metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
-      const fbClass = classifyFailure(fbError, { timeoutMs });
-      const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
-      await logError({
-        model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown',
-        errorClass: fbError?.constructor?.name, attemptCount: attemptIndex,
-        durationMs: metadata.duration_ms, timeoutMs, classification: fbClass,
-        mechanismMessage: fbError?.message, scrubEnv: env,
-      });
-      fbError.ocaskMetadata = metadata; throw fbError;
+      lastError.ocaskMetadata = metadata; throw lastError;
+    } else if (!result) {
+      metadata.fallback_used = true;
+      try {
+        const attempt = await timeAttempt(selectedFallback, `${originalPrompt}\n\n${retryCorrection(lastError)}`, true);
+        result = { ok: true, output: attempt.output, model: attempt.modelUsed };
+      } catch (fbError) {
+        metadata.exit_code = 1; metadata.duration_ms = Date.now() - runStarted;
+        const fbClass = classifyFailure(fbError, { timeoutMs });
+        const fbProvider = unwrapOrigin(fbError)?.provider || provider || defaultProvider(selectedFallback) || 'unknown';
+        await logError({
+          model: selectedFallback, provider: fbProvider, errorCode: fbClass.mechanism || 'unknown',
+          errorClass: fbError?.constructor?.name, attemptCount: attemptIndex,
+          durationMs: metadata.duration_ms, timeoutMs, classification: fbClass,
+          mechanismMessage: fbError?.message, scrubEnv: env,
+        });
+        fbError.ocaskMetadata = metadata; throw fbError;
+      }
     }
   }
   metadata.exit_code = 0; metadata.duration_ms = Date.now() - runStarted;
