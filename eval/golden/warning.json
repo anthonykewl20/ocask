@@ -1,0 +1,25 @@
+{
+  "case_id": "gold-warning-clean",
+  "language": "javascript",
+  "arm": "lens",
+  "iteration": 1,
+  "ground_truth": "clean",
+  "expected": "APPROVED",
+  "raw_output": {
+    "outcome": "judgment",
+    "verdict": "WARNING",
+    "reason": "policy deviation",
+    "mechanism": null,
+    "metadata": {
+      "attempts": [
+        { "tokensUsed": 145 }
+      ]
+    },
+    "output": "VERDICT: WARNING\nPotentially unsafe style change, review required."
+  },
+  "metadata": {
+    "attempts": [
+      { "tokensUsed": 145 }
+    ]
+  }
+}

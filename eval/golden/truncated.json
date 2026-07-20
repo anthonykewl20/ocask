@@ -1,0 +1,26 @@
+{
+  "case_id": "gold-truncated-buggy",
+  "language": "javascript",
+  "arm": "control",
+  "iteration": 2,
+  "ground_truth": "clean",
+  "expected": "APPROVED",
+  "raw_output": {
+    "outcome": "analysis",
+    "verdict": null,
+    "reason": "truncated output",
+    "mechanism": "CONTENT_LIMIT",
+    "metadata": {
+      "attempts": [
+        { "tokensUsed": 300 }
+      ]
+    },
+    "output": "VERDICT: APPROVED ... [truncated]"
+  },
+  "metadata": {
+    "attempts": [
+      { "tokensUsed": 300 }
+    ]
+  },
+  "truncated": true
+}

@@ -19,6 +19,8 @@ echo "→ Installing CLI to $BIN"
 chmod +x "$REPO_DIR/ocask.mjs"
 ln -sf "$REPO_DIR/ocask.mjs" "$BIN"
 echo "  ✓ ocask CLI ready"
+# `eval/` contains dev-only evaluation harness assets. It is intentionally not copied
+# during install so local users receive only the runtime CLI and command docs.
 
 # ── Provider auth check ──
 echo ""
