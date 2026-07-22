@@ -240,6 +240,8 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 ### Auth Failures
 - Env var not set and key file missing → provider is skipped before invocation with
   `NOT_CONFIGURED`, unless explicitly pinned or it is the last available transport.
+- `NOT_CONFIGURED` skips are omitted from exhausted-provider names. Load failures remain
+  named as `PROVIDER_UNAVAILABLE`, and any real terminal cause retains the full attempt history.
 - Key expired/revoked → API 401/403 → `AUTH_FAILURE`. Retryable on next provider.
 - OpenCode Go key Lite-tier → `ENTITLEMENT_UNAVAILABLE`. Not retryable.
 

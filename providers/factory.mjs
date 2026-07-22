@@ -4,7 +4,7 @@
 //     → { stdout, stderr, provider, model_used }
 //   throws ProviderError with .code
 
-import { stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -218,11 +218,14 @@ async function hasProviderCredentials(provider, env) {
 
   // Keep this invocation-local instead of exporting system.mjs's doctor helper:
   // fallback receives a caller-owned env, while doctor intentionally inspects process.env.
+  // Mirror the native providers' HOME fallback exactly; divergence could skip a
+  // transport that the provider itself would authenticate successfully.
   try {
-    const keyFile = await stat(path.join(env.HOME || os.homedir(), credential.filename));
-    return keyFile.isFile() && keyFile.size > 0;
-  } catch {
-    return false;
+    return Boolean((await readFile(path.join(env.HOME || os.homedir(), credential.filename), 'utf8')).trim());
+  } catch (error) {
+    // Only confirmed absence means not configured. Let the provider attempt
+    // other filesystem failures so they remain observable as real failures.
+    return error?.code !== 'ENOENT';
   }
 }
 
@@ -282,12 +285,14 @@ export async function invokeWithFallback({
     }
   }
 
-  const attemptedProviders = attempts
-    .filter(attempt => attempt.outcome === 'failed')
+  const namedProviders = attempts
+    .filter(attempt => attempt.outcome !== 'skipped' || attempt.reason_code !== 'NOT_CONFIGURED')
     .map(attempt => attempt.provider);
-  if (lastError && attemptedProviders.length) {
+  // Each lastError assignment follows a non-NOT_CONFIGURED attempt record, so
+  // the displayed provider list is non-empty whenever a real cause exists.
+  if (lastError) {
     throw Object.assign(
-      new ProviderError(`All providers exhausted (${attemptedProviders.join(', ')}); last: ${lastError.message}`, 'ALL_PROVIDERS_EXHAUSTED'),
+      new ProviderError(`All providers exhausted (${namedProviders.join(', ')}); last: ${lastError.message}`, 'ALL_PROVIDERS_EXHAUSTED'),
       { attempts, cause: lastError }
     );
   }
