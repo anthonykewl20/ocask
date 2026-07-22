@@ -427,15 +427,18 @@ test('default fallback is deterministic and from opposite family', () => {
   assert.equal(defaultFallbackModel(HY3_MODEL), DEEPSEEK_PRO_MODEL);
 });
 
-test('every configured fallback and panel counterpart is from the opposite family', () => {
+test('configured DeepSeek and hy3 fallback and panel counterparts are opposite-family', () => {
+  let assertionCount = 0;
   for (const model of PAID_MODELS) {
     const family = modelFamily(model);
     if (!family) continue;
     for (const counterpart of [defaultFallbackModel(model), panelCounterpartModel(model)]) {
       if (!counterpart) continue;
       assert.notEqual(modelFamily(counterpart), family, `${model} -> ${counterpart}`);
+      assertionCount += 1;
     }
   }
+  assert.ok(assertionCount >= 6, `expected at least 6 counterpart assertions, got ${assertionCount}`);
 });
 
 test('retired model ids are rejected by the paid-model guard', () => {
@@ -2282,6 +2285,27 @@ test('installed-symlink CLI: existing --cross-verify buddy path remains operatio
     assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
       identityTransportRoute(HY3_MODEL, 'opencode'),
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+    ]));
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('installed-symlink CLI: --cross-verify gives a DeepSeek primary an hy3 buddy', async () => {
+  const fixture = await makeFakeOpenCodeCli('cross-approved');
+  try {
+    const run = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.ok(Buffer.byteLength(run.stdout, 'utf8') > 0);
+    assert.equal(JSON.parse(run.stdout).verdict, 'APPROVED');
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(HY3_MODEL, 'opencode'),
     ]));
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });

@@ -23,13 +23,13 @@ All notable changes to ocask are documented here. The format is based on
 - **Identity trust table** (#12): `--no-fallback` now pins model *identity* (not transport)
   via a curated, human-asserted trust table; transport fallback proceeds only across
   declared same-weights transports (`deepseek-v4-pro:{deepseek,opencode}`,
-  `qwen3.7-plus:{qwen,opencode}`), and a DeepSeek model never routes to the Qwen provider
-  (hard reject). Runs record `identity_preserved`.
+  `hy3:{opencode}`), and the hy3 model never routes to the DeepSeek provider (hard reject).
+  Runs record `identity_preserved`.
 - **`prompt_hash`** (#9): every run logs a SHA-256 digest of the prompt so identical tasks
   correlate across the log without ever storing prompt text.
 - **Own-secret redactor** (#9): `mechanism_message` is scrubbed of known secrets before it
   touches the local 0700 log — value-based, default-deny, and never written to `--metadata`.
-- **Consensus verify-panel** (#23): `--panel` runs a cross-family panel (DeepSeek + Qwen)
+- **Consensus verify-panel** (#23): `--panel` runs a cross-family panel (DeepSeek + hy3)
   under one absolute deadline; majority K-of-N with a conservative BLOCKED tiebreaker. A
   member that returns no-judgment is an ABSTENTION (not a vote) — too many abstentions fail
   closed to no-judgment (exit 30), never a false agreement.
@@ -42,6 +42,12 @@ All notable changes to ocask are documented here. The format is based on
   URL-encoded forms of every known secret.
 
 ### Changed
+- **Qwen retired; Tencent hy3 promoted**: Qwen is retired and removed — its native provider
+  is deleted and its models are de-allowlisted — because Tencent hy3 now serves as DeepSeek's
+  opposite-family counterpart. hy3 is available only through the OpenCode CLI route
+  `openrouter/tencent/hy3`, using OpenCode's own OpenRouter credential; it has no native ocask
+  provider or key file. It is deliberately unreachable through `ocverify.mjs`'s Zen HTTP client,
+  which is why `ZEN_SERVABLE_MODELS` now exists.
 - **Exit codes** now follow the four-way contract: a failed/`no-judgment` run exits `30`
   (was `1`), and a `BLOCKED` verdict exits `20`. **Exit `0` now requires a positively-produced,
   parseable verdict** — an empty or failed run can no longer be mistaken for success. Consumers
