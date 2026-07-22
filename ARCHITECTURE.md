@@ -96,13 +96,13 @@ export async function invoke({ model, prompt, timeoutMs, env, cwd })
 
 #### `deepseek` — Native DeepSeek API
 - POST `https://api.deepseek.com/v1/chat/completions`
-- Auth: `DEEPSEEK_API_KEY` env var or `~/.deepseek-key` (mode 0600)
+- Auth: `DEEPSEEK_API_KEY` env var or `$HOME/.deepseek-key` (mode 0600)
 - Maps `deepseek-v4-pro` → `deepseek-chat`, `deepseek-v4-flash` → `deepseek-chat`
 - Returns `tokensUsed` from `body.usage`
 
 #### `qwen` — Native Alibaba DashScope API
 - POST `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions`
-- Auth: `QWEN_API_KEY` env var or `~/.qwen-key` (mode 0600)
+- Auth: `QWEN_API_KEY` env var or `$HOME/.qwen-key` (mode 0600)
 - Token Plan: set `QWEN_TOKEN_PLAN=1` for `x-dashscope-plugin` header
 - Maps `qwen3.7-plus` → `qwen-plus`, `qwen3.7-max` → `qwen-max`
 - Handles both OpenAI-compatible (`choices[0].message`) and DashScope-native (`output.text`) response formats
@@ -268,6 +268,9 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 ### Auth Failures
 - Env var not set and key file missing → provider is skipped before invocation with
   `NOT_CONFIGURED`, unless explicitly pinned or it is the last available transport.
+- The invocation's caller-owned `env` is authoritative for key discovery. Native providers
+  and the fallback credential predictor consult a key file only when that object contains a
+  non-empty `HOME`; they never fall back to the process home directory.
 - `NOT_CONFIGURED` skips are omitted from exhausted-provider names. Load failures remain
   named as `PROVIDER_UNAVAILABLE`, and any real terminal cause retains the full attempt history.
 - Key expired/revoked → API 401/403 → `AUTH_FAILURE`. Retryable on next provider.
@@ -323,7 +326,8 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 | `XDG_DATA_HOME` | all | Base for `~/.local/share/ocask/` (log, pricing cache) |
 | `OCASK_REFUSE_DEFAULT_LOG` | tests | Set exactly `1` to refuse telemetry in the default data directory |
 
-Key files: `~/.deepseek-key`, `~/.qwen-key` (mode 0600, one trimmed line).
+Key files: `$HOME/.deepseek-key`, `$HOME/.qwen-key` (mode 0600, one trimmed line). `HOME`
+must be present in the caller-supplied invocation environment for these files to be visible.
 
 ## Project Structure
 

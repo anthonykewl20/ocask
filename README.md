@@ -36,8 +36,8 @@ mkdir -p ~/.config/opencode/commands && cp commands/ocask.md ~/.config/opencode/
 
 | Provider | Auth method | Models |
 |----------|-------------|--------|
-| `deepseek` | `DEEPSEEK_API_KEY` env var, or `~/.deepseek-key` (mode 0600, one line) | DeepSeek V4 Pro, V4 Flash, Chat, Reasoner |
-| `qwen` | `QWEN_API_KEY` env var, or `~/.qwen-key` (mode 0600, one line) | Qwen 3.7 Plus/Max, 3.6 Plus/Pro |
+| `deepseek` | `DEEPSEEK_API_KEY` env var, or `$HOME/.deepseek-key` (mode 0600, one line) | DeepSeek V4 Pro, V4 Flash, Chat, Reasoner |
+| `qwen` | `QWEN_API_KEY` env var, or `$HOME/.qwen-key` (mode 0600, one line) | Qwen 3.7 Plus/Max, 3.6 Plus/Pro |
 | `opencode` | `opencode providers login` (picks up existing CLI auth) | Routes via `deepseek/` and `alibaba/` provider prefixes |
 
 For Qwen via OpenCode CLI: get an API key from https://home.qwencloud.com/api-keys and run `opencode providers login alibaba`.
@@ -276,8 +276,8 @@ missing credentials, and a hang's advice never tells you to raise the timeout.
 
 Key files (fallback, read once per invocation):
 
-- `~/.deepseek-key` — mode 0600, one trimmed line
-- `~/.qwen-key` — mode 0600, one trimmed line
+- `$HOME/.deepseek-key` — mode 0600, one trimmed line
+- `$HOME/.qwen-key` — mode 0600, one trimmed line
 
 ## Tests
 

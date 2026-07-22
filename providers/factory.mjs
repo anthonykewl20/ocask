@@ -5,7 +5,6 @@
 //   throws ProviderError with .code
 
 import { readFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
 // ── ProviderError ──
@@ -218,13 +217,19 @@ async function hasProviderCredentials(provider, env) {
 
   // Keep this invocation-local instead of exporting system.mjs's doctor helper:
   // fallback receives a caller-owned env, while doctor intentionally inspects process.env.
-  // Mirror the native providers' HOME fallback exactly; divergence could skip a
+  // Mirror the native providers' caller-owned HOME contract exactly; divergence could skip a
   // transport that the provider itself would authenticate successfully.
+  if (!env.HOME) return false;
   try {
-    return Boolean((await readFile(path.join(env.HOME || os.homedir(), credential.filename), 'utf8')).trim());
+    return Boolean((await readFile(path.join(env.HOME, credential.filename), 'utf8')).trim());
   } catch (error) {
-    // Only confirmed absence means not configured. Let the provider attempt
-    // other filesystem failures so they remain observable as real failures.
+    // Only confirmed absence (ENOENT) proves "not configured". Any other read
+    // failure — EACCES, ENOTDIR — means we cannot tell, so say "configured" and
+    // let the provider try: a wasted attempt is safe, wrongly skipping a working
+    // transport is not.
+    // Note the provider reports that attempt as AUTH_FAILURE, having swallowed the
+    // underlying errno (providers/deepseek.mjs, providers/qwen.mjs). So the specific
+    // filesystem cause is NOT preserved in the outcome; only the fact of failure is.
     return error?.code !== 'ENOENT';
   }
 }
