@@ -60,7 +60,7 @@ optimized for analytical reasoning models. Three components:
 - **Task body** — user-supplied review target (diff, file paths, question)
 - **Lens framework** — domain-specific audit checklist injected per `--lens` (7 lenses: `code-review`, `architecture`, `security`, `tdd`, `maintainability`, `deep-modules`, `general`)
 - **Execution guidance** — chain-of-thought instruction, evidence inspection, structural simplification
-- **Response contract** — `VERDICT: APPROVED | WARNING | BLOCKED` with structured rationale
+- **Response contract** — `VERDICT: APPROVED | WARNING | BLOCKED` with requested structured rationale
 
 ### 3. Provider Abstraction (`providers/factory.mjs`)
 
@@ -185,9 +185,10 @@ plain delegation stays capped at 300000ms. A timed-out run records
 ### 6. Output Validation (`ocask.mjs` — `validateAssistantOutput`)
 
 - Text + verdict: one or more explicit `VERDICT: APPROVED|WARNING|BLOCKED`
-  lines anywhere in the response + alphabetic rationale. Repeated verdicts must
-  agree; every conflicting set is malformed `MODEL_OUTPUT`, including a set
-  containing `BLOCKED`, so the model can retry with a coherent judgment.
+  lines anywhere in the response + at least one Unicode letter outside those
+  lines. Repeated verdicts must agree; every conflicting set is malformed
+  `MODEL_OUTPUT`, including a set containing `BLOCKED`, so the model can retry
+  with a coherent judgment.
 - JSON + verdict: `{ verdict, reason|reasoning|summary }` single object
 - All modes: must contain alphabetic content (not numbers-only)
 
@@ -199,7 +200,16 @@ fifth nonempty line, 537 were JSON parse failures, and 41 had no message. On
 2026-07-20 through 2026-07-22, every field `MODEL_OUTPUT` was one of the two
 cosmetic text-verdict rejections. Accepting consistent repetitions and verdicts
 at any line preserves completed reviews while missing verdicts, all conflicting
-verdict sets, and reviews without prose still fail closed.
+verdict sets, and replies with no Unicode letter content outside verdict lines still
+fail closed.
+
+The alphabetic-content floor is hygiene, not semantic rationale detection. It
+rejects a bare verdict (and verdict plus punctuation or numbers), but accepts any
+letter-bearing line, including `Rationale:`, `Review summary:`, and `x`. Those
+strings can also be genuine terse rationale, so text shape and length cannot
+reliably distinguish the two meanings. The gate does not claim that a passing
+text reply contains reasoning; semantic enforcement would need an additional
+signal, such as a later model judgment, rather than another regex or threshold.
 
 Cross-verify disagreement is a synthesized judgment: its leading `WARNING` is
 authoritative. The primary and buddy reviews are embedded for context, so their
@@ -288,7 +298,7 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 
 ### Response Quality
 - Empty, numbers-only, missing verdict, conflicting verdicts,
-  rationale-free reviews, unparseable JSON →
+  no Unicode letter content outside text verdict lines, unparseable JSON →
   `MODEL_OUTPUT`. Eligible for opposite-family model retry.
 
 ### Log Integrity
