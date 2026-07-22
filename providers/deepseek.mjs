@@ -1,10 +1,10 @@
 // Native DeepSeek API provider — direct HTTP to api.deepseek.com.
 // OpenAI-compatible chat completions endpoint.
-// Auth: DEEPSEEK_API_KEY env var or ~/.deepseek-key file.
+// Auth: DEEPSEEK_API_KEY env var, or $HOME/.deepseek-key where HOME comes from the
+// caller-supplied env (#81) — never the process home.
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { ProviderError, identityTransportRoute, isDeepSeekModel } from './factory.mjs';
 
 const BASE_URL = 'https://api.deepseek.com';
@@ -14,12 +14,14 @@ const DEFAULT_MAX_TOKENS = 65536;
 // Read API key: env var takes priority, then key file.
 async function resolveApiKey(env = process.env) {
   if (env.DEEPSEEK_API_KEY) return env.DEEPSEEK_API_KEY;
-  const keyfile = path.join(env.HOME || os.homedir(), '.deepseek-key');
-  try {
-    const key = (await readFile(keyfile, 'utf8')).trim();
-    if (key) return key;
-  } catch { /* not found */ }
-  throw Object.assign(new ProviderError('DEEPSEEK_API_KEY not set and ~/.deepseek-key not found', 'AUTH_FAILURE'), { code: 'AUTH_FAILURE' });
+  if (env.HOME) {
+    const keyfile = path.join(env.HOME, '.deepseek-key');
+    try {
+      const key = (await readFile(keyfile, 'utf8')).trim();
+      if (key) return key;
+    } catch { /* not found */ }
+  }
+  throw Object.assign(new ProviderError('DEEPSEEK_API_KEY not set and $HOME/.deepseek-key not found (HOME is taken from the caller-supplied environment)', 'AUTH_FAILURE'), { code: 'AUTH_FAILURE' });
 }
 
 // Map ocask model IDs to DeepSeek API model IDs.

@@ -28,10 +28,11 @@ and records:
 { provider, duration_ms: 0, outcome: 'skipped', reason_code: 'NOT_CONFIGURED' }
 ```
 
-The credential check mirrors the native provider's `env.HOME || os.homedir()` resolution and
-trimmed key-file content check. Confirmed absence or empty content means unconfigured. Other
-filesystem errors do not become `NOT_CONFIGURED`; the native provider is attempted so the
-failure remains observable.
+The credential check mirrors the native provider's caller-owned `env.HOME` resolution and
+trimmed key-file content check. A missing `HOME`, confirmed file absence, or empty content
+means unconfigured. Other filesystem errors do not become `NOT_CONFIGURED`; the native
+provider is attempted so the failure remains observable. Issue #81 records why process-home
+fallback is deliberately excluded.
 
 Two cases never take this skip:
 

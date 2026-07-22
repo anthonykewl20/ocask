@@ -1,11 +1,11 @@
 // Native Qwen (Alibaba DashScope) API provider.
 // OpenAI-compatible endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-// Auth: QWEN_API_KEY env var or ~/.qwen-key file.
+// Auth: QWEN_API_KEY env var, or $HOME/.qwen-key where HOME comes from the
+// caller-supplied env (#81) — never the process home.
 // Supports both Token Plan and Pay-As-You-Go billing.
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { ProviderError, identityTransportRoute, isQwenModel } from './factory.mjs';
 
 const BASE_URL = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
@@ -15,12 +15,14 @@ const DEFAULT_MAX_TOKENS = 65536;
 // Read API key: env var > key file.
 async function resolveApiKey(env = process.env) {
   if (env.QWEN_API_KEY) return env.QWEN_API_KEY;
-  const keyfile = path.join(env.HOME || os.homedir(), '.qwen-key');
-  try {
-    const key = (await readFile(keyfile, 'utf8')).trim();
-    if (key) return key;
-  } catch { /* not found */ }
-  throw Object.assign(new ProviderError('QWEN_API_KEY not set and ~/.qwen-key not found', 'AUTH_FAILURE'), { code: 'AUTH_FAILURE' });
+  if (env.HOME) {
+    const keyfile = path.join(env.HOME, '.qwen-key');
+    try {
+      const key = (await readFile(keyfile, 'utf8')).trim();
+      if (key) return key;
+    } catch { /* not found */ }
+  }
+  throw Object.assign(new ProviderError('QWEN_API_KEY not set and $HOME/.qwen-key not found (HOME is taken from the caller-supplied environment)', 'AUTH_FAILURE'), { code: 'AUTH_FAILURE' });
 }
 
 // Map ocask model IDs to Alibaba DashScope model IDs.

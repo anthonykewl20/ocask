@@ -53,6 +53,8 @@ import {
   invokeWithFallback,
   resolveProviderChain,
 } from './providers/factory.mjs';
+import { invoke as invokeDeepSeek } from './providers/deepseek.mjs';
+import { invoke as invokeQwen } from './providers/qwen.mjs';
 import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
 const QWEN_MODEL = 'qwen3.7-plus';
@@ -1307,6 +1309,107 @@ test('default fallback skips an unconfigured native transport without invoking i
   } finally {
     globalThis.fetch = previousFetch;
     await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('caller env without HOME hides process-home key files from native providers and predictor', async t => {
+  const cases = [
+    {
+      name: 'deepseek',
+      model: DEEPSEEK_PRO_MODEL,
+      keyFile: '.deepseek-key',
+      invoke: invokeDeepSeek,
+    },
+    {
+      name: 'qwen',
+      model: QWEN_MODEL,
+      keyFile: '.qwen-key',
+      invoke: invokeQwen,
+    },
+  ];
+
+  for (const provider of cases) {
+    await t.test(provider.name, async () => {
+      const fixture = await makeFakeOpenCodeCli();
+      const processHome = path.join(fixture.root, 'process-home');
+      const env = { ...fixture.env };
+      delete env.HOME;
+      await fs.mkdir(processHome);
+      await fs.writeFile(path.join(processHome, provider.keyFile), 'test-only-hidden-key\n');
+
+      const previousHome = process.env.HOME;
+      const previousFetch = globalThis.fetch;
+      let fetchCalls = 0;
+      process.env.HOME = processHome;
+      globalThis.fetch = async () => {
+        fetchCalls++;
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            choices: [{ message: { content: '{"verdict":"APPROVED"}' } }],
+          }),
+        };
+      };
+
+      try {
+        let providerError = null;
+        try {
+          await provider.invoke({ model: provider.model, prompt: 'must remain local', env });
+        } catch (error) {
+          providerError = error;
+        }
+        const fallbackResult = await invokeWithFallback({
+          model: provider.model,
+          prompt: 'use only caller-visible credentials',
+          env,
+        });
+
+        assert.equal(providerError?.code, 'AUTH_FAILURE', 'the provider treats missing HOME as no key file');
+        assert.equal(fallbackResult.provider, 'opencode', 'the predictor reaches the same no-credential decision');
+        assert.equal(fallbackResult.attempts[0]?.reason_code, 'NOT_CONFIGURED');
+        assert.equal(fetchCalls, 0, 'neither provider nor predictor consults the process home key file');
+      } finally {
+        globalThis.fetch = previousFetch;
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        await fs.rm(fixture.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+// The API key env var is checked BEFORE HOME in both the providers and the predictor,
+// so an env carrying a key but no HOME must still authenticate. Reviewers flagged this
+// path as untested; without it the ordering could be inverted and nothing would notice.
+test('an API key in the caller env works with no HOME, at provider and predictor alike', async () => {
+  for (const { name, envName, model, keyFile } of [
+    { name: 'deepseek', envName: 'DEEPSEEK_API_KEY', model: DEEPSEEK_PRO_MODEL, keyFile: '.deepseek-key' },
+    { name: 'qwen', envName: 'QWEN_API_KEY', model: QWEN_MODEL, keyFile: '.qwen-key' },
+  ]) {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), `ocask-nohome-${name}-`));
+    try {
+      // A key file exists at the process home, and must be irrelevant: the env var wins
+      // and HOME is absent, so nothing should ever look for it.
+      await fs.writeFile(path.join(home, keyFile), 'file-key-that-must-not-be-used\n');
+      const env = { [envName]: 'env-key-value', PATH: process.env.PATH };
+      assert.equal(env.HOME, undefined, 'the caller env deliberately carries no HOME');
+
+      const chain = await invokeWithFallback({
+        model,
+        prompt: 'probe',
+        env,
+        invokeFn: async () => ({ stdout: 'ok', stderr: '', provider: name, model_used: model }),
+      }).then(r => r.attempts, () => null);
+
+      assert.ok(
+        chain === null || !chain.some(a => a.reason_code === 'NOT_CONFIGURED'),
+        `${name}: predictor must not report NOT_CONFIGURED when the env var is present`,
+      );
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
   }
 });
 
