@@ -471,11 +471,14 @@ export async function resolveSystemUnderTest(ocaskPath, { spawnImpl = spawn } = 
     ]);
     const gitCommit = commitResult.stdout.trim();
     if (commitResult.exitCode !== 0 || !gitCommit) return unresolved;
+    const gitRef = refResult.stdout.trim();
+    if (refResult.exitCode !== 0 && refResult.exitCode !== 1) return unresolved;
+    if (refResult.exitCode === 0 && !gitRef) return unresolved;
 
     return {
       path: path.relative(repositoryRoot, resolvedOcaskPath) || path.basename(resolvedOcaskPath),
-      git_ref: refResult.exitCode === 0 && refResult.stdout.trim()
-        ? refResult.stdout.trim()
+      git_ref: refResult.exitCode === 0
+        ? gitRef
         : 'HEAD (detached)',
       git_commit: gitCommit,
       dirty: statusResult.exitCode === 0 ? statusResult.stdout.trim().length > 0 : null,

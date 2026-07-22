@@ -65,3 +65,19 @@ live runner's USD ceiling.
 ## Golden fixtures
 
 `eval/golden/*.json` stores curated real-ish `ocask` outputs used by `eval/golden.test.mjs`.
+
+## Output mode, and what it does not yet give you
+
+`EVAL_OUTPUT_MODE` selects `json` (default) or `text`, and the chosen mode is recorded in any
+frozen baseline so a JSON-mode baseline can never again be mistaken for a general one.
+
+**Text mode is plumbing only until #87 lands.** The scoring path — `eval/arm.mjs` and
+`eval/metrics.mjs` — reads verdicts through `parseVerdict` in `eval/parse.mjs`, which uses an
+unanchored substring match. The product uses a whole-line rule where every occurrence must agree
+(`ocask.mjs`, `resolveTextVerdict`). Those disagree on real replies: a mid-sentence mention scores
+as a verdict here and as nothing in the product, and a contradictory pair scores as the first
+verdict here and is rejected outright by the product.
+
+So a text-mode run today would execute the right contract and then grade it by the wrong rule. The
+default stays `json` for that reason. #87 makes the harness and the product answer that question
+the same way; treat text-mode numbers as untrustworthy until it does.

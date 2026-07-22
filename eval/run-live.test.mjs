@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +36,27 @@ const CASE_RECORD = {
   ground_truth: 'buggy',
   expected: 'BLOCKED',
 };
+
+async function createGitCheckout(t) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-eval-checkout-'));
+  t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const checkoutDir = path.join(tempDir, 'checkout');
+  const ocaskPath = path.join(checkoutDir, 'ocask.mjs');
+  await fs.mkdir(checkoutDir);
+  await fs.writeFile(ocaskPath, '#!/usr/bin/env node\n', 'utf8');
+  execFileSync('git', ['init', '-b', 'test-checkout'], { cwd: checkoutDir });
+  execFileSync('git', ['add', 'ocask.mjs'], { cwd: checkoutDir });
+  execFileSync('git', [
+    '-c', 'user.name=Eval Test',
+    '-c', 'user.email=eval@example.invalid',
+    'commit', '-m', 'test fixture',
+  ], { cwd: checkoutDir });
+  const commit = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: checkoutDir,
+    encoding: 'utf8',
+  }).trim();
+  return { checkoutDir, commit, ocaskPath };
+}
 
 test('liveInvoke constructs JSON-mode arguments for every arm', async () => {
   const argCases = [
@@ -342,6 +363,23 @@ test('buildFrozenBaselinePayload emits canonical frozen schema', () => {
   assert.equal(typeof frozen.notes, 'string');
 });
 
+test('committed baseline declares JSON mode without claiming unverified git identity', async () => {
+  const frozen = JSON.parse(await fs.readFile(
+    new URL('./baseline/frozen-baseline.json', import.meta.url),
+    'utf8',
+  ));
+
+  assert.equal(frozen.output_mode, 'json');
+  assert.deepEqual(frozen.system_under_test, {
+    path: 'ocask.mjs',
+    git_ref: null,
+    git_commit: null,
+    dirty: null,
+    resolution: 'unresolved',
+    legacy_label: 'ocask.mjs@origin/main',
+  });
+});
+
 test('normal live artifact persistence cannot overwrite the frozen baseline', async (t) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-eval-artifacts-'));
   t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
@@ -368,25 +406,10 @@ test('normal live artifact persistence cannot overwrite the frozen baseline', as
 });
 
 test('opt-in baseline persistence records the invoked checkout git identity', async (t) => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-eval-checkout-'));
-  t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
-  const checkoutDir = path.join(tempDir, 'checkout');
+  const { checkoutDir, commit, ocaskPath } = await createGitCheckout(t);
   const resultsPath = path.join(checkoutDir, 'run-live-results.json');
   const frozenBaselinePath = path.join(checkoutDir, 'frozen-baseline.json');
-  await fs.mkdir(checkoutDir);
-  await fs.writeFile(path.join(checkoutDir, 'ocask.mjs'), '#!/usr/bin/env node\n', 'utf8');
-  execFileSync('git', ['init', '-b', 'test-checkout'], { cwd: checkoutDir });
-  execFileSync('git', ['add', 'ocask.mjs'], { cwd: checkoutDir });
-  execFileSync('git', [
-    '-c', 'user.name=Eval Test',
-    '-c', 'user.email=eval@example.invalid',
-    'commit', '-m', 'test fixture',
-  ], { cwd: checkoutDir });
-  const expectedCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-    cwd: checkoutDir,
-    encoding: 'utf8',
-  }).trim();
-  const systemUnderTest = await resolveSystemUnderTest(path.join(checkoutDir, 'ocask.mjs'));
+  const systemUnderTest = await resolveSystemUnderTest(ocaskPath);
 
   const result = {
     can_freeze_baseline: true,
@@ -401,7 +424,7 @@ test('opt-in baseline persistence records the invoked checkout git identity', as
   };
   const outcome = await persistLiveRunArtifacts(result, {
     env: { EVAL_FREEZE_BASELINE: 'true' },
-    ocaskPath: path.join(checkoutDir, 'ocask.mjs'),
+    ocaskPath,
     resultsPath,
     frozenBaselinePath,
     capUsd: 1,
@@ -413,12 +436,83 @@ test('opt-in baseline persistence records the invoked checkout git identity', as
   assert.deepEqual(systemUnderTest, {
     path: 'ocask.mjs',
     git_ref: 'test-checkout',
-    git_commit: expectedCommit,
+    git_commit: commit,
     dirty: false,
     resolution: 'resolved',
   });
   assert.deepEqual(frozen.system_under_test, systemUnderTest);
   assert.equal(frozen.output_mode, 'json');
+});
+
+test('system-under-test identity records a dirty checkout', async (t) => {
+  const { checkoutDir, commit, ocaskPath } = await createGitCheckout(t);
+  await fs.appendFile(ocaskPath, '// dirty\n', 'utf8');
+
+  const identity = await resolveSystemUnderTest(ocaskPath);
+
+  assert.deepEqual(identity, {
+    path: 'ocask.mjs',
+    git_ref: 'test-checkout',
+    git_commit: commit,
+    dirty: true,
+    resolution: 'resolved',
+  });
+  assert.equal(execFileSync('git', ['status', '--porcelain'], {
+    cwd: checkoutDir,
+    encoding: 'utf8',
+  }).trim().length > 0, true);
+});
+
+test('system-under-test identity reports a genuinely detached HEAD', async (t) => {
+  const { checkoutDir, commit, ocaskPath } = await createGitCheckout(t);
+  execFileSync('git', ['checkout', '--detach', commit], {
+    cwd: checkoutDir,
+    stdio: 'ignore',
+  });
+
+  const identity = await resolveSystemUnderTest(ocaskPath);
+
+  assert.deepEqual(identity, {
+    path: 'ocask.mjs',
+    git_ref: 'HEAD (detached)',
+    git_commit: commit,
+    dirty: false,
+    resolution: 'resolved',
+  });
+  assert.equal(spawnSync('git', ['symbolic-ref', '-q', '--short', 'HEAD'], {
+    cwd: checkoutDir,
+    encoding: 'utf8',
+  }).status, 1);
+});
+
+test('system-under-test identity does not call a symbolic-ref error detached', async (t) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-eval-ref-error-'));
+  t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const ocaskPath = path.join(tempDir, 'ocask.mjs');
+  await fs.writeFile(ocaskPath, '#!/usr/bin/env node\n', 'utf8');
+  const spawnImpl = (_command, args) => {
+    if (args.includes('--show-toplevel')) {
+      return { stdout: `${tempDir}\n`, exitCode: 0 };
+    }
+    if (args.includes('symbolic-ref')) {
+      return { stderr: 'fatal: ref storage failure\n', exitCode: 128 };
+    }
+    if (args.includes('status')) {
+      return { stdout: '', exitCode: 0 };
+    }
+    return { stdout: 'abc123\n', exitCode: 0 };
+  };
+
+  const identity = await resolveSystemUnderTest(ocaskPath, { spawnImpl });
+
+  assert.deepEqual(identity, {
+    path: ocaskPath,
+    git_ref: null,
+    git_commit: null,
+    dirty: null,
+    resolution: 'unresolved',
+  });
+  assert.notEqual(identity.git_ref, 'HEAD (detached)');
 });
 
 test('executeLiveRun captures checkout identity before measurement and carries it to persistence', async () => {

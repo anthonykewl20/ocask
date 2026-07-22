@@ -1,7 +1,15 @@
 {
   "frozen_at": "2026-07-19",
   "phase": "T08",
-  "system_under_test": "ocask.mjs@origin/main",
+  "system_under_test": {
+    "path": "ocask.mjs",
+    "git_ref": null,
+    "git_commit": null,
+    "dirty": null,
+    "resolution": "unresolved",
+    "legacy_label": "ocask.mjs@origin/main"
+  },
+  "output_mode": "json",
   "run": {
     "cases": 20,
     "arms": [
