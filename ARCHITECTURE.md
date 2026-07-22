@@ -182,10 +182,22 @@ plain delegation stays capped at 300000ms. A timed-out run records
 
 ### 6. Output Validation (`ocask.mjs` — `validateAssistantOutput`)
 
-- Text + verdict: exactly one `VERDICT: APPROVED|WARNING|BLOCKED` line
-  within first 5 nonempty lines + alphabetic rationale
+- Text + verdict: one or more explicit `VERDICT: APPROVED|WARNING|BLOCKED`
+  lines anywhere in the response + alphabetic rationale. Repeated verdicts must
+  agree, except that any `BLOCKED` candidate resolves to `BLOCKED` before the
+  agreement check so a safety finding cannot be outvoted.
 - JSON + verdict: `{ verdict, reason|reasoning|summary }` single object
 - All modes: must contain alphabetic content (not numbers-only)
+
+The text rule deliberately ignores verdict placement because placement carries
+no review-quality signal. The measured log held 944 `MODEL_OUTPUT` records. The
+reported breakdown accounted for 942 of them: 343 were rejected for not
+containing exactly one verdict line, 21 because the verdict appeared after the
+fifth nonempty line, 537 were JSON parse failures, and 41 had no message. On
+2026-07-20 through 2026-07-22, every field `MODEL_OUTPUT` was one of the two
+cosmetic text-verdict rejections. Accepting consistent repetitions and verdicts
+at any line preserves completed reviews while missing verdicts, conflicting
+non-`BLOCKED` verdicts, and reviews without prose still fail closed.
 
 ### 7. Observability (`logging.mjs`)
 
@@ -251,7 +263,8 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 - Truncated JSON → `MALFORMED_RESPONSE`. NOT retryable (double-fire risk).
 
 ### Response Quality
-- Empty, numbers-only, missing verdict, verdict too late, unparseable JSON →
+- Empty, numbers-only, missing verdict, conflicting non-`BLOCKED` verdicts,
+  rationale-free reviews, unparseable JSON →
   `MODEL_OUTPUT`. Eligible for opposite-family model retry.
 
 ### Log Integrity

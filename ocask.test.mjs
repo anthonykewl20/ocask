@@ -582,7 +582,8 @@ test('prompt with system, context, verdict, and maxTokens', () => {
   assert.match(prompt, /## CONTEXT/);
   assert.match(prompt, /analytical review/);
   assert.match(prompt, /Think step by step/);
-  assert.match(prompt, /Near the top/);
+  assert.match(prompt, /exactly one line containing/);
+  assert.doesNotMatch(prompt, /Near the top/);
   assert.match(prompt, /review-only task/);
   assert.match(prompt, /approximately 800 tokens/);
 });
@@ -659,15 +660,73 @@ test('promptHash never contains prompt text — it is a pure hex digest', () => 
 });
 
 // ── Output validation ──
-test('verdict accepts APPROVED, WARNING, BLOCKED', () => {
-  validateAssistantOutput('VERDICT: APPROVED\n\nRationale: correct.', { requireVerdict: true });
-  validateAssistantOutput('VERDICT: WARNING\n\nRationale: issue found.', { requireVerdict: true });
-  validateAssistantOutput('VERDICT: BLOCKED\n\nRationale: must fix.', { requireVerdict: true });
-});
+test('text verdict contract accepts usable reviews and keeps fail-closed floors', async t => {
+  const logDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-verdict-log-'));
+  const previousXdg = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = logDir;
+  try {
+    await t.test('accepts APPROVED, WARNING, and BLOCKED', () => {
+      validateAssistantOutput('VERDICT: APPROVED\n\nRationale: correct.', { requireVerdict: true });
+      validateAssistantOutput('VERDICT: WARNING\n\nRationale: issue found.', { requireVerdict: true });
+      validateAssistantOutput('VERDICT: BLOCKED\n\nRationale: must fix.', { requireVerdict: true });
+    });
 
-test('missing verdict or rationale errors', () => {
-  assert.throws(() => validateAssistantOutput('Just text', { requireVerdict: true }), /explicit/);
-  assert.throws(() => validateAssistantOutput('VERDICT: APPROVED', { requireVerdict: true }), /rationale/);
+    await t.test('accepts a verdict below the fifth nonempty line', () => {
+      const review = [
+        'Review summary follows.',
+        'Correctness was checked.',
+        'Security was checked.',
+        'Tests were checked.',
+        'Compatibility was checked.',
+        'Documentation was checked.',
+        'VERDICT: APPROVED',
+      ].join('\n');
+      const output = validateAssistantOutput(review, { requireVerdict: true });
+      assert.equal(extractVerdict(output), 'APPROVED');
+    });
+
+    await t.test('accepts repeated agreeing verdicts and extracts their verdict', () => {
+      const review = 'VERDICT: APPROVED\n\nThe implementation satisfies the contract.\n\nVERDICT: APPROVED';
+      const output = validateAssistantOutput(review, { requireVerdict: true });
+      assert.equal(extractVerdict(output), 'APPROVED');
+    });
+
+    await t.test('a BLOCKED candidate cannot be outvoted by another verdict', () => {
+      const review = 'VERDICT: APPROVED\n\nMost checks passed, but one safety issue remains.\n\nVERDICT: BLOCKED';
+      const output = validateAssistantOutput(review, { requireVerdict: true });
+      assert.equal(extractVerdict(output), 'BLOCKED');
+    });
+
+    await t.test('rejects disagreeing non-BLOCKED candidates as MODEL_OUTPUT', () => {
+      const review = 'VERDICT: APPROVED\n\nThe evidence is internally inconsistent.\n\nVERDICT: WARNING';
+      assert.throws(
+        () => validateAssistantOutput(review, { requireVerdict: true }),
+        error => error?.code === 'MODEL_OUTPUT',
+      );
+    });
+
+    await t.test('rejects a reply with no verdict as MODEL_OUTPUT', () => {
+      assert.throws(
+        () => validateAssistantOutput('Just text', { requireVerdict: true }),
+        error => error?.code === 'MODEL_OUTPUT',
+      );
+    });
+
+    await t.test('rejects a bare verdict without rationale as MODEL_OUTPUT', () => {
+      assert.throws(
+        () => validateAssistantOutput('VERDICT: APPROVED', { requireVerdict: true }),
+        error => error?.code === 'MODEL_OUTPUT',
+      );
+      assert.throws(
+        () => validateAssistantOutput('VERDICT: APPROVED\nVERDICT: APPROVED', { requireVerdict: true }),
+        error => error?.code === 'MODEL_OUTPUT',
+      );
+    });
+  } finally {
+    if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousXdg;
+    await fs.rm(logDir, { recursive: true, force: true });
+  }
 });
 
 test('JSON verdict contract', () => {
