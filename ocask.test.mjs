@@ -108,8 +108,9 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
   } else {
     process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'BLOCKED', reason:'Recovered on same-model retry.'})}}) + '\\n');
   }
-} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'cross' && route.startsWith('deepseek/')) {
-  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:'VERDICT: APPROVED\\n\\nRationale: buddy concurs.'}}) + '\\n');
+} else if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('cross-') && route.startsWith('deepseek/')) {
+  const verdict = process.env.OCASK_TEST_OPENCODE_MODE.slice('cross-'.length).toUpperCase();
+  process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:'VERDICT: ' + verdict + '\\n\\nRationale: independent buddy review.'}}) + '\\n');
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'blocked') {
   process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'BLOCKED', reason:'Controlled blocking finding.'})}}) + '\\n');
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'failure') {
@@ -791,7 +792,12 @@ test('prompt with system, context, verdict, and maxTokens', () => {
   assert.match(prompt, /## CONTEXT/);
   assert.match(prompt, /analytical review/);
   assert.match(prompt, /Think step by step/);
-  assert.match(prompt, /Near the top/);
+  assert.match(prompt, /a line containing/);
+  // The validator accepts repeated agreeing verdict lines, so the contract must not
+  // demand "exactly one" — and it must not demand a position either.
+  assert.doesNotMatch(prompt, /exactly one line containing/);
+  assert.match(prompt, /every occurrence must give the same verdict/);
+  assert.doesNotMatch(prompt, /Near the top/);
   assert.match(prompt, /review-only task/);
   assert.match(prompt, /approximately 800 tokens/);
 });
@@ -868,15 +874,66 @@ test('promptHash never contains prompt text — it is a pure hex digest', () => 
 });
 
 // ── Output validation ──
-test('verdict accepts APPROVED, WARNING, BLOCKED', () => {
-  validateAssistantOutput('VERDICT: APPROVED\n\nRationale: correct.', { requireVerdict: true });
-  validateAssistantOutput('VERDICT: WARNING\n\nRationale: issue found.', { requireVerdict: true });
-  validateAssistantOutput('VERDICT: BLOCKED\n\nRationale: must fix.', { requireVerdict: true });
-});
+test('text verdict contract accepts usable reviews and keeps fail-closed floors', async t => {
+  await t.test('accepts APPROVED, WARNING, and BLOCKED', () => {
+    validateAssistantOutput('VERDICT: APPROVED\n\nRationale: correct.', { requireVerdict: true });
+    validateAssistantOutput('VERDICT: WARNING\n\nRationale: issue found.', { requireVerdict: true });
+    validateAssistantOutput('VERDICT: BLOCKED\n\nRationale: must fix.', { requireVerdict: true });
+  });
 
-test('missing verdict or rationale errors', () => {
-  assert.throws(() => validateAssistantOutput('Just text', { requireVerdict: true }), /explicit/);
-  assert.throws(() => validateAssistantOutput('VERDICT: APPROVED', { requireVerdict: true }), /rationale/);
+  await t.test('accepts a verdict below the fifth nonempty line', () => {
+    const review = [
+      'Review summary follows.',
+      'Correctness was checked.',
+      'Security was checked.',
+      'Tests were checked.',
+      'Compatibility was checked.',
+      'Documentation was checked.',
+      'VERDICT: APPROVED',
+    ].join('\n');
+    const output = validateAssistantOutput(review, { requireVerdict: true });
+    assert.equal(extractVerdict(output), 'APPROVED');
+  });
+
+  await t.test('accepts repeated agreeing verdicts and extracts their verdict', () => {
+    const review = 'VERDICT: APPROVED\n\nThe implementation satisfies the contract.\n\nVERDICT: APPROVED';
+    const output = validateAssistantOutput(review, { requireVerdict: true });
+    assert.equal(extractVerdict(output), 'APPROVED');
+  });
+
+  await t.test('rejects conflicts involving BLOCKED as MODEL_OUTPUT', () => {
+    const review = 'VERDICT: APPROVED\n\nMost checks passed, but one safety issue remains.\n\nVERDICT: BLOCKED';
+    assert.throws(
+      () => validateAssistantOutput(review, { requireVerdict: true }),
+      error => error?.code === 'MODEL_OUTPUT',
+    );
+  });
+
+  await t.test('rejects disagreeing non-BLOCKED candidates as MODEL_OUTPUT', () => {
+    const review = 'VERDICT: APPROVED\n\nThe evidence is internally inconsistent.\n\nVERDICT: WARNING';
+    assert.throws(
+      () => validateAssistantOutput(review, { requireVerdict: true }),
+      error => error?.code === 'MODEL_OUTPUT',
+    );
+  });
+
+  await t.test('rejects a reply with no verdict as MODEL_OUTPUT', () => {
+    assert.throws(
+      () => validateAssistantOutput('Just text', { requireVerdict: true }),
+      error => error?.code === 'MODEL_OUTPUT',
+    );
+  });
+
+  await t.test('rejects a bare verdict without rationale as MODEL_OUTPUT', () => {
+    assert.throws(
+      () => validateAssistantOutput('VERDICT: APPROVED', { requireVerdict: true }),
+      error => error?.code === 'MODEL_OUTPUT',
+    );
+    assert.throws(
+      () => validateAssistantOutput('VERDICT: APPROVED\nVERDICT: APPROVED', { requireVerdict: true }),
+      error => error?.code === 'MODEL_OUTPUT',
+    );
+  });
 });
 
 test('JSON verdict contract', () => {
@@ -1649,6 +1706,10 @@ test('extractVerdict reads prose VERDICT lines and JSON object .verdict', () => 
   assert.equal(extractVerdict('VERDICT: APPROVED\n\nok'), 'APPROVED');
   assert.equal(extractVerdict('VERDICT: WARNING'), 'WARNING');
   assert.equal(extractVerdict('VERDICT: BLOCKED.'), 'BLOCKED');
+  assert.equal(extractVerdict('The reviewer wrote VERDICT: BLOCKED mid-sentence.'), null);
+  assert.equal(extractVerdict('VERDICT: APPROVED\nReasoning.\nVERDICT: APPROVED'), 'APPROVED');
+  assert.equal(extractVerdict('VERDICT: APPROVED\nReasoning.\nVERDICT: WARNING'), null);
+  assert.equal(extractVerdict('VERDICT: APPROVED\nReasoning.\nVERDICT: BLOCKED'), null);
   assert.equal(extractVerdict('no verdict here'), null);
   assert.equal(extractVerdict(''), null);
   // jsonMode object form
@@ -2022,7 +2083,7 @@ test('installed-symlink CLI: --panel timeout shares one wall-clock and returns q
 });
 
 test('installed-symlink CLI: existing --cross-verify buddy path remains operational', async () => {
-  const fixture = await makeFakeOpenCodeCli('cross');
+  const fixture = await makeFakeOpenCodeCli('cross-approved');
   try {
     const run = spawnSync(process.execPath, [fixture.ocaskPath,
       '--model', QWEN_MODEL,
@@ -2041,6 +2102,28 @@ test('installed-symlink CLI: existing --cross-verify buddy path remains operatio
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
 });
+
+for (const buddyVerdict of ['BLOCKED', 'WARNING']) {
+  test(`installed-symlink CLI: --cross-verify preserves synthesized WARNING for APPROVED/${buddyVerdict} disagreement`, async () => {
+    const fixture = await makeFakeOpenCodeCli(`cross-${buddyVerdict.toLowerCase()}`);
+    try {
+      const run = spawnSync(process.execPath, [fixture.ocaskPath,
+        '--model', QWEN_MODEL,
+        '--task', 'Return an approved verdict.',
+        '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
+      ], { encoding: 'utf8', env: fixture.env });
+      assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+      const response = JSON.parse(run.stdout);
+      assert.equal(response.verdict, 'WARNING');
+      assert.match(response.output, /^VERDICT: WARNING$/m);
+      assert.match(response.output, /BUDDIES DISAGREE/);
+      assert.ok(response.output.includes(`${QWEN_MODEL} (primary): APPROVED`));
+      assert.ok(response.output.includes(`${DEEPSEEK_PRO_MODEL} (buddy): ${buddyVerdict}`));
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('post-invocation validation failure retains the actual provider attribution', async () => {
   await assert.rejects(

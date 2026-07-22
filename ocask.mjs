@@ -281,7 +281,7 @@ export function buildPrompt({ taskText, systemText = '', contextText = '', jsonM
     contract.push('Return exactly one JSON object and no Markdown fence or surrounding text.', 'Include meaningful alphabetic content.');
   } else if (requireVerdict) {
     const rationale = lens !== 'general' ? 'Provide a separate alphabetic prose rationale organized by the audit dimensions above.' : 'Provide a separate alphabetic prose rationale.';
-    contract.push('Near the top, include exactly one line containing: VERDICT: APPROVED, VERDICT: WARNING, or VERDICT: BLOCKED.', rationale,
+    contract.push('Include a line containing: VERDICT: APPROVED, VERDICT: WARNING, or VERDICT: BLOCKED. If you state it more than once, every occurrence must give the same verdict.', rationale,
       'WARNING and BLOCKED are valid review outcomes; choose the verdict that the evidence supports.',
       'This is a review-only task: do not modify files or external state. Read-only inspection and non-mutating verification tools remain available.');
   } else {
@@ -414,6 +414,18 @@ export function extractJsonObject(raw) {
   return parsed;
 }
 
+function resolveTextVerdict(text) {
+  const nonemptyLines = text.split(/\r?\n/).filter(line => line.trim());
+  const candidates = nonemptyLines.map((line, index) => {
+    const canonical = line.trim().replace(/^#{1,6}\s+/, '').replace(/^[-+*]\s+/, '').replace(/[\*_`]/g, '').trim();
+    const match = /^VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)\s*[.!]?$/i.exec(canonical);
+    return match ? { index, verdict: match[1].toUpperCase() } : null;
+  }).filter(Boolean);
+
+  const verdicts = new Set(candidates.map(candidate => candidate.verdict));
+  return { nonemptyLines, candidates, verdict: verdicts.size === 1 ? candidates[0].verdict : null };
+}
+
 export function validateAssistantOutput(raw, { jsonMode = false, requireVerdict = false } = {}) {
   if (typeof raw !== 'string' || !raw.trim()) throw makeError('Output is empty', 'MODEL_OUTPUT');
   const trimmed = raw.trim();
@@ -429,39 +441,41 @@ export function validateAssistantOutput(raw, { jsonMode = false, requireVerdict 
   }
   if (!hasLetter(trimmed)) throw makeError('Output must contain alphabetic content', 'MODEL_OUTPUT');
   if (requireVerdict) {
-    const nonemptyLines = trimmed.split(/\r?\n/).filter(l => l.trim());
-    const candidates = nonemptyLines.map((line, index) => {
-      const canonical = line.trim().replace(/^#{1,6}\s+/, '').replace(/^[-+*]\s+/, '').replace(/[\*_`]/g, '').trim();
-      const match = /^VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)\s*[.!]?$/i.exec(canonical);
-      return match ? { index, verdict: match[1].toUpperCase() } : null;
-    }).filter(Boolean);
-    if (candidates.length !== 1) throw makeError('Review must contain exactly one explicit VERDICT line', 'MODEL_OUTPUT');
-    if (candidates[0].index >= 5) throw makeError('VERDICT line must appear within first five nonempty lines', 'MODEL_OUTPUT');
-    const rationale = nonemptyLines.filter((_, i) => i !== candidates[0].index).join('\n');
+    const { nonemptyLines, candidates, verdict } = resolveTextVerdict(trimmed);
+    if (candidates.length === 0) throw makeError('Review must contain an explicit VERDICT line', 'MODEL_OUTPUT');
+    if (!verdict) throw makeError('Review contains conflicting explicit VERDICT lines', 'MODEL_OUTPUT');
+    // Verdict placement carries no information about review quality. Enforcing
+    // a line index rejected real reviews for a cosmetic reason.
+    const candidateIndexes = new Set(candidates.map(candidate => candidate.index));
+    const rationale = nonemptyLines.filter((_, index) => !candidateIndexes.has(index)).join('\n');
     if (!hasLetter(rationale)) throw makeError('Review must include alphabetic prose rationale', 'MODEL_OUTPUT');
   }
   return trimmed;
 }
 
 // ── VERDICT EXTRACTION ──
-// Pull an APPROVED/WARNING/BLOCKED verdict out of model output. Handles BOTH the
-// prose `VERDICT: <X>` line (text mode) and a JSON object's `.verdict` field
+// Pull an APPROVED/WARNING/BLOCKED verdict out of model output. Handles BOTH a
+// standalone `VERDICT: <X>` line (text mode) and a JSON object's `.verdict` field
 // (jsonMode), so a verdict reached via either response contract is first-class.
-// Returns null when no verdict is present (e.g. freeform analysis).
+// Text mode matches a WHOLE LINE, not a mention embedded in a sentence: a verdict
+// quoted mid-prose is not a judgment, and matching it would let nested reviews
+// outvote a caller's own synthesized verdict.
+// Returns null when no verdict is present (e.g. freeform analysis), and when
+// several standalone verdict lines disagree.
 export function extractVerdict(output) {
   if (output && typeof output === 'object' && !Array.isArray(output)) {
     const v = typeof output.verdict === 'string' ? output.verdict.trim() : '';
     return /^(APPROVED|WARNING|BLOCKED)$/i.test(v) ? v.toUpperCase() : null;
   }
   const text = typeof output === 'string' ? output : '';
-  return (text.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase() || null;
+  return resolveTextVerdict(text).verdict;
 }
 
-// Attach the four-way contract fields to a runAsk success envelope. The verdict is
-// derived from the ACTUAL output being returned so it can never drift from what the
-// caller observes; the classification is the judgment taxonomy for that verdict.
-function withContract(envelope) {
-  const verdict = extractVerdict(envelope.output);
+// Attach the four-way contract fields to a runAsk success envelope. A caller that
+// synthesizes output from nested reviews carries its authoritative verdict here;
+// ordinary output derives the verdict from the text returned to the caller.
+function withContract(envelope, explicitVerdict) {
+  const verdict = explicitVerdict === undefined ? extractVerdict(envelope.output) : explicitVerdict;
   return { ...envelope, verdict, classification: verdict ? classifyFailure(null, { verdict }) : null };
 }
 
@@ -922,7 +936,7 @@ export async function runAsk({
       const buddyRaw = buddyResult.commandOutput || parseOpenCodeJsonl(buddyResult.stdout);
       const buddyOut = validateAssistantOutput(buddyRaw, { requireVerdict: true });
       const buddyOutput = typeof buddyOut === 'string' ? buddyOut : JSON.stringify(buddyOut);
-      const buddyVerdict = (buddyOutput.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i) || [])[1]?.toUpperCase();
+      const buddyVerdict = extractVerdict(buddyOut);
 
       await logAttemptResult({
         provider: buddyResult.provider || 'unknown', model: buddyModel, attemptIndex: attemptIndex++,
@@ -956,7 +970,7 @@ export async function runAsk({
             `${buddyModel} (buddy): ${buddyVerdict}`,
             buddyOutput.slice(0, 400),
           ].join('\n');
-          return withContract({ ...result, output: combinedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: false } });
+          return withContract({ ...result, output: combinedOutput, metadata, run_id: runId, cross_verify: { primary: { model: result.model, verdict: primaryVerdict }, buddy: { model: buddyModel, verdict: buddyVerdict }, agreement: false } }, 'WARNING');
         }
 
         // Agreement — note buddy concurrence
