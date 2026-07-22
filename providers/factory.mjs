@@ -4,6 +4,10 @@
 //     → { stdout, stderr, provider, model_used }
 //   throws ProviderError with .code
 
+import { readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 // ── ProviderError ──
 export class ProviderError extends Error {
   constructor(message, code) {
@@ -203,6 +207,28 @@ const RETRYABLE_CODES = new Set([
   'CONNECTION_ERROR', 'MODEL_NOT_FOUND',
 ]);
 
+async function hasProviderCredentials(provider, env) {
+  const credential = provider === 'deepseek'
+    ? { envName: 'DEEPSEEK_API_KEY', filename: '.deepseek-key' }
+    : provider === 'qwen'
+      ? { envName: 'QWEN_API_KEY', filename: '.qwen-key' }
+      : null;
+  if (!credential) return true;
+  if (env[credential.envName]) return true;
+
+  // Keep this invocation-local instead of exporting system.mjs's doctor helper:
+  // fallback receives a caller-owned env, while doctor intentionally inspects process.env.
+  // Mirror the native providers' HOME fallback exactly; divergence could skip a
+  // transport that the provider itself would authenticate successfully.
+  try {
+    return Boolean((await readFile(path.join(env.HOME || os.homedir(), credential.filename), 'utf8')).trim());
+  } catch (error) {
+    // Only confirmed absence means not configured. Let the provider attempt
+    // other filesystem failures so they remain observable as real failures.
+    return error?.code !== 'ENOENT';
+  }
+}
+
 // ── Invocation with fallback ──
 export async function invokeWithFallback({
   model,
@@ -224,7 +250,7 @@ export async function invokeWithFallback({
   let lastError = null;
   const attempts = [];
 
-  for (const providerId of fallbackProviders) {
+  for (const [providerIndex, providerId] of fallbackProviders.entries()) {
     let invoke;
     try {
       invoke = await _loadProvider(providerId);
@@ -232,6 +258,12 @@ export async function invokeWithFallback({
       const e = Object.assign(new ProviderError(`Provider ${providerId} unavailable: ${err.message}`, 'PROVIDER_UNAVAILABLE'), { provider: providerId });
       attempts.push({ provider: providerId, duration_ms: 0, outcome: 'skipped', reason_code: 'PROVIDER_UNAVAILABLE' });
       lastError = e;
+      continue;
+    }
+
+    const hasLaterProvider = providerIndex < fallbackProviders.length - 1;
+    if (!preferredProvider && hasLaterProvider && !await hasProviderCredentials(providerId, env)) {
+      attempts.push({ provider: providerId, duration_ms: 0, outcome: 'skipped', reason_code: 'NOT_CONFIGURED' });
       continue;
     }
 
@@ -253,9 +285,14 @@ export async function invokeWithFallback({
     }
   }
 
+  const namedProviders = attempts
+    .filter(attempt => attempt.outcome !== 'skipped' || attempt.reason_code !== 'NOT_CONFIGURED')
+    .map(attempt => attempt.provider);
+  // Each lastError assignment follows a non-NOT_CONFIGURED attempt record, so
+  // the displayed provider list is non-empty whenever a real cause exists.
   if (lastError) {
     throw Object.assign(
-      new ProviderError(`All providers exhausted (${attempts.map(a => a.provider).join(', ')}); last: ${lastError.message}`, 'ALL_PROVIDERS_EXHAUSTED'),
+      new ProviderError(`All providers exhausted (${namedProviders.join(', ')}); last: ${lastError.message}`, 'ALL_PROVIDERS_EXHAUSTED'),
       { attempts, cause: lastError }
     );
   }

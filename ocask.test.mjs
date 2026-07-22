@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import {
   buildPrompt,
@@ -1226,6 +1226,184 @@ test('unlisted transport under the identity pin fails our-side without invocatio
     }),
     error => error.code === 'NO_PROVIDER',
   );
+});
+
+test('default fallback skips an unconfigured native transport without invoking it', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetchCalls++; throw new Error('DeepSeek invoke must not reach fetch'); };
+  try {
+    const result = await invokeWithFallback({
+      model: DEEPSEEK_PRO_MODEL,
+      prompt: 'use the configured fallback',
+      env: fixture.env,
+    });
+    assert.equal(result.provider, 'opencode');
+    assert.deepEqual(result.attempts, [{
+      provider: 'deepseek',
+      duration_ms: 0,
+      outcome: 'skipped',
+      reason_code: 'NOT_CONFIGURED',
+    }]);
+    assert.equal(fetchCalls, 0, 'the unconfigured DeepSeek transport was never invoked');
+  } finally {
+    globalThis.fetch = previousFetch;
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('qwen key-file credentials keep the native transport in the fallback chain', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  await fs.writeFile(path.join(fixture.env.HOME, '.qwen-key'), 'test-only-qwen-key\n');
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        model: 'qwen-plus',
+        choices: [{ message: { content: '{"verdict":"APPROVED"}' } }],
+      }),
+    };
+  };
+  try {
+    const result = await invokeWithFallback({
+      model: QWEN_MODEL,
+      prompt: 'use the configured native transport',
+      env: fixture.env,
+    });
+    assert.equal(result.provider, 'qwen');
+    assert.deepEqual(result.attempts, []);
+    assert.equal(fetchCalls, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a whitespace-only key file is treated as not configured', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  await fs.writeFile(path.join(fixture.env.HOME, '.deepseek-key'), ' \n\t');
+  globalThis.fetch = async () => { fetchCalls++; throw new Error('DeepSeek invoke must not reach fetch'); };
+  try {
+    const result = await invokeWithFallback({
+      model: DEEPSEEK_PRO_MODEL,
+      prompt: 'skip the blank credential',
+      env: fixture.env,
+    });
+    assert.equal(result.provider, 'opencode');
+    assert.equal(result.attempts[0]?.reason_code, 'NOT_CONFIGURED');
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = previousFetch;
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('credential file I/O errors are attempted rather than marked not configured', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  await fs.mkdir(path.join(fixture.env.HOME, '.deepseek-key'));
+  try {
+    const result = await invokeWithFallback({
+      model: DEEPSEEK_PRO_MODEL,
+      prompt: 'preserve the credential read failure',
+      env: fixture.env,
+    });
+    assert.equal(result.provider, 'opencode');
+    assert.equal(result.attempts[0]?.outcome, 'failed');
+    assert.equal(result.attempts[0]?.reason_code, 'AUTH_FAILURE');
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('an unconfigured transport is still attempted when skipping would empty the chain', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'retain one transport',
+        chain: { deepseek: ['deepseek'] },
+        env: fixture.env,
+      }),
+      error => error.code === 'ALL_PROVIDERS_EXHAUSTED'
+        && error.cause?.code === 'AUTH_FAILURE'
+        && error.attempts?.[0]?.outcome === 'failed',
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('provider exhaustion names only transports that genuinely attempted invocation', async () => {
+  const fixture = await makeFakeOpenCodeCli('failure');
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'force exhaustion',
+        env: fixture.env,
+      }),
+      error => {
+        assert.equal(error.code, 'ALL_PROVIDERS_EXHAUSTED');
+        assert.match(error.message, /opencode/);
+        assert.doesNotMatch(error.message, /deepseek/);
+        assert.deepEqual(error.attempts.map(({ provider, outcome, reason_code }) => ({ provider, outcome, reason_code })), [
+          { provider: 'deepseek', outcome: 'skipped', reason_code: 'NOT_CONFIGURED' },
+          { provider: 'opencode', outcome: 'failed', reason_code: 'PROVIDER_ERROR' },
+        ]);
+        return true;
+      },
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('a load failure after an unconfigured skip preserves its cause and attempts', async () => {
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-provider-load-'));
+  const providersDir = path.join(fixture, 'providers');
+  const homeDir = path.join(fixture, 'home');
+  try {
+    await fs.mkdir(providersDir);
+    await fs.mkdir(homeDir);
+    await fs.copyFile(fileURLToPath(new URL('providers/factory.mjs', import.meta.url)), path.join(providersDir, 'factory.mjs'));
+    await fs.copyFile(fileURLToPath(new URL('providers/deepseek.mjs', import.meta.url)), path.join(providersDir, 'deepseek.mjs'));
+    const isolatedFactory = await import(pathToFileURL(path.join(providersDir, 'factory.mjs')).href);
+
+    await assert.rejects(
+      isolatedFactory.invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'preserve the provider load failure',
+        chain: { deepseek: ['deepseek', 'opencode'] },
+        env: {
+          HOME: homeDir,
+          XDG_DATA_HOME: path.join(fixture, 'data'),
+          DEEPSEEK_API_KEY: '',
+        },
+      }),
+      error => {
+        assert.equal(error.code, 'ALL_PROVIDERS_EXHAUSTED');
+        assert.equal(error.cause?.code, 'PROVIDER_UNAVAILABLE');
+        assert.deepEqual(error.attempts.map(({ provider, outcome, reason_code }) => ({ provider, outcome, reason_code })), [
+          { provider: 'deepseek', outcome: 'skipped', reason_code: 'NOT_CONFIGURED' },
+          { provider: 'opencode', outcome: 'skipped', reason_code: 'PROVIDER_UNAVAILABLE' },
+        ]);
+        assert.match(error.message, /opencode/);
+        assert.doesNotMatch(error.message, /deepseek/);
+        return true;
+      },
+    );
+  } finally {
+    await fs.rm(fixture, { recursive: true, force: true });
+  }
 });
 
 // install.sh installs the CLI as a symlink, so argv[1] is the link path while
