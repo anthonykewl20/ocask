@@ -929,13 +929,55 @@ test('text verdict contract accepts usable reviews and keeps fail-closed floors'
   await t.test('rejects a bare verdict without rationale as MODEL_OUTPUT', () => {
     assert.throws(
       () => validateAssistantOutput('VERDICT: APPROVED', { requireVerdict: true }),
-      error => error?.code === 'MODEL_OUTPUT',
+      error => error?.code === 'MODEL_OUTPUT'
+        && error.message === 'Review must include Unicode letter content outside recognized explicit VERDICT lines',
     );
     assert.throws(
       () => validateAssistantOutput('VERDICT: APPROVED\nVERDICT: APPROVED', { requireVerdict: true }),
       error => error?.code === 'MODEL_OUTPUT',
     );
   });
+});
+
+test('issue #83 probe records the text floor without claiming semantic detection', () => {
+  const cases = [
+    { input: 'bare verdict', content: '', shouldAccept: false, acceptedNow: false },
+    { input: 'Rationale:', content: 'Rationale:', shouldAccept: false, acceptedNow: true },
+    { input: 'Review summary:', content: 'Review summary:', shouldAccept: false, acceptedNow: true },
+    { input: '**Review summary:**', content: '**Review summary:**', shouldAccept: false, acceptedNow: true },
+    { input: 'Detailed findings from my review:', content: 'Detailed findings from my review:', shouldAccept: false, acceptedNow: true },
+    { input: 'x', content: 'x', shouldAccept: false, acceptedNow: true },
+    { input: 'OK.', content: 'OK.', shouldAccept: true, acceptedNow: true },
+    { input: 'Correct.', content: 'Correct.', shouldAccept: true, acceptedNow: true },
+    { input: '問題ありません。', content: '問題ありません。', shouldAccept: true, acceptedNow: true },
+    { input: '没有问题。', content: '没有问题。', shouldAccept: true, acceptedNow: true },
+    { input: 'Well-written.', content: 'Well-written.', shouldAccept: true, acceptedNow: true },
+    { input: 'No issues found.', content: 'No issues found.', shouldAccept: true, acceptedNow: true },
+    { input: 'Required key is `version:`', content: 'Required key is `version:`', shouldAccept: true, acceptedNow: true },
+    { input: 'The generated YAML correctly includes the required key: version:', content: 'The generated YAML correctly includes the required key: version:', shouldAccept: true, acceptedNow: true },
+    { input: 'heading followed by real content', content: 'Review summary:\nThe implementation preserves the required behavior.', shouldAccept: true, acceptedNow: true },
+  ];
+
+  const results = cases.map(probe => {
+    const review = probe.content ? `VERDICT: APPROVED\n\n${probe.content}` : 'VERDICT: APPROVED';
+    let accepted = true;
+    try {
+      validateAssistantOutput(review, { requireVerdict: true });
+    } catch (error) {
+      assert.equal(error?.code, 'MODEL_OUTPUT', probe.input);
+      accepted = false;
+    }
+    assert.equal(accepted, probe.acceptedNow, probe.input);
+    return { input: probe.input, shouldAccept: probe.shouldAccept, accepted };
+  });
+
+  // The five false accepts are the evidence for Outcome B: the validator can
+  // observe letters, but it has no semantic signal that separates these labels
+  // from genuine terse rationale. A future semantic fix should change this list.
+  assert.deepEqual(
+    results.filter(result => result.shouldAccept !== result.accepted).map(result => result.input),
+    ['Rationale:', 'Review summary:', '**Review summary:**', 'Detailed findings from my review:', 'x'],
+  );
 });
 
 test('JSON verdict contract', () => {

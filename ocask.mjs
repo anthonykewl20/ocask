@@ -444,11 +444,17 @@ export function validateAssistantOutput(raw, { jsonMode = false, requireVerdict 
     const { nonemptyLines, candidates, verdict } = resolveTextVerdict(trimmed);
     if (candidates.length === 0) throw makeError('Review must contain an explicit VERDICT line', 'MODEL_OUTPUT');
     if (!verdict) throw makeError('Review contains conflicting explicit VERDICT lines', 'MODEL_OUTPUT');
-    // Verdict placement carries no information about review quality. Enforcing
-    // a line index rejected real reviews for a cosmetic reason.
+    // A nonempty-content hygiene floor, and nothing more. `hasLetter` tests
+    // \p{L} — Unicode General_Category=Letter, which is NARROWER than the Unicode
+    // Alphabetic property (`Ⅳ` is Alphabetic but not \p{L}), so say "letter",
+    // not "alphabetic". What is observable is that SOME letter exists outside the
+    // verdict lines; whether it is reasoning or merely a heading is not observable
+    // here. Do not promote this to a semantic guarantee and do not tune another
+    // text-shape threshold — terse rationale and bare headings overlap exactly.
+    // See docs/research/issue83-rationale-floor.md; semantic detection is #80.
     const candidateIndexes = new Set(candidates.map(candidate => candidate.index));
     const rationale = nonemptyLines.filter((_, index) => !candidateIndexes.has(index)).join('\n');
-    if (!hasLetter(rationale)) throw makeError('Review must include alphabetic prose rationale', 'MODEL_OUTPUT');
+    if (!hasLetter(rationale)) throw makeError('Review must include Unicode letter content outside recognized explicit VERDICT lines', 'MODEL_OUTPUT');
   }
   return trimmed;
 }
