@@ -18,14 +18,13 @@ export class ProviderError extends Error {
 // ── Lazy-loaded provider registry (dynamic imports avoid requiring all
 //     providers be available before the factory is importable) ──
 const _providers = {};
-const PROVIDER_IDS = ['opencode', 'deepseek', 'qwen'];
+const PROVIDER_IDS = ['opencode', 'deepseek'];
 
 async function _loadProvider(id) {
   if (_providers[id]) return _providers[id];
   switch (id) {
     case 'opencode': _providers.opencode = (await import('./opencode.mjs')).invoke; break;
     case 'deepseek': _providers.deepseek = (await import('./deepseek.mjs')).invoke; break;
-    case 'qwen': _providers.qwen = (await import('./qwen.mjs')).invoke; break;
     default: throw new ProviderError(`Unknown provider: ${id}`, 'UNKNOWN_PROVIDER');
   }
   return _providers[id];
@@ -35,9 +34,7 @@ async function _loadProvider(id) {
 const DEEPSEEK_MODELS = new Set([
   'deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner',
 ]);
-const QWEN_MODELS = new Set([
-  'qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-plus', 'qwen3.6-pro',
-]);
+const HY3_MODELS = new Set(['hy3']);
 
 // Curated identity-trust table. Every entry is a HUMAN-ASSERTED DECLARATION,
 // never a cryptographic verification. The table is the sole authority for which
@@ -65,24 +62,18 @@ const IDENTITY_TRANSPORT_TRUST = Object.freeze({
       provenance: '.evidence/issue5-nofallback-decision.md',
     }),
   ]),
-  'qwen3.7-plus': Object.freeze([
-    Object.freeze({
-      provider: 'qwen',
-      modelRoute: 'qwen-plus',
-      snapshotId: null,
-      equivalence: 'declared',
-      snapshotStatus: 'vendor-exposes-no-snapshot',
-      declaration: 'Human-curated declaration that the native Qwen route serves the qwen3.7-plus weights.',
-      provenance: '.evidence/issue5-nofallback-decision.md',
-    }),
+  hy3: Object.freeze([
     Object.freeze({
       provider: 'opencode',
-      modelRoute: 'alibaba/qwen3.7-plus',
+      modelRoute: 'openrouter/tencent/hy3',
       snapshotId: null,
       equivalence: 'declared',
       snapshotStatus: 'vendor-exposes-no-snapshot',
-      declaration: 'Human-curated declaration that the OpenCode route serves the qwen3.7-plus weights.',
-      provenance: '.evidence/issue5-nofallback-decision.md',
+      declaration: 'Human-curated declaration that the OpenCode OpenRouter route serves the Tencent hy3 weights.',
+      // Self-contained on purpose: the sibling deepseek entries cite a .evidence/ path
+      // that does not exist in this repo, so a reader cannot check them. State the
+      // measurement here instead. Re-runnable verbatim.
+      provenance: 'Measured 2026-07-23: `opencode run --auto --pure --model openrouter/tencent/hy3 --format json` returned rc=0 with a text event and a step_finish token record.',
     }),
   ]),
 });
@@ -95,19 +86,19 @@ export function isDeepSeekModel(model) {
   return DEEPSEEK_MODELS.has(model) || /^deepseek/.test(model);
 }
 
-export function isQwenModel(model) {
-  return QWEN_MODELS.has(model) || /^qwen/.test(model);
+export function isHy3Model(model) {
+  return HY3_MODELS.has(model);
 }
 
 export function modelFamily(model) {
   if (isDeepSeekModel(model)) return 'deepseek';
-  if (isQwenModel(model)) return 'qwen';
+  if (isHy3Model(model)) return 'hy3';
   return null;
 }
 
 export function defaultProvider(model) {
   if (isDeepSeekModel(model)) return 'deepseek';
-  if (isQwenModel(model)) return 'qwen';
+  if (isHy3Model(model)) return 'opencode';
   throw Object.assign(new Error(`Unknown model: ${model}`), { code: 'MODEL_NOT_FOUND' });
 }
 
@@ -117,8 +108,7 @@ export function availableProviders() {
 
 // ── Fallback chain config ──
 const DEFAULT_FALLBACK_CHAIN = {
-  deepseek: ['deepseek', 'qwen', 'opencode'],
-  qwen: ['qwen', 'deepseek', 'opencode'],
+  deepseek: ['deepseek', 'opencode'],
 };
 
 function uniqueProviders(values) {
@@ -127,9 +117,8 @@ function uniqueProviders(values) {
 
 export function providerSupportsModel(provider, model) {
   const family = modelFamily(model);
-  if (provider === 'opencode') return family === 'deepseek' || family === 'qwen';
+  if (provider === 'opencode') return family === 'deepseek' || family === 'hy3';
   if (provider === 'deepseek') return family === 'deepseek';
-  if (provider === 'qwen') return family === 'qwen';
   return false;
 }
 
@@ -209,9 +198,7 @@ const RETRYABLE_CODES = new Set([
 async function hasProviderCredentials(provider, env) {
   const credential = provider === 'deepseek'
     ? { envName: 'DEEPSEEK_API_KEY', filename: '.deepseek-key' }
-    : provider === 'qwen'
-      ? { envName: 'QWEN_API_KEY', filename: '.qwen-key' }
-      : null;
+    : null;
   if (!credential) return true;
   if (env[credential.envName]) return true;
 
@@ -228,7 +215,7 @@ async function hasProviderCredentials(provider, env) {
     // let the provider try: a wasted attempt is safe, wrongly skipping a working
     // transport is not.
     // Note the provider reports that attempt as AUTH_FAILURE, having swallowed the
-    // underlying errno (providers/deepseek.mjs, providers/qwen.mjs). So the specific
+    // underlying errno (providers/deepseek.mjs). So the specific
     // filesystem cause is NOT preserved in the outcome; only the fact of failure is.
     return error?.code !== 'ENOENT';
   }

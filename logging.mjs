@@ -84,7 +84,6 @@ export async function gatherSecretValues(env = process.env, deps = {}) {
   const homeDir = os.homedir();
 
   const deepFile = await _safeReadOptionalText(path.join(homeDir, '.deepseek-key'), readFile);
-  const qwenFile = await _safeReadOptionalText(path.join(homeDir, '.qwen-key'), readFile);
   const opencodeGoFile = await _safeReadOptionalText(path.join(homeDir, '.opencode-go-key'), readFile);
   const statePath = path.join(_resolveRuntimeDir(env), 'server-state.json');
   let statePassword = null;
@@ -99,8 +98,8 @@ export async function gatherSecretValues(env = process.env, deps = {}) {
   }
 
   return _sanitizeSecrets([
-    env.DEEPSEEK_API_KEY, env.QWEN_API_KEY, env.OPENCODE_SERVER_PASSWORD,
-    deepFile, qwenFile, opencodeGoFile, statePassword,
+    env.DEEPSEEK_API_KEY, env.OPENCODE_SERVER_PASSWORD,
+    deepFile, opencodeGoFile, statePassword,
   ]);
 }
 

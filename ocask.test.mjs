@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import {
+  assertOppositeFamilyCounterpart,
   buildPrompt,
   buildJsonResponse,
   classifyDiffInput,
@@ -20,10 +21,12 @@ import {
   guardAllowedModels,
   parseArgs,
   parseOpenCodeJsonl,
+  panelCounterpartModel,
   promptHash,
   readExistingPathOrLiteral,
   remainingBudget,
   resolvePanelMembers,
+  resolveCrossVerifyBuddy,
   resolveRisk,
   runAsk,
   runMain,
@@ -46,19 +49,27 @@ import {
   MAX_MECHANISM_MSG_LENGTH,
 } from './logging.mjs';
 import {
+  availableProviders,
+  defaultProvider,
   ProviderError,
   isIdentityPreservingTransport,
   identityTransportRoute,
   identityTransportTrustTable,
   invokeWithFallback,
+  modelFamily,
   resolveProviderChain,
 } from './providers/factory.mjs';
 import { invoke as invokeDeepSeek } from './providers/deepseek.mjs';
-import { invoke as invokeQwen } from './providers/qwen.mjs';
+import { invoke as invokeOpenCode } from './providers/opencode.mjs';
+import {
+  isPaidModelAllowed,
+  PAID_MODELS,
+  runMain as runVerifierMain,
+  ZEN_SERVABLE_MODELS,
+} from './ocverify.mjs';
 import { connectivityStatusFromHttp, summarizeChecks } from './system.mjs';
 
-const QWEN_MODEL = 'qwen3.7-plus';
-const QWEN_MAX_MODEL = 'qwen3.7-max';
+const HY3_MODEL = 'hy3';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
 const DEEPSEEK_PRO_MODEL = 'deepseek-v4-pro';
 
@@ -97,8 +108,8 @@ process.stdin.on('end', () => fs.appendFileSync(process.env.OCASK_TEST_OPENCODE_
 const route = args[args.indexOf('--model') + 1];
 if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith('deepseek/')) {
   process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({reason:'Primary deliberately omitted its verdict.'})}}) + '\\n');
-} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'swap-failure' && route.startsWith('alibaba/')) {
-  process.stderr.write('controlled qwen transport failure\\n');
+} else if (process.env.OCASK_TEST_OPENCODE_MODE === 'swap-failure' && route === 'openrouter/tencent/hy3') {
+  process.stderr.write('controlled hy3 transport failure\\n');
   process.exitCode = 1;
 } else if (process.env.OCASK_TEST_OPENCODE_MODE === 'slow') {
   setTimeout(() => process.stdout.write(JSON.stringify({type:'text', timestamp:Date.now(), part:{type:'text', text:JSON.stringify({verdict:'APPROVED', reason:'Late response.'})}}) + '\\n'), 1000);
@@ -134,7 +145,6 @@ if (process.env.OCASK_TEST_OPENCODE_MODE.startsWith('swap-') && route.startsWith
     OCASK_TEST_OPENCODE_PROMPT_TRACE: promptTracePath,
     OCASK_TEST_OPENCODE_MODE: mode,
     DEEPSEEK_API_KEY: '',
-    QWEN_API_KEY: '',
   };
   return { root, tracePath, promptTracePath, metadataPath, ocaskPath, env };
 }
@@ -345,8 +355,8 @@ test('issue79: in-process and spawned CLI telemetry stays in isolated data direc
 
 // ── Arg parsing ──
 test('parseArgs handles supported booleans and rejects unknown legacy flags', () => {
-  const args = parseArgs(['--model', QWEN_MODEL, '--task', 'audit', '--json', '--require-verdict', '--no-fallback']);
-  assert.equal(args.model, QWEN_MODEL);
+  const args = parseArgs(['--model', HY3_MODEL, '--task', 'audit', '--json', '--require-verdict', '--no-fallback']);
+  assert.equal(args.model, HY3_MODEL);
   assert.equal(args.task, 'audit');
   assert.equal(args.json, true);
   assert.equal(args['require-verdict'], true);
@@ -390,8 +400,8 @@ test('selectPanel maps trivial to solo and default/high to strict cross-family K
   for (const risk of ['default', 'high']) {
     const selection = selectPanel(risk, { model: DEEPSEEK_PRO_MODEL });
     assert.equal(selection.mode, 'panel');
-    assert.deepEqual(selection.members.map(member => member.model), [DEEPSEEK_PRO_MODEL, QWEN_MODEL]);
-    assert.deepEqual(selection.members.map(member => member.family), ['deepseek', 'qwen']);
+    assert.deepEqual(selection.members.map(member => member.model), [DEEPSEEK_PRO_MODEL, HY3_MODEL]);
+    assert.deepEqual(selection.members.map(member => member.family), ['deepseek', 'hy3']);
     assert.equal(selection.k, 2);
     assert.equal(selection.noFallback, risk === 'high');
     assert.equal(selection.strict, risk === 'high');
@@ -413,8 +423,64 @@ test('paid-model gate rejects free and unknown models', () => {
 });
 
 test('default fallback is deterministic and from opposite family', () => {
-  assert.equal(defaultFallbackModel(DEEPSEEK_MODEL), 'qwen3.7-max');
-  assert.equal(defaultFallbackModel('qwen3.7-max'), DEEPSEEK_PRO_MODEL);
+  assert.equal(defaultFallbackModel(DEEPSEEK_PRO_MODEL), HY3_MODEL);
+  assert.equal(defaultFallbackModel(HY3_MODEL), DEEPSEEK_PRO_MODEL);
+});
+
+test('configured DeepSeek and hy3 fallback and panel counterparts are opposite-family', () => {
+  let assertionCount = 0;
+  for (const model of PAID_MODELS) {
+    const family = modelFamily(model);
+    if (!family) continue;
+    for (const counterpart of [defaultFallbackModel(model), panelCounterpartModel(model)]) {
+      if (!counterpart) continue;
+      assert.notEqual(modelFamily(counterpart), family, `${model} -> ${counterpart}`);
+      assertionCount += 1;
+    }
+  }
+  assert.ok(assertionCount >= 6, `expected at least 6 counterpart assertions, got ${assertionCount}`);
+});
+
+test('retired model ids are rejected by the paid-model guard', () => {
+  for (const model of ['qwen3.7-plus', 'qwen3.7-max', 'qwen3.6-plus']) {
+    assert.throws(() => guardAllowedModels({ model }), /not allowed/);
+  }
+});
+
+test('hy3 is spend-allowed but rejected before the Zen HTTP verifier can call fetch', async () => {
+  assert.equal(isPaidModelAllowed(HY3_MODEL), true);
+  assert.ok(PAID_MODELS.includes(HY3_MODEL));
+  assert.ok(!ZEN_SERVABLE_MODELS.includes(HY3_MODEL));
+
+  const stdout = [];
+  let fetchCalls = 0;
+  const previousExitCode = process.exitCode;
+  process.exitCode = 0;
+  try {
+    await runVerifierMain(
+      ['--model', HY3_MODEL, '--lens', 'general', '--diff', '-', '--spec', '-'],
+      async () => { fetchCalls++; throw new Error('must not reach fetch'); },
+      line => stdout.push(line),
+      () => {},
+    );
+    assert.equal(process.exitCode, 1);
+    const result = JSON.parse(stdout.join(''));
+    assert.match(result.error, /Use ocask --model hy3 instead/);
+    assert.equal(fetchCalls, 0);
+  } finally {
+    process.exitCode = previousExitCode;
+  }
+});
+
+test('cross-verification rejects missing and same-family counterparts', () => {
+  assert.throws(
+    () => assertOppositeFamilyCounterpart(DEEPSEEK_PRO_MODEL, DEEPSEEK_MODEL, 'Cross-verification'),
+    /shares the primary deepseek family/,
+  );
+  assert.throws(
+    () => resolveCrossVerifyBuddy('kimi-k2.7-code'),
+    /Cross-verification requires a configured opposite-family counterpart/,
+  );
 });
 
 // ── Verify panel (#23) ──
@@ -425,10 +491,10 @@ test('resolvePanelMembers selects the exact trust-table-supported default panel'
     preferredProvider: 'opencode',
     env: process.env,
   });
-  assert.deepEqual(members.map(member => member.model), [DEEPSEEK_PRO_MODEL, QWEN_MODEL]);
-  assert.ok(!members.some(member => member.model === QWEN_MAX_MODEL));
+  assert.deepEqual(members.map(member => member.model), [DEEPSEEK_PRO_MODEL, HY3_MODEL]);
+  assert.ok(!members.some(member => member.model === 'hy3-preview'));
   assert.ok(members.every(member => Object.hasOwn(identityTransportTrustTable(), member.model)));
-  assert.deepEqual(members.map(member => member.family), ['deepseek', 'qwen']);
+  assert.deepEqual(members.map(member => member.family), ['deepseek', 'hy3']);
   assert.deepEqual(members.map(member => member.transport), ['opencode', 'opencode']);
   assert.equal(new Set(members.map(member => member.family)).size, 2);
 });
@@ -441,7 +507,7 @@ test('resolvePanelMembers fails fast when a member has no serving transport', ()
       preferredProvider: 'deepseek',
       env: process.env,
     }),
-    /Panel member qwen3\.7-plus has no available serving transport/,
+    /Panel member hy3 has no available serving transport/,
   );
 });
 
@@ -467,7 +533,7 @@ const panelAbstention = (model, mechanism = 'TIMEOUT') => ({
 
 test('computeConsensus returns unanimous APPROVED and counts only real judgments', () => {
   const consensus = computeConsensus({
-    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'APPROVED')],
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(HY3_MODEL, 'APPROVED')],
     k: 2,
   });
   assert.equal(consensus.consensus_verdict, 'APPROVED');
@@ -479,14 +545,14 @@ test('computeConsensus returns unanimous APPROVED and counts only real judgments
 
 test('computeConsensus uses conservative WARNING/BLOCKED split tiebreakers', () => {
   const warning = computeConsensus({
-    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'WARNING')],
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(HY3_MODEL, 'WARNING')],
     k: 2,
   });
   assert.equal(warning.consensus_verdict, 'WARNING');
   assert.equal(warning.agreement, false);
 
   const blocked = computeConsensus({
-    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(QWEN_MAX_MODEL, 'BLOCKED')],
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelJudgment(HY3_MODEL, 'BLOCKED')],
     k: 2,
   });
   assert.equal(blocked.consensus_verdict, 'BLOCKED');
@@ -495,7 +561,7 @@ test('computeConsensus uses conservative WARNING/BLOCKED split tiebreakers', () 
 
 test('computeConsensus never turns all abstentions into a verdict or agreement', () => {
   const consensus = computeConsensus({
-    memberResults: [panelAbstention(DEEPSEEK_PRO_MODEL), panelAbstention(QWEN_MAX_MODEL, 'AUTH_FAILURE')],
+    memberResults: [panelAbstention(DEEPSEEK_PRO_MODEL), panelAbstention(HY3_MODEL, 'AUTH_FAILURE')],
     k: 2,
   });
   assert.equal(consensus.consensus_verdict, null);
@@ -507,7 +573,7 @@ test('computeConsensus never turns all abstentions into a verdict or agreement',
 
 test('computeConsensus returns quorum failure when one of two members abstains', () => {
   const consensus = computeConsensus({
-    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelAbstention(QWEN_MAX_MODEL)],
+    memberResults: [panelJudgment(DEEPSEEK_PRO_MODEL, 'APPROVED'), panelAbstention(HY3_MODEL)],
     k: 2,
   });
   assert.equal(consensus.consensus_verdict, null);
@@ -541,7 +607,7 @@ test('runPanel launches members in parallel with one shared absolute deadline', 
     },
   });
   assert.equal(maxActive, 2, 'both panel members must overlap');
-  assert.deepEqual(new Set(calls.map(call => call.model)), new Set([DEEPSEEK_PRO_MODEL, QWEN_MODEL]));
+  assert.deepEqual(new Set(calls.map(call => call.model)), new Set([DEEPSEEK_PRO_MODEL, HY3_MODEL]));
   assert.ok(calls.every(call => call.timeoutMs > 0 && call.timeoutMs <= 1000));
   assert.ok(calls.every(call => call.startedAt + call.timeoutMs <= absoluteDeadlineMs + 5));
   assert.equal(result.verdict, 'APPROVED');
@@ -577,7 +643,7 @@ test('runPanel classifies one member timeout as an abstention and fails K=2 quor
     absoluteDeadlineMs: Date.now() + 1000,
     run_id: 'panel-abstention-test',
     invokeWithFallbackFn: async ({ model }) => {
-      if (model === QWEN_MODEL) throw Object.assign(new ProviderError('timed out', 'TIMEOUT'), { code: 'TIMEOUT', provider: 'opencode' });
+      if (model === HY3_MODEL) throw Object.assign(new ProviderError('timed out', 'TIMEOUT'), { code: 'TIMEOUT', provider: 'opencode' });
       return { provider: 'opencode', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: ok.' };
     },
   });
@@ -586,7 +652,7 @@ test('runPanel classifies one member timeout as an abstention and fails K=2 quor
   assert.equal(result.classification.mechanism, 'PANEL_QUORUM_FAILURE');
   assert.equal(result.consensus.judgments_count, 1);
   assert.equal(result.consensus.abstentions_count, 1);
-  assert.equal(result.members.find(member => member.model === QWEN_MODEL).classification.class, 'no-judgment');
+  assert.equal(result.members.find(member => member.model === HY3_MODEL).classification.class, 'no-judgment');
 });
 
 test('runPanel fails fast on a preferred provider incompatibility', async () => {
@@ -604,7 +670,7 @@ test('runPanel fails fast on a preferred provider incompatibility', async () => 
         return { provider: 'deepseek', model_used: model, commandOutput: 'VERDICT: APPROVED\n\nRationale: ok.' };
       },
     }),
-    /Panel member qwen3\.7-plus has no available serving transport/,
+    /Panel member hy3 has no available serving transport/,
   );
   assert.deepEqual(calls, []);
 });
@@ -642,7 +708,7 @@ test('runAsk --panel skips the primary/fallback/buddy flow and returns split WAR
       return { provider: 'opencode', model_used: model, commandOutput: `VERDICT: ${verdict}\n\nRationale: independent review.` };
     },
   });
-  assert.deepEqual(new Set(calls), new Set([DEEPSEEK_PRO_MODEL, QWEN_MODEL]));
+  assert.deepEqual(new Set(calls), new Set([DEEPSEEK_PRO_MODEL, HY3_MODEL]));
   assert.equal(calls.length, 2, 'panel members are the only model invocations');
   assert.equal(result.verdict, 'WARNING');
   assert.equal(result.failed, false);
@@ -702,7 +768,7 @@ test('runAsk risk default/high and bare --panel use the same cross-family K=2 pa
         return { provider: 'opencode', model_used: options.model, commandOutput: 'VERDICT: APPROVED\n\nRationale: independent review.' };
       },
     });
-    assert.deepEqual(calls.map(call => call.model).sort(), [DEEPSEEK_PRO_MODEL, QWEN_MODEL].sort());
+    assert.deepEqual(calls.map(call => call.model).sort(), [DEEPSEEK_PRO_MODEL, HY3_MODEL].sort());
     assert.ok(calls.every(call => call.noFallback === (risk === 'high')));
     assert.ok(calls.every(call => call.prompt.includes('Test-contract alignment') === (risk !== 'high')),
       `${risk ?? 'bare'} panel must preserve the caller lens unless high risk`);
@@ -782,7 +848,7 @@ test('runPanel logs panel.result and keeps scrubbed mechanism messages local-onl
 test('same-family fallback rejects', () => {
   assert.throws(() => guardAllowedModels({ model: DEEPSEEK_MODEL, fallbackModel: DEEPSEEK_MODEL }), /differ/);
   assert.throws(() => guardAllowedModels({ model: DEEPSEEK_MODEL, fallbackModel: DEEPSEEK_PRO_MODEL }), /opposite/);
-  assert.throws(() => guardAllowedModels({ model: DEEPSEEK_MODEL, fallbackModel: 'qwen3.7-free' }), /not allowed/);
+  assert.throws(() => guardAllowedModels({ model: DEEPSEEK_MODEL, fallbackModel: 'hy3-preview' }), /not allowed/);
 });
 
 // ── Prompt builder ──
@@ -1020,7 +1086,7 @@ test('inline literals bypass stat, paths resolved', async () => {
 // The human stderr line is still emitted; the band simply moved from 1 to 30.
 test('runMain rejects unknown flag', async () => {
   const stderr = []; const prev = process.exitCode;
-  await runMain(['--model', QWEN_MODEL, '--task', 'test', '--bogus'], () => {}, (l) => stderr.push(l));
+  await runMain(['--model', HY3_MODEL, '--task', 'test', '--bogus'], () => {}, (l) => stderr.push(l));
   assert.match(stderr.join(''), /Unknown option/);
   assert.equal(process.exitCode, 30, 'usage throw is no-judgment band 30, not 1');
   process.exitCode = prev;
@@ -1064,7 +1130,7 @@ test('runMain rejects invalid --risk values and --risk without --panel', async (
 
 test('runMain rejects missing model or task', async () => {
   const stderr = []; const prev = process.exitCode;
-  await runMain(['--model', QWEN_MODEL], () => {}, (l) => stderr.push(l));
+  await runMain(['--model', HY3_MODEL], () => {}, (l) => stderr.push(l));
   assert.ok(stderr.join('').includes('Usage'));
   assert.equal(process.exitCode, 30, 'usage throw is no-judgment band 30, not 1');
   process.exitCode = prev;
@@ -1095,10 +1161,10 @@ test('resolveTimeout keeps the default timeout when request is omitted even with
 test('runMain maps absent --timeout-ms to default', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 170000);
@@ -1108,10 +1174,10 @@ test('runMain maps absent --timeout-ms to default', async () => {
 test('runMain maps absent --timeout-ms to default for review operations', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 170000);
@@ -1121,10 +1187,10 @@ test('runMain maps absent --timeout-ms to default for review operations', async 
 test('runMain caps explicit --timeout-ms above the hard ceiling', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '500000', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--timeout-ms', '500000', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 300000);
@@ -1134,10 +1200,10 @@ test('runMain caps explicit --timeout-ms above the hard ceiling', async () => {
 test('runMain uses review ceiling for --require-verdict workloads', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '600000', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '600000', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 600000);
@@ -1147,10 +1213,10 @@ test('runMain uses review ceiling for --require-verdict workloads', async () => 
 test('runMain caps explicit --timeout-ms above the review ceiling', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '1000000', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--timeout-ms', '1000000', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: 'APPROVED', classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 900000);
@@ -1160,10 +1226,10 @@ test('runMain caps explicit --timeout-ms above the review ceiling', async () => 
 test('runMain treats explicit --timeout-ms 0 as default, not unbounded', async () => {
   let askedTimeoutMs;
   const { exitCode } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--timeout-ms', '0', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--timeout-ms', '0', '--json'],
     async ({ timeoutMs }) => {
       askedTimeoutMs = timeoutMs;
-      return { output: 'ok', model: QWEN_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
+      return { output: 'ok', model: HY3_MODEL, verdict: null, classification: null, metadata: {}, run_id: 'fake' };
     },
   );
   assert.equal(askedTimeoutMs, 170000);
@@ -1183,17 +1249,15 @@ test('shared deadline math: fallback receives only remaining wall-clock', () => 
 });
 
 // ── Provider factory (unit) ──
-test('modelFamily classification', async () => {
-  const { modelFamily } = await import('./providers/factory.mjs');
+test('modelFamily classification', () => {
   assert.equal(modelFamily('deepseek-v4-pro'), 'deepseek');
-  assert.equal(modelFamily('qwen3.7-plus'), 'qwen');
+  assert.equal(modelFamily(HY3_MODEL), 'hy3');
   assert.equal(modelFamily('unknown'), null);
 });
 
-test('defaultProvider maps models', async () => {
-  const { defaultProvider } = await import('./providers/factory.mjs');
+test('defaultProvider maps models', () => {
   assert.equal(defaultProvider('deepseek-v4-pro'), 'deepseek');
-  assert.equal(defaultProvider('qwen3.7-plus'), 'qwen');
+  assert.equal(defaultProvider(HY3_MODEL), 'opencode');
   assert.throws(() => defaultProvider('bogus'));
 });
 
@@ -1204,37 +1268,31 @@ test('ProviderError is classified', async () => {
   assert.ok(e instanceof Error);
 });
 
-test('availableProviders lists all', async () => {
-  const { availableProviders } = await import('./providers/factory.mjs');
+test('availableProviders lists all', () => {
   const providers = availableProviders();
-  assert.ok(providers.includes('opencode'));
-  assert.ok(providers.includes('deepseek'));
-  assert.ok(providers.includes('qwen'));
+  assert.deepEqual(providers, ['opencode', 'deepseek']);
 });
 
 test('resolveProviderChain enforces the identity-trust transport set', async () => {
   assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true }), ['deepseek', 'opencode']);
-  assert.deepEqual(resolveProviderChain({ model: QWEN_MODEL, noFallback: true }), ['qwen', 'opencode']);
+  assert.deepEqual(resolveProviderChain({ model: HY3_MODEL, noFallback: true }), ['opencode']);
+  assert.deepEqual(resolveProviderChain({ model: HY3_MODEL }), ['opencode']);
+  assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL }), ['deepseek', 'opencode']);
   assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'deepseek' }), ['deepseek']);
   assert.deepEqual(resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: true, preferredProvider: 'opencode' }), ['opencode']);
-  assert.ok(!resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, noFallback: false }).includes('qwen'));
-  assert.ok(!resolveProviderChain({ model: QWEN_MODEL, noFallback: false }).includes('deepseek'));
+  assert.ok(!resolveProviderChain({ model: HY3_MODEL, noFallback: false }).includes('deepseek'));
   assert.deepEqual(
-    resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, chain: { deepseek: ['qwen', 'opencode', 'deepseek'] } }),
+    resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, chain: { deepseek: ['bogus', 'opencode', 'deepseek'] } }),
     ['opencode', 'deepseek'],
     'configured chains receive the same final serving filter',
   );
   assert.deepEqual(
-    resolveProviderChain({ model: QWEN_MODEL, chain: { qwen: ['deepseek', 'opencode', 'qwen'] } }),
-    ['opencode', 'qwen'],
-    'the final serving filter is symmetric for qwen-family models',
+    resolveProviderChain({ model: HY3_MODEL, chain: { opencode: ['deepseek', 'opencode', 'bogus'] } }),
+    ['opencode'],
+    'the final serving filter isolates hy3-family models',
   );
   assert.throws(
-    () => resolveProviderChain({ model: DEEPSEEK_PRO_MODEL, preferredProvider: 'qwen' }),
-    error => error.code === 'MODEL_NOT_FOUND',
-  );
-  assert.throws(
-    () => resolveProviderChain({ model: QWEN_MODEL, preferredProvider: 'deepseek' }),
+    () => resolveProviderChain({ model: HY3_MODEL, preferredProvider: 'deepseek' }),
     error => error.code === 'MODEL_NOT_FOUND',
   );
   assert.deepEqual(
@@ -1244,8 +1302,7 @@ test('resolveProviderChain enforces the identity-trust transport set', async () 
   );
 });
 
-test('identity pin always admits a model native provider without weakening family isolation', async () => {
-  const unlistedQwenModel = 'qwen3.7-max';
+test('identity pin always admits a native model provider without weakening family isolation', async () => {
   assert.deepEqual(
     resolveProviderChain({ model: DEEPSEEK_MODEL, noFallback: true }),
     ['deepseek'],
@@ -1257,28 +1314,23 @@ test('identity pin always admits a model native provider without weakening famil
     'an explicitly pinned native transport is accepted',
   );
   assert.equal(isIdentityPreservingTransport(DEEPSEEK_MODEL, 'deepseek'), true);
-  assert.deepEqual(
-    resolveProviderChain({ model: unlistedQwenModel, noFallback: true }),
-    ['qwen'],
-    'an unlisted Qwen model retains its native transport',
-  );
-  assert.equal(isIdentityPreservingTransport(unlistedQwenModel, 'qwen'), true);
   assert.ok(
     !resolveProviderChain({
       model: DEEPSEEK_MODEL,
       noFallback: true,
-      chain: { deepseek: ['qwen', 'deepseek'] },
-    }).includes('qwen'),
-    'a DeepSeek model never crosses into the Qwen provider',
+      chain: { deepseek: ['opencode', 'deepseek'] },
+    }).includes('opencode'),
+    'an unlisted DeepSeek model never gains an undeclared OpenCode identity transport',
   );
   assert.throws(
-    () => resolveProviderChain({ model: DEEPSEEK_MODEL, preferredProvider: 'qwen', noFallback: true }),
+    () => resolveProviderChain({ model: HY3_MODEL, preferredProvider: 'deepseek', noFallback: true }),
     error => error.code === 'MODEL_NOT_FOUND',
   );
-  assert.throws(
-    () => resolveProviderChain({ model: unlistedQwenModel, preferredProvider: 'deepseek', noFallback: true }),
-    error => error.code === 'MODEL_NOT_FOUND',
-  );
+});
+
+test('hy3 OpenCode transport is table-declared and identity-preserving', () => {
+  assert.equal(identityTransportRoute(HY3_MODEL, 'opencode'), 'openrouter/tencent/hy3');
+  assert.equal(isIdentityPreservingTransport(HY3_MODEL, 'opencode'), true);
 });
 
 test('identity trust declarations are explicit, auditable, and provide executable routes', () => {
@@ -1287,7 +1339,7 @@ test('identity trust declarations are explicit, auditable, and provide executabl
     for (const entry of entries) {
       assert.equal(entry.equivalence, 'declared', `${model}/${entry.provider}`);
       assert.match(entry.declaration, /Human-curated declaration/);
-      assert.equal(entry.provenance, '.evidence/issue5-nofallback-decision.md');
+      assert.ok(entry.provenance, `${model}/${entry.provider} provenance`);
       assert.ok(Object.hasOwn(entry, 'snapshotId'));
       assert.equal(entry.snapshotId, null);
       assert.equal(entry.snapshotStatus, 'vendor-exposes-no-snapshot');
@@ -1296,23 +1348,36 @@ test('identity trust declarations are explicit, auditable, and provide executabl
   }
 });
 
-test('explicit qwen provider for a deepseek model hard-rejects before invocation', async () => {
+test('explicit deepseek provider for hy3 hard-rejects before invocation', async () => {
   let fetchCalls = 0;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () => { fetchCalls++; throw new Error('must not be called'); };
   try {
     await assert.rejects(
       invokeWithFallback({
-        model: DEEPSEEK_PRO_MODEL,
+        model: HY3_MODEL,
         prompt: 'never sent',
-        preferredProvider: 'qwen',
-        env: { ...process.env, QWEN_API_KEY: 'would-attempt-if-routing-were-wrong' },
+        preferredProvider: 'deepseek',
+        env: { ...process.env, DEEPSEEK_API_KEY: 'would-attempt-if-routing-were-wrong' },
       }),
-      error => error.code === 'MODEL_NOT_FOUND' && error.provider === 'qwen',
+      error => error.code === 'MODEL_NOT_FOUND' && error.provider === 'deepseek',
     );
     assert.equal(fetchCalls, 0, 'the incompatible provider was never attempted');
   } finally {
     globalThis.fetch = previousFetch;
+  }
+});
+
+test('OpenCode rejects an allowlisted model with no known family before route construction', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    await assert.rejects(
+      invokeOpenCode({ model: 'kimi-k2.7-code', prompt: 'never sent', env: fixture.env }),
+      error => error.code === 'UNKNOWN_MODEL_FAMILY' && /no known model family/.test(error.message),
+    );
+    await assertPathMissing(fixture.tracePath);
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
   }
 });
 
@@ -1361,12 +1426,6 @@ test('caller env without HOME hides process-home key files from native providers
       model: DEEPSEEK_PRO_MODEL,
       keyFile: '.deepseek-key',
       invoke: invokeDeepSeek,
-    },
-    {
-      name: 'qwen',
-      model: QWEN_MODEL,
-      keyFile: '.qwen-key',
-      invoke: invokeQwen,
     },
   ];
 
@@ -1428,7 +1487,6 @@ test('caller env without HOME hides process-home key files from native providers
 test('an API key in the caller env works with no HOME, at provider and predictor alike', async () => {
   for (const { name, envName, model, keyFile } of [
     { name: 'deepseek', envName: 'DEEPSEEK_API_KEY', model: DEEPSEEK_PRO_MODEL, keyFile: '.deepseek-key' },
-    { name: 'qwen', envName: 'QWEN_API_KEY', model: QWEN_MODEL, keyFile: '.qwen-key' },
   ]) {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), `ocask-nohome-${name}-`));
     try {
@@ -1455,34 +1513,19 @@ test('an API key in the caller env works with no HOME, at provider and predictor
   }
 });
 
-test('qwen key-file credentials keep the native transport in the fallback chain', async () => {
+test('hy3 invokes OpenCode directly without a native credential transport', async () => {
   const fixture = await makeFakeOpenCodeCli();
-  let fetchCalls = 0;
-  const previousFetch = globalThis.fetch;
-  await fs.writeFile(path.join(fixture.env.HOME, '.qwen-key'), 'test-only-qwen-key\n');
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    return {
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({
-        model: 'qwen-plus',
-        choices: [{ message: { content: '{"verdict":"APPROVED"}' } }],
-      }),
-    };
-  };
   try {
     const result = await invokeWithFallback({
-      model: QWEN_MODEL,
-      prompt: 'use the configured native transport',
+      model: HY3_MODEL,
+      prompt: 'use the OpenCode transport',
       env: fixture.env,
     });
-    assert.equal(result.provider, 'qwen');
+    assert.equal(result.provider, 'opencode');
     assert.deepEqual(result.attempts, []);
-    assert.equal(fetchCalls, 1);
+    const [args] = await readOpenCodeTrace(fixture.tracePath);
+    assert.equal(args[args.indexOf('--model') + 1], 'openrouter/tencent/hy3');
   } finally {
-    globalThis.fetch = previousFetch;
     await fs.rm(fixture.root, { recursive: true, force: true });
   }
 });
@@ -1697,7 +1740,7 @@ test('AUTH_FAILURE classifies as our-side with mechanism AUTH_FAILURE', () => {
 test('unknown / undefined code classifies as indeterminate, never a verdict', () => {
   const weird = Object.assign(
     new ProviderError('something broke', 'SOMETHING_WEIRD'),
-    { code: 'SOMETHING_WEIRD', provider: 'qwen' },
+    { code: 'SOMETHING_WEIRD', provider: 'opencode' },
   );
   const clsUnknown = classifyFailure(wrapAsExhausted(weird));
   assert.equal(clsUnknown.class, 'no-judgment');
@@ -1747,7 +1790,7 @@ test('non-empty malformed model output classifies as reply-unusable', () => {
 test('HTTP status and retry-after propagate from the originating cause', () => {
   const origin = Object.assign(
     new ProviderError('rate limited', 'RATE_LIMITED'),
-    { code: 'RATE_LIMITED', provider: 'qwen', status: 429, retryAfter: '42' },
+    { code: 'RATE_LIMITED', provider: 'opencode', status: 429, retryAfter: '42' },
   );
   const cls = classifyFailure(wrapAsExhausted(origin));
   assert.equal(cls.mechanism, 'RATE_LIMITED');
@@ -1820,7 +1863,7 @@ test('main(): failure metadata never includes mechanism_message (local-only mech
         ...process.env,
         HOME: home,
         DEEPSEEK_API_KEY: '',
-        QWEN_API_KEY: '',
+        OTHER_API_KEY: '',
         OPENCODE_SERVER_PASSWORD: '',
       },
     );
@@ -1939,7 +1982,7 @@ test('runMain rejects conflicting panel modes before any invocation', async () =
   assert.match(both.stderr, /mutually exclusive/);
 
   const fallback = await runFakeMain(
-    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--fallback-model', QWEN_MAX_MODEL],
+    ['--model', DEEPSEEK_PRO_MODEL, '--task', 't', '--require-verdict', '--panel', '--fallback-model', HY3_MODEL],
     async () => { invoked = true; },
   );
   assert.equal(fallback.exitCode, 30);
@@ -2046,7 +2089,7 @@ test('real CLI: default-mode model swap is surfaced and flips identity_preserved
     const traces = await readOpenCodeTrace(fixture.tracePath);
     assert.equal(response.verdict, 'APPROVED');
     assert.equal(metadata.fallback_used, true);
-    assert.equal(metadata.actual_model, QWEN_MAX_MODEL);
+    assert.equal(metadata.actual_model, HY3_MODEL);
     assert.equal(metadata.actual_transport, 'opencode');
     assert.equal(metadata.identity_preserved, false);
     // #45: a MODEL_OUTPUT failure now triggers MODEL_OUTPUT_RETRIES (2) same-model
@@ -2055,7 +2098,7 @@ test('real CLI: default-mode model swap is surfaced and flips identity_preserved
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
-      `alibaba/${QWEN_MAX_MODEL}`,
+      identityTransportRoute(HY3_MODEL, 'opencode'),
     ]);
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
@@ -2101,7 +2144,7 @@ test('real CLI: failed default-mode model swap remains identity_preserved=false'
     assert.equal(response.outcome, 'no-judgment');
     assert.equal(response.verdict, null);
     assert.equal(metadata.fallback_used, true);
-    assert.equal(metadata.actual_model, QWEN_MAX_MODEL);
+    assert.equal(metadata.actual_model, HY3_MODEL);
     assert.equal(metadata.actual_transport, 'opencode');
     assert.equal(metadata.identity_preserved, false);
   } finally {
@@ -2124,11 +2167,11 @@ test('real CLI: --panel emits unanimous cross-family consensus and is never sile
     assert.equal(response.verdict, 'APPROVED');
     assert.equal(response.consensus.agreement, true);
     assert.equal(response.consensus.judgments_count, 2);
-    assert.deepEqual(new Set(response.members.map(member => member.model)), new Set([DEEPSEEK_PRO_MODEL, QWEN_MODEL]));
+    assert.deepEqual(new Set(response.members.map(member => member.model)), new Set([DEEPSEEK_PRO_MODEL, HY3_MODEL]));
     const traces = await readOpenCodeTrace(fixture.tracePath);
     assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
-      identityTransportRoute(QWEN_MODEL, 'opencode'),
+      identityTransportRoute(HY3_MODEL, 'opencode'),
     ]));
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
@@ -2158,7 +2201,7 @@ test('real CLI: --panel --risk trivial is solo while default/high reach OpenCode
       assert.equal(Object.hasOwn(response, 'consensus'), expectsPanel);
       assert.equal(Object.hasOwn(response, 'members'), expectsPanel);
       if (expectsPanel) {
-        assert.deepEqual(response.members.map(member => member.model), [DEEPSEEK_PRO_MODEL, QWEN_MODEL]);
+        assert.deepEqual(response.members.map(member => member.model), [DEEPSEEK_PRO_MODEL, HY3_MODEL]);
         assert.ok(response.members.every(member => member.transport === 'opencode'));
         assert.equal(response.consensus.judgments_count, 2);
       }
@@ -2231,7 +2274,7 @@ test('installed-symlink CLI: existing --cross-verify buddy path remains operatio
   const fixture = await makeFakeOpenCodeCli('cross-approved');
   try {
     const run = spawnSync(process.execPath, [fixture.ocaskPath,
-      '--model', QWEN_MODEL,
+      '--model', HY3_MODEL,
       '--task', 'Return an approved verdict.',
       '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
     ], { encoding: 'utf8', env: fixture.env });
@@ -2240,8 +2283,29 @@ test('installed-symlink CLI: existing --cross-verify buddy path remains operatio
     assert.equal(JSON.parse(run.stdout).verdict, 'APPROVED');
     const traces = await readOpenCodeTrace(fixture.tracePath);
     assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
-      identityTransportRoute(QWEN_MODEL, 'opencode'),
+      identityTransportRoute(HY3_MODEL, 'opencode'),
       identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+    ]));
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('installed-symlink CLI: --cross-verify gives a DeepSeek primary an hy3 buddy', async () => {
+  const fixture = await makeFakeOpenCodeCli('cross-approved');
+  try {
+    const run = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
+    ], { encoding: 'utf8', env: fixture.env });
+    assert.equal(run.status, 0, `exit ${run.status}: ${run.stderr}`);
+    assert.ok(Buffer.byteLength(run.stdout, 'utf8') > 0);
+    assert.equal(JSON.parse(run.stdout).verdict, 'APPROVED');
+    const traces = await readOpenCodeTrace(fixture.tracePath);
+    assert.deepEqual(new Set(traces.map(args => args[args.indexOf('--model') + 1])), new Set([
+      identityTransportRoute(DEEPSEEK_PRO_MODEL, 'opencode'),
+      identityTransportRoute(HY3_MODEL, 'opencode'),
     ]));
   } finally {
     await fs.rm(fixture.root, { recursive: true, force: true });
@@ -2253,7 +2317,7 @@ for (const buddyVerdict of ['BLOCKED', 'WARNING']) {
     const fixture = await makeFakeOpenCodeCli(`cross-${buddyVerdict.toLowerCase()}`);
     try {
       const run = spawnSync(process.execPath, [fixture.ocaskPath,
-        '--model', QWEN_MODEL,
+        '--model', HY3_MODEL,
         '--task', 'Return an approved verdict.',
         '--require-verdict', '--cross-verify', '--provider', 'opencode', '--json',
       ], { encoding: 'utf8', env: fixture.env });
@@ -2262,7 +2326,7 @@ for (const buddyVerdict of ['BLOCKED', 'WARNING']) {
       assert.equal(response.verdict, 'WARNING');
       assert.match(response.output, /^VERDICT: WARNING$/m);
       assert.match(response.output, /BUDDIES DISAGREE/);
-      assert.ok(response.output.includes(`${QWEN_MODEL} (primary): APPROVED`));
+      assert.ok(response.output.includes(`${HY3_MODEL} (primary): APPROVED`));
       assert.ok(response.output.includes(`${DEEPSEEK_PRO_MODEL} (buddy): ${buddyVerdict}`));
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
@@ -2312,7 +2376,7 @@ test('successful but untrusted transport is never attributed as identity-preserv
 // classification + metadata + run_id. main() never calls a provider.
 function fakeJudgment(verdict, text) {
   return async () => ({
-    output: text, model: QWEN_MODEL, verdict,
+    output: text, model: HY3_MODEL, verdict,
     classification: { class: 'judgment', subclass: null, locus: null, mechanism: null },
     metadata: {}, run_id: 'fake',
   });
@@ -2331,9 +2395,9 @@ function fakePanelEnvelope({ verdict, judgments, abstentions }) {
       output_preview: '',
     },
     {
-      model: QWEN_MAX_MODEL, transport: 'opencode',
+      model: HY3_MODEL, transport: 'opencode',
       verdict: judgments >= 2 ? (verdict || 'APPROVED') : null,
-      classification: judgments >= 2 ? classifyFailure(null, { verdict: verdict || 'APPROVED' }) : panelAbstention(QWEN_MAX_MODEL).classification,
+      classification: judgments >= 2 ? classifyFailure(null, { verdict: verdict || 'APPROVED' }) : panelAbstention(HY3_MODEL).classification,
       output_preview: '',
     },
   ];
@@ -2368,7 +2432,7 @@ async function runFakeMain(argv, fakeRunAsk, capture = { stdout: [], stderr: [] 
 test('scrubMessage strips fake DEEPSEEK_API_KEY from mechanism payload while preserving context', async () => {
   const secret = 'sk-live-fake-key-1234567890';
   const text = `DeepSeek API error: invalid credentials ${secret} for model deepseek-v4-flash`;
-  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, OTHER_API_KEY: '' });
   assert.equal(out.includes(secret), false, 'secret token must be removed');
   assert.equal(out.includes('DEEPSEEK_API_KEY'), false);
   assert.match(out, /\[redacted:own-key-[0-9a-f]{8}\]/);
@@ -2421,7 +2485,7 @@ test('issue22: an encoding failure preserves scrubMessage default-deny behavior'
 test('scrubMessage returns placeholder when scrubbing fails', async () => {
   const secret = 'sk-live-fake-key-1234567890';
   const text = `DeepSeek API error: invalid credentials ${secret}`;
-  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' }, {
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, OTHER_API_KEY: '' }, {
     createHashImpl: () => { throw new Error('crypto unavailable'); },
   });
   assert.equal(out, '[scrubbed:unavailable]');
@@ -2442,14 +2506,14 @@ test('scrubMessage enforces a max mechanism-message length and marks truncation'
 test('scrubMessage strips a secret that straddles the 200-char boundary', async () => {
   const secret = 'sk-live-fake-boundary-key-123456';
   const text = `${'A'.repeat(196)}${secret}:tail`;
-  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, QWEN_API_KEY: '' });
+  const out = await scrubMessage(text, { DEEPSEEK_API_KEY: secret, OTHER_API_KEY: '' });
   assert.equal(out.includes(secret), false);
   assert.equal(out.includes(secret.slice(0, 8)), false);
 });
 
 test('main(): APPROVED verdict -> exit 0 + verdict in json', async () => {
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     fakeJudgment('APPROVED', 'VERDICT: APPROVED\n\nLooks good.'));
   const obj = JSON.parse(stdout);
   assert.equal(exitCode, 0);
@@ -2460,7 +2524,7 @@ test('main(): APPROVED verdict -> exit 0 + verdict in json', async () => {
 
 test('main(): WARNING verdict -> exit 0 (proceed), distinguished only in json verdict', async () => {
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     fakeJudgment('WARNING', 'VERDICT: WARNING\n\nMinor issue.'));
   const obj = JSON.parse(stdout);
   assert.equal(exitCode, 0);
@@ -2470,7 +2534,7 @@ test('main(): WARNING verdict -> exit 0 (proceed), distinguished only in json ve
 
 test('main(): BLOCKED verdict -> exit 20', async () => {
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     fakeJudgment('BLOCKED', 'VERDICT: BLOCKED\n\nMust fix.'));
   const obj = JSON.parse(stdout);
   assert.equal(exitCode, 20);
@@ -2480,7 +2544,7 @@ test('main(): BLOCKED verdict -> exit 20', async () => {
 
 test('main(): non-json BLOCKED still prints the human text and exits 20', async () => {
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict'],
     fakeJudgment('BLOCKED', 'VERDICT: BLOCKED\n\nMust fix.'));
   assert.equal(exitCode, 20);
   assert.match(stdout, /VERDICT: BLOCKED/);
@@ -2492,7 +2556,7 @@ test('main(): forced AUTH_FAILURE -> exit 30, verdict:null, reason/locus/mechani
     { code: 'AUTH_FAILURE', provider: 'deepseek' },
   );
   const { exitCode, stdout, stderr } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     async () => { throw authError; });
   const obj = JSON.parse(stdout);
   assert.equal(exitCode, 30);
@@ -2512,7 +2576,7 @@ test('main(): a no-judgment run never exits 0 and never emits a non-null verdict
     { code: 'TIMEOUT', provider: 'deepseek' },
   );
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--require-verdict', '--json'],
+    ['--model', HY3_MODEL, '--task', 't', '--require-verdict', '--json'],
     async () => { throw timeoutError; });
   const obj = JSON.parse(stdout);
   assert.notEqual(exitCode, 0, 'no-judgment must never exit 0');
@@ -2523,11 +2587,11 @@ test('main(): a no-judgment run never exits 0 and never emits a non-null verdict
 
 test('main(): freeform success (no --require-verdict) -> exit 0, verdict:null, not a judgment', async () => {
   const freeform = async () => ({
-    output: 'Here is the analysis.', model: QWEN_MODEL, verdict: null,
+    output: 'Here is the analysis.', model: HY3_MODEL, verdict: null,
     classification: null, metadata: {}, run_id: 'fake',
   });
   const { exitCode, stdout } = await runFakeMain(
-    ['--model', QWEN_MODEL, '--task', 't', '--json'], freeform);
+    ['--model', HY3_MODEL, '--task', 't', '--json'], freeform);
   const obj = JSON.parse(stdout);
   assert.equal(exitCode, 0, 'freeform success did not fail -> exit 0');
   assert.equal(obj.outcome, 'analysis', 'freeform success is analysis (exit 0), never no-judgment');
@@ -2553,11 +2617,11 @@ test('issue10: timeout is inferred as timeout/hang, never credentials auth', () 
 test('issue10: a classified HTTP 429 is inferred as rate-limited on our side', () => {
   const origin = Object.assign(
     new ProviderError('rate limited', 'RATE_LIMITED'),
-    { code: 'RATE_LIMITED', provider: 'qwen', status: 429 },
+    { code: 'RATE_LIMITED', provider: 'opencode', status: 429 },
   );
   const classification = classifyFailure(wrapAsExhausted(origin));
   const attempts = [{
-    outcome: 'failed', provider: 'qwen', model: QWEN_MODEL,
+    outcome: 'failed', provider: 'opencode', model: HY3_MODEL,
     ...classification,
   }];
   const root = _inferRootCause(attempts, [], null, {});
@@ -2774,8 +2838,8 @@ test('issue10: _inferRootCause with two distinct mechanisms yields undetermined'
     },
     {
       outcome: 'failed',
-      provider: 'qwen',
-      model: QWEN_MODEL,
+      provider: 'opencode',
+      model: HY3_MODEL,
       mechanism: 'AUTH_FAILURE',
       class: 'no-judgment',
       subclass: 'reply-absent',
@@ -2977,10 +3041,10 @@ test('issue9: stderr cause line is scrubbed of own secrets (Domain 3, ocask.mjs 
 
 test('issue9: longest-first ordering — a longer key overlapping a shorter one is fully scrubbed (no orphan)', async () => {
   // Design §7.1: secrets are matched longest-first so scrubbing a shorter key that is a prefix of a
-  // longer key cannot orphan the longer key's suffix. Here QWEN key is a prefix of the DEEPSEEK key.
+  // longer key cannot orphan the longer key's suffix. Here secondary key is a prefix of the DEEPSEEK key.
   const shortKey = 'sk-common-prefix-1234';          // 21 chars, >= MIN_SECRET_LENGTH
   const longKey  = 'sk-common-prefix-1234-SUFFIX-XYZ789'; // longKey starts with shortKey
-  const env = { QWEN_API_KEY: shortKey, DEEPSEEK_API_KEY: longKey };
+  const env = { OTHER_API_KEY: shortKey, DEEPSEEK_API_KEY: longKey };
   const out = await scrubMessage(`upstream rejected ${longKey} at edge`, env);
   assert.equal(out.includes(longKey), false, 'the full long key must be removed');
   assert.equal(out.includes('SUFFIX-XYZ789'), false, 'no orphaned suffix of the long key may survive');
@@ -2988,7 +3052,7 @@ test('issue9: longest-first ordering — a longer key overlapping a shorter one 
 
 test('issue9: MIN_SECRET_LENGTH guard — a sub-8-char value is NOT used as a scrub token (no over-scrub)', async () => {
   const tiny = 'abc12';   // 5 chars, below MIN_SECRET_LENGTH (8)
-  const env = { DEEPSEEK_API_KEY: tiny, QWEN_API_KEY: '' };
+  const env = { DEEPSEEK_API_KEY: tiny, OTHER_API_KEY: '' };
   const out = await scrubMessage(`benign text abc12 and abc12345 tail`, env);
   assert.equal(out.includes('abc12'), true, 'a below-threshold value must not redact its occurrences');
   assert.doesNotMatch(out, /redacted:own-key-/, 'no redaction should occur for a sub-threshold secret');

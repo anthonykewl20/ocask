@@ -9,7 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createServer } from 'node:net';
 import { isPaidModelAllowed } from '../ocverify.mjs';
-import { identityTransportRoute, isDeepSeekModel, isQwenModel, ProviderError } from './factory.mjs';
+import { identityTransportRoute, isDeepSeekModel, modelFamily, ProviderError } from './factory.mjs';
 
 const MAX_OUTPUT_BYTES = 0;
 const KILL_GRACE_MS = 1000;
@@ -338,8 +338,10 @@ export async function invoke({ model, prompt, timeoutMs = 0, env = process.env, 
   if (!opencodeBin) throw makeError('OpenCode CLI not found on PATH', 'ENOENT');
 
   const disableServer = env.OCASK_DISABLE_SERVER !== '0';
-  const providerPrefix = isDeepSeekModel(model) ? 'deepseek' : (isQwenModel(model) ? 'alibaba' : 'deepseek');
-  const modelRoute = identityTransportRoute(model, 'opencode') || `${providerPrefix}/${model}`;
+  const trustedRoute = identityTransportRoute(model, 'opencode');
+  const family = modelFamily(model);
+  if (!trustedRoute && !family) throw makeError(`Model ${model} has no known model family`, 'UNKNOWN_MODEL_FAMILY');
+  const modelRoute = trustedRoute || `${family}/${model}`;
   const isDeepSeek = isDeepSeekModel(model);
 
   const args = [
