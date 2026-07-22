@@ -29,24 +29,36 @@ The runner exits immediately when `RUN_LIVE_EVAL !== "true"` and does not perfor
 ### Live knobs
 
 - `RUN_LIVE_EVAL=true` is required to run live invocations.
-- `EVAL_BUDGET_CAP` sets the USD cap (default `1`).
+- `EVAL_LIVE_CAP_USD` sets the live spend ceiling in USD (default `1`).
 - `EVAL_LIVE_CONCURRENCY` sets concurrency (default `5`).
+- `EVAL_OUTPUT_MODE` selects the verdict contract: `json` (default) or `text`.
+- `EVAL_OCASK_PATH` selects the `ocask.mjs` checkout to measure (default: this repository).
+- `EVAL_FREEZE_BASELINE=true` explicitly opts into replacing the frozen baseline after a
+  qualifying run. Omit it for normal runs.
 
 Example:
 
 ```
-EVAL_BUDGET_CAP=1 EVAL_LIVE_CONCURRENCY=5 RUN_LIVE_EVAL=true node eval/run-live.mjs
+EVAL_LIVE_CAP_USD=1 EVAL_LIVE_CONCURRENCY=5 EVAL_OUTPUT_MODE=text \
+  RUN_LIVE_EVAL=true node eval/run-live.mjs
 ```
 
-On success, this writes:
-- `eval/baseline/run-live-results.json` (full run payload)
-- `eval/baseline/frozen-baseline.json` (when completion ratio is `>= 0.8`)
+Every completed run writes `eval/baseline/run-live-results.json`. A normal run never writes
+`eval/baseline/frozen-baseline.json`, even when its completion ratio is high enough to freeze.
+Replacing that reference additionally requires `EVAL_FREEZE_BASELINE=true` and a case
+completion ratio of at least `0.8`.
+
+Frozen payloads record `output_mode` and a structured `system_under_test` identity resolved
+from the checkout containing `EVAL_OCASK_PATH`: executable path, branch (or detached HEAD),
+commit, and dirty state. If git identity cannot be resolved, the payload records
+`resolution: "unresolved"` with null ref/commit fields instead of claiming a false ref.
 
 ## Budget tracker
 
-Budget is enforced via `eval/budget.mjs`.
+Offline invocation budgets are enforced via `eval/budget.mjs`; they are separate from the
+live runner's USD ceiling.
 
-- Set cap with `EVAL_BUDGET_CAP` environment variable.
+- Pass a `createBudgetTracker({ cap })` tracker to the offline matrix API (default cap `5000`).
 - Hard stop occurs when the cap is exhausted.
 - Both `runCaseMatrix` and `runCorpusMatrix` honor budget pressure before new invocations.
 

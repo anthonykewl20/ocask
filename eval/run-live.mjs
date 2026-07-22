@@ -7,13 +7,9 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { createBudgetTracker, DEFAULT_BUDGET_CAP } from './budget.mjs';
 import { ARM_LABELS, runOcaskArm } from './arm.mjs';
 import { aggregate } from './metrics.mjs';
 import { freezeBaselineFromCorpus } from './matrix.mjs';
-
-// Inherit the single harness default from budget.mjs so offline dry runs and live entry gates agree.
-export const REFUSAL_MESSAGE = 'Live budget cap already exhausted; refusing to start eval run.';
 
 const RUN_LIVE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CORPUS_PATH = path.join(RUN_LIVE_DIR, 'corpus', 'cases.json');
@@ -26,19 +22,25 @@ const LIVE_TIMEOUT_MS = 900000;
 const LIVE_TEMPERATURE = 0;
 const LIVE_ITERATIONS = 3;
 const LIVE_ATTEMPT_BLOCK = 15;
+const DEFAULT_OUTPUT_MODE = 'json';
 
 function parseCapFromEnv(env, fallback) {
-  const parsed = Number(env.EVAL_BUDGET_CAP);
+  const parsed = Number(env.EVAL_LIVE_CAP_USD);
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
   return fallback;
 }
 
-function budgetFromEnv(env = process.env) {
-  return parseCapFromEnv(env, DEFAULT_BUDGET_CAP);
-}
-
 function liveCapFromEnv(env = process.env) {
   return parseCapFromEnv(env, DEFAULT_LIVE_CAP_USD);
+}
+
+function normalizeOutputMode(value = DEFAULT_OUTPUT_MODE) {
+  if (value === 'json' || value === 'text') return value;
+  throw new Error(`Unsupported eval output mode: ${value}. Expected "json" or "text".`);
+}
+
+function liveOutputModeFromEnv(env = process.env) {
+  return normalizeOutputMode(env.EVAL_OUTPUT_MODE || DEFAULT_OUTPUT_MODE);
 }
 
 function liveConcurrencyFromEnv(env = process.env) {
@@ -51,12 +53,6 @@ function describeEntryGate(env = process.env) {
   return env.RUN_LIVE_EVAL !== 'true'
     ? 'Offline harness is enabled by default. Set RUN_LIVE_EVAL=true to opt into live execution.'
     : null;
-}
-
-function assertBudgetAvailable(budget) {
-  if (budget.exhausted) {
-    throw new Error(REFUSAL_MESSAGE);
-  }
 }
 
 async function loadCorpus(corpusPath = DEFAULT_CORPUS_PATH) {
@@ -109,6 +105,7 @@ function normalizeAttempts(parsed) {
 }
 
 function buildSpawnArgs(request, diffPath, specPath) {
+  const outputMode = normalizeOutputMode(request?.output_mode);
   const args = [
     '--model',
     request.model,
@@ -117,12 +114,15 @@ function buildSpawnArgs(request, diffPath, specPath) {
     '--context',
     specPath,
     '--require-verdict',
-    '--json',
     '--temperature',
     String(LIVE_TEMPERATURE),
     '--timeout-ms',
     String(LIVE_TIMEOUT_MS),
   ];
+
+  if (outputMode === 'json') {
+    args.push('--json');
+  }
 
   if (isPanelRequest(request)) {
     args.push('--panel');
@@ -275,6 +275,7 @@ export async function runLiveMatrix(cases, {
   concurrency = DEFAULT_LIVE_CONCURRENCY,
   capUsd = DEFAULT_LIVE_CAP_USD,
   costSnapshotFn = null,
+  outputMode = DEFAULT_OUTPUT_MODE,
 } = {}) {
   if (!Array.isArray(cases)) {
     throw new TypeError('runLiveMatrix requires a case array');
@@ -287,6 +288,11 @@ export async function runLiveMatrix(cases, {
   if (Number.isFinite(capUsd) && typeof costSnapshotFn !== 'function') {
     throw new TypeError('runLiveMatrix: capUsd is set but no costSnapshotFn was provided — refusing to run uncapped');
   }
+  const selectedOutputMode = normalizeOutputMode(outputMode);
+  const invokeInSelectedMode = (request) => invoke({
+    ...request,
+    output_mode: selectedOutputMode,
+  });
 
   const poolSize = concurrency > 0 ? Math.floor(concurrency) : DEFAULT_LIVE_CONCURRENCY;
   const expectedRowsPerCase = ARM_LABELS.length * LIVE_ITERATIONS;
@@ -319,7 +325,7 @@ export async function runLiveMatrix(cases, {
     const batch = tasks.slice(index, Math.min(index + poolSize, tasks.length));
     const batchRows = await Promise.all(batch.map((task) => (
       runOcaskArm(task.caseRecord, task.arm, {
-        invoke,
+        invoke: invokeInSelectedMode,
         iteration: task.iteration,
         case_id: task.caseId,
         caseIndex: task.caseIndex,
@@ -375,10 +381,22 @@ export async function runLiveMatrix(cases, {
     iterations: LIVE_ITERATIONS,
     concurrency: poolSize,
     cap_usd: capUsd,
+    output_mode: selectedOutputMode,
   };
 }
 
-export function buildFrozenBaselinePayload(result, { capUsd, concurrency }) {
+export function buildFrozenBaselinePayload(result, {
+  capUsd,
+  concurrency,
+  outputMode = result.output_mode ?? DEFAULT_OUTPUT_MODE,
+  systemUnderTest = {
+    path: null,
+    git_ref: null,
+    git_commit: null,
+    dirty: null,
+    resolution: 'unresolved',
+  },
+}) {
   const run = {
     cases: result.case_count,
     arms: ARM_LABELS,
@@ -407,7 +425,8 @@ export function buildFrozenBaselinePayload(result, { capUsd, concurrency }) {
   return {
     frozen_at: new Date().toISOString().slice(0, 10),
     phase: 'T08',
-    system_under_test: 'ocask.mjs@origin/main',
+    system_under_test: systemUnderTest,
+    output_mode: normalizeOutputMode(outputMode),
     run,
     per_arm: byArm,
     comparisons_vs_control: result.aggregate?.comparisons ?? null,
@@ -421,24 +440,93 @@ async function writeJson(filePath, data) {
   await fs.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
 }
 
-export function makeBudget() {
-  return createBudgetTracker({ cap: budgetFromEnv() });
+export async function resolveSystemUnderTest(ocaskPath, { spawnImpl = spawn } = {}) {
+  let resolvedOcaskPath = path.resolve(ocaskPath);
+  try {
+    resolvedOcaskPath = await fs.realpath(resolvedOcaskPath);
+  } catch {
+    // Keep the requested path so an unresolved payload still identifies the target.
+  }
+
+  const unresolved = {
+    path: resolvedOcaskPath,
+    git_ref: null,
+    git_commit: null,
+    dirty: null,
+    resolution: 'unresolved',
+  };
+
+  try {
+    const checkoutDir = path.dirname(resolvedOcaskPath);
+    const rootResult = await runCommand('git', [
+      '-C', checkoutDir, 'rev-parse', '--show-toplevel',
+    ], { spawnImpl });
+    const repositoryRoot = rootResult.stdout.trim();
+    if (rootResult.exitCode !== 0 || !repositoryRoot) return unresolved;
+
+    const [commitResult, refResult, statusResult] = await Promise.all([
+      runCommand('git', ['-C', repositoryRoot, 'rev-parse', 'HEAD'], { spawnImpl }),
+      runCommand('git', ['-C', repositoryRoot, 'symbolic-ref', '-q', '--short', 'HEAD'], { spawnImpl }),
+      runCommand('git', ['-C', repositoryRoot, 'status', '--porcelain'], { spawnImpl }),
+    ]);
+    const gitCommit = commitResult.stdout.trim();
+    if (commitResult.exitCode !== 0 || !gitCommit) return unresolved;
+
+    return {
+      path: path.relative(repositoryRoot, resolvedOcaskPath) || path.basename(resolvedOcaskPath),
+      git_ref: refResult.exitCode === 0 && refResult.stdout.trim()
+        ? refResult.stdout.trim()
+        : 'HEAD (detached)',
+      git_commit: gitCommit,
+      dirty: statusResult.exitCode === 0 ? statusResult.stdout.trim().length > 0 : null,
+      resolution: 'resolved',
+    };
+  } catch {
+    return unresolved;
+  }
+}
+
+export async function persistLiveRunArtifacts(result, {
+  env = process.env,
+  ocaskPath = DEFAULT_OCASK_PATH,
+  resultsPath = RESULTS_PATH,
+  frozenBaselinePath = FROZEN_BASELINE_PATH,
+  capUsd = DEFAULT_LIVE_CAP_USD,
+  concurrency = DEFAULT_LIVE_CONCURRENCY,
+  writeJsonFn = writeJson,
+  resolveSystemUnderTestFn = resolveSystemUnderTest,
+} = {}) {
+  await writeJsonFn(resultsPath, result);
+
+  const freezeRequested = env.EVAL_FREEZE_BASELINE === 'true';
+  if (!freezeRequested || !result.can_freeze_baseline || !result.baseline) {
+    return { baseline_frozen: false };
+  }
+
+  const systemUnderTest = await resolveSystemUnderTestFn(ocaskPath);
+  const frozen = buildFrozenBaselinePayload(result, {
+    capUsd,
+    concurrency,
+    outputMode: result.output_mode,
+    systemUnderTest,
+  });
+  await writeJsonFn(frozenBaselinePath, frozen);
+  return { baseline_frozen: true, system_under_test: systemUnderTest };
 }
 
 export async function runLive({
-  budget = makeBudget(),
   env = process.env,
   invoke,
   costSnapshotFn = null,
   capUsd = liveCapFromEnv(env),
   concurrency = liveConcurrencyFromEnv(env),
+  outputMode = liveOutputModeFromEnv(env),
 } = {}) {
   const gateMessage = describeEntryGate(env);
   if (gateMessage) {
-    return { status: 'SKIPPED', reason: gateMessage, budget: budget.snapshot() };
+    return { status: 'SKIPPED', reason: gateMessage };
   }
 
-  assertBudgetAvailable(budget);
   if (!invoke) {
     throw new Error('runLive requires an invoke function when RUN_LIVE_EVAL=true');
   }
@@ -447,7 +535,13 @@ export async function runLive({
   }
 
   const corpus = await loadCorpus();
-  return runLiveMatrix(corpus, { invoke, concurrency, capUsd, costSnapshotFn });
+  return runLiveMatrix(corpus, {
+    invoke,
+    concurrency,
+    capUsd,
+    costSnapshotFn,
+    outputMode,
+  });
 }
 
 async function main() {
@@ -460,7 +554,7 @@ async function main() {
 
   const capUsd = liveCapFromEnv(env);
   const concurrency = liveConcurrencyFromEnv(env);
-  const budget = makeBudget();
+  const outputMode = liveOutputModeFromEnv(env);
   const ocaskPath = env.EVAL_OCASK_PATH || DEFAULT_OCASK_PATH;
   let baselineCost = null;
   const costSnapshotFn = async () => {
@@ -479,25 +573,26 @@ async function main() {
   });
 
   const result = await runLive({
-    budget,
     env,
     invoke,
     costSnapshotFn,
     capUsd,
     concurrency,
+    outputMode,
   });
 
-  await writeJson(RESULTS_PATH, result);
-  if (result.can_freeze_baseline && result.baseline) {
-    const frozen = buildFrozenBaselinePayload(result, {
-      capUsd: capUsd ?? baselineCost ?? 0,
-      concurrency,
-    });
-    await writeJson(FROZEN_BASELINE_PATH, frozen);
-  }
+  const persistence = await persistLiveRunArtifacts(result, {
+    env,
+    ocaskPath,
+    capUsd: capUsd ?? baselineCost ?? 0,
+    concurrency,
+  });
 
   console.log(`RUN_LIVE_EVAL completed: ${result.status}.`);
   console.log(`Saved run output: ${RESULTS_PATH}`);
+  if (persistence.baseline_frozen) {
+    console.log(`Explicitly replaced frozen baseline: ${FROZEN_BASELINE_PATH}`);
+  }
 }
 
 main().catch((error) => {
