@@ -15,7 +15,7 @@ async function loadFixture(name) {
   return JSON.parse(raw);
 }
 
-test('golden fixtures parse to expected verdicts', async () => {
+test('golden fixtures follow the product verdict contract', async () => {
   const fixtures = await Promise.all(GOLDEN_FILES.map(loadFixture));
   const parsed = fixtures.map((fixture) => {
     const parsedOutput = parseVerdict(fixture.raw_output);
@@ -39,9 +39,10 @@ test('golden fixtures parse to expected verdicts', async () => {
   assert.equal(parsed[0].verdict, 'APPROVED');
   assert.equal(parsed[1].verdict, 'WARNING');
   assert.equal(parsed[2].verdict, 'BLOCKED');
-  assert.equal(parsed[3].verdict, 'APPROVED');
+  assert.equal(parsed[3].verdict, null);
   assert.equal(parsed[3].truncated, true);
-  assert.equal(parsed.some(row => row.parse_ok === false), false);
+  assert.equal(parsed[3].parse_ok, false);
+  assert.equal(parsed.slice(0, 3).some(row => row.parse_ok === false), false);
 
   const byCase = aggregate(parsed);
   assert.equal(byCase.row_count, 4);

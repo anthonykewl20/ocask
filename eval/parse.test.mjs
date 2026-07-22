@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { extractVerdict } from '../ocask.mjs';
 import { parseVerdict } from './parse.mjs';
 
 const CASES = [
@@ -56,7 +57,7 @@ const CASES = [
   },
   {
     name: 'detects truncation through marker text',
-    raw: 'VERDICT: APPROVED ...[truncated]',
+    raw: 'VERDICT: APPROVED\n...[truncated]',
     expected: {
       verdict: 'APPROVED',
       tokens_used: null,
@@ -103,4 +104,54 @@ test('prefers parseable payload verdict even when truncated flag is present on c
   assert.equal(out.parse_ok, true);
   assert.equal(out.truncated, true);
   assert.equal(out.tokens_used, 12);
+});
+
+test('recorded product envelope keeps its authoritative object verdict', () => {
+  const raw = { verdict: 'WARNING', output: 'VERDICT: APPROVED' };
+  assert.equal(parseVerdict(raw).verdict, extractVerdict(raw));
+  assert.equal(parseVerdict(raw).verdict, 'WARNING');
+});
+
+test('text verdict parsing agrees with the product parser', async (t) => {
+  const corpus = [
+    {
+      name: 'mid-sentence mention is not a verdict',
+      raw: 'The reviewer wrote VERDICT: BLOCKED mid-sentence.',
+      expected: null,
+    },
+    {
+      name: 'Markdown-wrapped verdict line is canonicalized',
+      raw: '**VERDICT: WARNING**',
+      expected: 'WARNING',
+    },
+    {
+      name: 'conflicting verdicts are rejected',
+      raw: 'VERDICT: APPROVED\nRationale.\nVERDICT: BLOCKED',
+      expected: null,
+    },
+    {
+      name: 'repeated agreeing verdicts resolve once',
+      raw: 'VERDICT: BLOCKED\nRationale.\nVERDICT: BLOCKED.',
+      expected: 'BLOCKED',
+    },
+    {
+      name: 'verdict below the fifth nonempty line is accepted',
+      raw: 'One\nTwo\nThree\nFour\nFive\nRationale.\nVERDICT: APPROVED',
+      expected: 'APPROVED',
+    },
+    {
+      name: 'reply without a verdict remains unparseable',
+      raw: 'Analysis only; no judgment was supplied.',
+      expected: null,
+    },
+  ];
+
+  for (const fixture of corpus) {
+    await t.test(fixture.name, () => {
+      const productVerdict = extractVerdict(fixture.raw);
+      const harnessVerdict = parseVerdict(fixture.raw).verdict;
+      assert.equal(productVerdict, fixture.expected);
+      assert.equal(harnessVerdict, productVerdict);
+    });
+  }
 });
