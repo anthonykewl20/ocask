@@ -37,6 +37,14 @@ node --test ocask.test.mjs   # the unit suite — the CI gate
 `check.sh` failure — `ocask does not resolve to repo` — is expected unless you have run
 `./install.sh`, and is not a blocker.
 
+The test suite assigns a temporary `XDG_DATA_HOME` before any test runs. Keep that
+suite-wide isolation in place: in-process logging and spawned `ocask.mjs` children both
+inherit it. The suite also sets `OCASK_REFUSE_DEFAULT_LOG=1`; when that explicit marker is
+present, telemetry throws if it would resolve to the user's default data directory. Set both
+values in any standalone ocask test harness that writes telemetry. `NODE_TEST_CONTEXT` is
+not used: it is automatically inherited by children of any `node --test` suite, including
+third-party suites that legitimately invoke ocask.
+
 ### The verification bar
 
 ocask is an analytical **gate**: a silent success is worse than a loud failure. Beyond the

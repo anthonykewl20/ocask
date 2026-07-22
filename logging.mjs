@@ -137,9 +137,13 @@ export async function scrubMessage(rawMessage, env = process.env, deps = {}) {
 // Resolve the log location at CALL time (not import time) so the path reflects
 // the live XDG_DATA_HOME — this lets tests redirect the log to a temp dir and
 // keeps logPath() honest if the environment shifts between processes.
+function defaultDataDir() {
+  return path.join(os.homedir(), '.local', 'share');
+}
+
 function logDir() {
   return path.join(
-    process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'),
+    process.env.XDG_DATA_HOME || defaultDataDir(),
     'ocask'
   );
 }
@@ -147,9 +151,38 @@ export function logPath() {
   return path.join(logDir(), 'log.jsonl');
 }
 
+async function canonicalPath(filePath) {
+  let existing = path.resolve(filePath);
+  const missing = [];
+  while (true) {
+    try {
+      return path.join(await fs.realpath(existing), ...missing);
+    } catch (error) {
+      // Canonical comparison is a safety aid, not a reason to break logging when
+      // an unrelated ancestor is unreadable or is not a directory.
+      if (error?.code !== 'ENOENT') return path.resolve(filePath);
+      const parent = path.dirname(existing);
+      if (parent === existing) return path.join(existing, ...missing);
+      missing.unshift(path.basename(existing));
+      existing = parent;
+    }
+  }
+}
+
+async function refuseRealTestLog(logDirectory) {
+  if (process.env.OCASK_REFUSE_DEFAULT_LOG !== '1') return;
+  const [resolvedLogDir, resolvedDefaultDir] = await Promise.all([
+    canonicalPath(logDirectory),
+    canonicalPath(path.join(defaultDataDir(), 'ocask')),
+  ]);
+  if (resolvedLogDir === resolvedDefaultDir) {
+    throw new Error('Refusing to write test telemetry to the real data directory; set XDG_DATA_HOME to a temp dir');
+  }
+}
+
 // ── Init ──
-async function ensureLogDir() {
-  await fs.mkdir(logDir(), { recursive: true, mode: 0o700 });
+async function ensureLogDir(logDirectory = logDir()) {
+  await fs.mkdir(logDirectory, { recursive: true, mode: 0o700 });
 }
 
 // ── Failure-record taxonomy (#2) + contract (#3) ──
@@ -335,8 +368,7 @@ function _inferFailureFinding(attempt, baselineHealthyP99Ms = null, options = {}
 }
 
 // ── Rotation ──
-async function maybeRotate() {
-  const LOG_PATH = logPath();
+async function maybeRotate(LOG_PATH = logPath()) {
   try {
     const stat = await fs.stat(LOG_PATH);
     if (stat.size > MAX_LOG_BYTES) {
@@ -353,15 +385,21 @@ async function maybeRotate() {
 
 // ── Write ──
 export async function logEvent(event, data = {}) {
-  await ensureLogDir();
-  await maybeRotate();
-  const LOG_PATH = logPath();
+  const LOG_DIR = logDir();
+  const LOG_PATH = path.join(LOG_DIR, 'log.jsonl');
+  await refuseRealTestLog(LOG_DIR);
+  await ensureLogDir(LOG_DIR);
+  // Re-resolve after mkdir so a symlink created while the path was missing is
+  // caught before rotation or append. The marker makes this test-only overhead.
+  await refuseRealTestLog(LOG_DIR);
+  await maybeRotate(LOG_PATH);
   const line = JSON.stringify({
     v: 1,
     ts: new Date().toISOString(),
     event,
     ...data,
   }) + '\n';
+  await refuseRealTestLog(LOG_DIR);
   await fs.appendFile(LOG_PATH, line, { mode: 0o600 });
   // Best-effort chmod in case file was just created
   try { await fs.chmod(LOG_PATH, 0o600); } catch { /* ok */ }

@@ -202,6 +202,18 @@ Every `runAsk` invocation writes structured events to
 
 Log file auto-rotates at 10MB (keeps 2 backups).
 
+**Test isolation invariant.** The ocask suite sets `OCASK_REFUSE_DEFAULT_LOG=1`; under
+ordinary, non-adversarial filesystem conditions, a process with that explicit marker may
+write telemetry only when `XDG_DATA_HOME` resolves outside the user's default data directory.
+`logEvent` enforces this at the single write funnel and throws with an actionable isolation
+message. The suite establishes a temporary data home globally so in-process calls and
+spawned CLI children are isolated from accidental contamination by construction. Path
+comparison resolves relative paths, trailing separators, and symlinks, and is repeated after
+directory creation and immediately before append. This is not a filesystem transaction; the
+residual ancestor-swap race is recorded in the issue #79 decision document.
+`NODE_TEST_CONTEXT` is deliberately ignored because unrelated Node test suites can pass it
+to children automatically.
+
 **Doctor** (`ocask doctor`): reads the log and produces:
 - Provider health: PASS/WARN/FAIL per provider/model — success rate, avg latency
   (censored timed-out runs excluded), and error breakdown. A connectivity probe
@@ -287,6 +299,7 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 | `QWEN_TOKEN_PLAN` | `qwen` | Set `1` for Alibaba Token Plan billing |
 | `OCASK_DISABLE_SERVER` | `opencode` | Set `0` to re-enable persistent server |
 | `XDG_DATA_HOME` | all | Base for `~/.local/share/ocask/` (log, pricing cache) |
+| `OCASK_REFUSE_DEFAULT_LOG` | tests | Set exactly `1` to refuse telemetry in the default data directory |
 
 Key files: `~/.deepseek-key`, `~/.qwen-key` (mode 0600, one trimmed line).
 
