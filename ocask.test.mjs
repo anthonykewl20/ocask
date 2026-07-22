@@ -60,6 +60,19 @@ const QWEN_MAX_MODEL = 'qwen3.7-max';
 const DEEPSEEK_MODEL = 'deepseek-v4-flash';
 const DEEPSEEK_PRO_MODEL = 'deepseek-v4-pro';
 
+const ORIGINAL_XDG_DATA_HOME = process.env.XDG_DATA_HOME;
+const ORIGINAL_REFUSE_DEFAULT_LOG = process.env.OCASK_REFUSE_DEFAULT_LOG;
+const SUITE_XDG_DATA_HOME = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-test-data-'));
+process.env.XDG_DATA_HOME = SUITE_XDG_DATA_HOME;
+process.env.OCASK_REFUSE_DEFAULT_LOG = '1';
+test.after(async () => {
+  if (ORIGINAL_XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME;
+  else process.env.XDG_DATA_HOME = ORIGINAL_XDG_DATA_HOME;
+  if (ORIGINAL_REFUSE_DEFAULT_LOG === undefined) delete process.env.OCASK_REFUSE_DEFAULT_LOG;
+  else process.env.OCASK_REFUSE_DEFAULT_LOG = ORIGINAL_REFUSE_DEFAULT_LOG;
+  await fs.rm(SUITE_XDG_DATA_HOME, { recursive: true, force: true });
+});
+
 async function makeFakeOpenCodeCli(mode = 'success') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-identity-'));
   const binDir = path.join(root, 'bin');
@@ -130,6 +143,202 @@ async function readOpenCodeTrace(tracePath) {
 async function readOpenCodePrompts(promptTracePath) {
   return (await fs.readFile(promptTracePath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
 }
+
+async function assertPathMissing(filePath) {
+  await assert.rejects(fs.access(filePath), error => error.code === 'ENOENT');
+}
+
+// ── Test telemetry isolation (#79) ──
+const LOG_EVENT_PROBE = `import { logEvent } from ${JSON.stringify(new URL('logging.mjs', import.meta.url).href)}; await logEvent('guard.probe');`;
+
+test('issue79: test telemetry guard refuses the default data directory', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-log-guard-'));
+  const realHome = path.join(root, 'real-home');
+  const linkedHome = path.join(root, 'linked-home');
+  await fs.mkdir(path.join(realHome, '.local', 'share'), { recursive: true });
+  await fs.symlink(realHome, linkedHome);
+
+  try {
+    const unsetXdgEnv = { ...process.env, HOME: realHome };
+    delete unsetXdgEnv.XDG_DATA_HOME;
+    const unsetXdg = spawnSync(process.execPath, ['--input-type=module', '--eval', LOG_EVENT_PROBE], {
+      cwd: root, encoding: 'utf8', env: unsetXdgEnv,
+    });
+    assert.notEqual(unsetXdg.status, 0, 'a test process must refuse the default data directory');
+    assert.match(unsetXdg.stderr, /set XDG_DATA_HOME to a temp dir/);
+
+    const equivalentXdg = spawnSync(process.execPath, ['--input-type=module', '--eval', LOG_EVENT_PROBE], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: linkedHome,
+        XDG_DATA_HOME: './real-home/.local/share/',
+      },
+    });
+    assert.notEqual(equivalentXdg.status, 0,
+      'relative, trailing-slash and symlink-equivalent paths must not bypass the guard');
+    assert.match(equivalentXdg.stderr, /set XDG_DATA_HOME to a temp dir/);
+    await assertPathMissing(path.join(realHome, '.local', 'share', 'ocask', 'log.jsonl'));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('issue79: guard requires the ocask marker and ignores NODE_TEST_CONTEXT', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-log-marker-'));
+  const emptyMarkerHome = path.join(root, 'empty-marker-home');
+  let fixture;
+  await fs.mkdir(emptyMarkerHome);
+
+  try {
+    const emptyMarkerEnv = {
+      ...process.env,
+      HOME: emptyMarkerHome,
+      OCASK_REFUSE_DEFAULT_LOG: '',
+    };
+    delete emptyMarkerEnv.XDG_DATA_HOME;
+    const emptyMarker = spawnSync(process.execPath, ['--input-type=module', '--eval', LOG_EVENT_PROBE], {
+      encoding: 'utf8', env: emptyMarkerEnv,
+    });
+    assert.equal(emptyMarker.status, 0,
+      `an empty refusal marker must not enable the guard: ${emptyMarker.stderr}`);
+
+    fixture = await makeFakeOpenCodeCli();
+    const thirdPartyHome = path.join(root, 'third-party-home');
+    await fs.mkdir(thirdPartyHome);
+    const thirdPartyEnv = {
+      ...fixture.env,
+      HOME: thirdPartyHome,
+      NODE_TEST_CONTEXT: 'child-v8',
+    };
+    delete thirdPartyEnv.XDG_DATA_HOME;
+    delete thirdPartyEnv.OCASK_REFUSE_DEFAULT_LOG;
+    const thirdParty = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--provider', 'opencode', '--no-fallback', '--json',
+    ], {
+      encoding: 'utf8', env: thirdPartyEnv,
+    });
+    assert.equal(thirdParty.status, 0,
+      `NODE_TEST_CONTEXT without the ocask marker must not refuse: ${thirdParty.stderr}`);
+    await fs.access(path.join(thirdPartyHome, '.local', 'share', 'ocask', 'log.jsonl'));
+  } finally {
+    if (fixture) await fs.rm(fixture.root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('issue79: canonical path errors do not block a safe isolated log', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-log-canonical-'));
+  const isolatedDataHome = path.join(root, 'data');
+  const invalidHome = path.join(root, 'not-a-directory');
+  await fs.writeFile(invalidHome, 'file ancestor');
+
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '--eval', LOG_EVENT_PROBE], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: invalidHome,
+        XDG_DATA_HOME: isolatedDataHome,
+      },
+    });
+    assert.equal(child.status, 0, `canonical fallback must preserve safe logging: ${child.stderr}`);
+    await fs.access(path.join(isolatedDataHome, 'ocask', 'log.jsonl'));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('issue79: spawned CLI inherits the suite data home', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-log-inheritance-'));
+  const fakeHome = path.join(root, 'home');
+  const defaultLog = path.join(fakeHome, '.local', 'share', 'ocask', 'log.jsonl');
+  let fixture;
+  await fs.mkdir(fakeHome);
+
+  try {
+    const before = (await readLog()).length;
+    fixture = await makeFakeOpenCodeCli();
+    const { XDG_DATA_HOME: _fixtureDataHome, ...fixtureEnv } = fixture.env;
+    const child = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--provider', 'opencode', '--no-fallback', '--json',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, ...fixtureEnv, HOME: fakeHome },
+    });
+    assert.equal(child.status, 0, `exit ${child.status}: ${child.stderr}`);
+
+    const childEntries = (await readLog()).slice(before);
+    assert.ok(childEntries.some(entry => entry.event === 'run.start'),
+      'spawned CLI must inherit the suite log and write a run record');
+    assert.ok(childEntries.some(entry => entry.event === 'attempt.result'),
+      'spawned CLI must inherit the suite log and write an attempt record');
+    await assertPathMissing(defaultLog);
+  } finally {
+    if (fixture) await fs.rm(fixture.root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('issue79: in-process and spawned CLI telemetry stays in isolated data directories', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-log-isolation-'));
+  const isolatedDataHome = path.join(root, 'data');
+  const fakeHome = path.join(root, 'home');
+  const defaultLog = path.join(fakeHome, '.local', 'share', 'ocask', 'log.jsonl');
+  const previousHome = process.env.HOME;
+  const previousXdg = process.env.XDG_DATA_HOME;
+  let fixture;
+  await fs.mkdir(fakeHome);
+  process.env.HOME = fakeHome;
+  process.env.XDG_DATA_HOME = isolatedDataHome;
+
+  try {
+    const inProcess = await runAsk({
+      model: DEEPSEEK_PRO_MODEL,
+      taskText: 'Return an approved verdict.',
+      requireVerdict: true,
+      noFallback: true,
+      provider: 'opencode',
+      invokeWithFallbackFn: async () => ({
+        provider: 'opencode',
+        model_used: DEEPSEEK_PRO_MODEL,
+        commandOutput: 'VERDICT: APPROVED\n\nRationale: isolated in-process path.',
+      }),
+    });
+    const inProcessEntries = await readLog();
+    assert.ok(inProcessEntries.some(entry => entry.event === 'run.start' && entry.run_id === inProcess.run_id));
+    assert.ok(inProcessEntries.some(entry => entry.event === 'attempt.result' && entry.run_id === inProcess.run_id));
+
+    fixture = await makeFakeOpenCodeCli();
+    const child = spawnSync(process.execPath, [fixture.ocaskPath,
+      '--model', DEEPSEEK_PRO_MODEL,
+      '--task', 'Return an approved verdict.',
+      '--require-verdict', '--provider', 'opencode', '--no-fallback', '--json',
+    ], {
+      encoding: 'utf8',
+      env: { ...fixture.env, HOME: fakeHome, XDG_DATA_HOME: isolatedDataHome },
+    });
+    assert.equal(child.status, 0, `exit ${child.status}: ${child.stderr}`);
+
+    const entries = await readLog();
+    const childEntries = entries.slice(inProcessEntries.length);
+    assert.ok(childEntries.some(entry => entry.event === 'run.start'), 'spawned CLI must write a run record');
+    assert.ok(childEntries.some(entry => entry.event === 'attempt.result'), 'spawned CLI must write an attempt record');
+    await assertPathMissing(defaultLog);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = previousXdg;
+    if (fixture) await fs.rm(fixture.root, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 // ── Arg parsing ──
 test('parseArgs handles supported booleans and rejects unknown legacy flags', () => {
