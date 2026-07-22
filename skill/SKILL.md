@@ -10,7 +10,7 @@ user-invocable: true
 
 One canonical ocask binary: `ocask` on PATH, or `/home/soultransit/devtony/opencode-verify/ocask.mjs`,
 or `node ~/ocask/ocask.mjs`. Do not inline `opencode run` commands;
-use `ocask` for all DeepSeek/Qwen analytical delegation.
+use `ocask` for all DeepSeek/hy3 analytical delegation.
 
 The host (Claude) owns scope, prompt, evidence collection, and verdict interpretation.
 ocask owns the analytical review — it inspects code, traces paths, and delivers
@@ -28,12 +28,13 @@ a structured verdict with cited rationale.
 | Deep-module audit | `deepseek-v4-pro` | `deep-modules` | `--require-verdict` |
 | Heavy read/analysis | `deepseek-v4-pro` | `general` | — |
 | Light/fast analysis | `deepseek-v4-flash` | `general` | — |
-| Quick sanity check | `qwen3.7-plus` | `general` | — |
+| Quick sanity check | `hy3` | `general` | — |
 | Mandatory gate review | `deepseek-v4-pro` | (any lens) | `--require-verdict --no-fallback` |
 
 DeepSeek v4 Pro is the primary analytical engine. v4 Flash for lighter tasks.
-Qwen 3.7 Plus is the fallback: it handles opposite-family retries automatically on
-malformed DeepSeek output, and can be used explicitly for quick one-off checks.
+Tencent hy3 is the opposite-family fallback: it is served only over the OpenCode CLI
+route `openrouter/tencent/hy3`, using OpenCode's own OpenRouter credential. It is not
+served by `ocverify.mjs` and has no native ocask API provider.
 
 ## Invocation
 
@@ -118,7 +119,7 @@ ocask --model deepseek-v4-pro --task ./diff.patch \
 ```
 
 If ocask times out or fails with a provider error, retry once with the
-opposite family fallback model (DeepSeek → Qwen) — ocask handles this
+opposite family fallback model (DeepSeek → hy3) — ocask handles this
 automatically for `--require-verdict` tasks unless `--no-fallback` is set.
 
 ## Speed
@@ -154,7 +155,7 @@ actionable suggestions.
 
 When to run: after a failed review, or periodically to check provider health.
 The host should relay any high-severity suggestions to the user (e.g.
-"Qwen has 40% error rate — consider removing from fallback chain").
+"hy3 has 40% error rate — check the OpenCode OpenRouter route").
 
 ### Diagnose — root cause for a specific run
 

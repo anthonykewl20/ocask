@@ -15,7 +15,7 @@ const CACHE_PATH = path.join(CACHE_DIR, 'pricing-cache.json');
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ── Baseline pricing (USD per million tokens) ──
-// Last updated: 2026-07-17. Sources: api.deepseek.com/pricing, help.aliyun.com
+// Last updated: 2026-07-23. Sources: api.deepseek.com/pricing, openrouter.ai/api/v1/models
 const BASELINE_PRICING = {
   'deepseek-v4-pro': {
     input: 0.27, output: 1.10, unit: 'MTok',
@@ -41,29 +41,11 @@ const BASELINE_PRICING = {
     model_family: 'deepseek',
     note: 'DeepSeek Reasoner — includes reasoning tokens in output',
   },
-  'qwen3.7-plus': {
-    input: 0.50, output: 2.00, unit: 'MTok',
-    source: 'https://help.aliyun.com/zh/model-studio/getting-started/models',
-    model_family: 'qwen',
-    note: 'Qwen 3.7 Plus — Alibaba DashScope',
-  },
-  'qwen3.7-max': {
-    input: 1.20, output: 4.80, unit: 'MTok',
-    source: 'https://help.aliyun.com/zh/model-studio/getting-started/models',
-    model_family: 'qwen',
-    note: 'Qwen 3.7 Max — largest Qwen model',
-  },
-  'qwen3.6-plus': {
-    input: 0.50, output: 2.00, unit: 'MTok',
-    source: 'https://help.aliyun.com/zh/model-studio/getting-started/models',
-    model_family: 'qwen',
-    note: 'Qwen 3.6 Plus — previous gen plus',
-  },
-  'qwen3.6-pro': {
-    input: 1.00, output: 4.00, unit: 'MTok',
-    source: 'https://help.aliyun.com/zh/model-studio/getting-started/models',
-    model_family: 'qwen',
-    note: 'Qwen 3.6 Pro — previous gen pro',
+  hy3: {
+    input: 0.14, output: 0.58, unit: 'MTok',
+    source: 'https://openrouter.ai/api/v1/models',
+    model_family: 'hy3',
+    note: 'Tencent hy3 — OpenCode route openrouter/tencent/hy3',
   },
 };
 
@@ -115,11 +97,6 @@ async function fetchDeepSeekPricing() {
   }
 }
 
-async function fetchQwenPricing() {
-  // Alibaba DashScope pricing — stable, rarely changes. Use baseline.
-  return null; // No public pricing API endpoint; manual updates via GitHub.
-}
-
 export async function refreshPricing(force = false) {
   if (!force) {
     const cached = await readCache();
@@ -132,17 +109,6 @@ export async function refreshPricing(force = false) {
   const dsPricing = await fetchDeepSeekPricing();
   if (dsPricing) {
     for (const [model, rates] of Object.entries(dsPricing)) {
-      if (pricing[model]) {
-        pricing[model].input = rates.input;
-        pricing[model].output = rates.output;
-        pricing[model].refreshed = new Date().toISOString();
-      }
-    }
-  }
-
-  const qwenPricing = await fetchQwenPricing();
-  if (qwenPricing) {
-    for (const [model, rates] of Object.entries(qwenPricing)) {
       if (pricing[model]) {
         pricing[model].input = rates.input;
         pricing[model].output = rates.output;

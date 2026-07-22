@@ -2,8 +2,8 @@
 
 Provider-agnostic review and analysis CLI for paid models. Delegates
 analytical tasks — code review, architecture audit, security analysis,
-TDD compliance, maintainability assessment — to DeepSeek V4 Pro,
-Qwen 3.7, or OpenCode Go through three pluggable backends.
+TDD compliance, maintainability assessment — to DeepSeek or Tencent hy3
+through native DeepSeek and OpenCode CLI backends.
 
 ocask = **O**pen**C**ode **A**nalytical **S**crutiny **K**it.
 
@@ -37,12 +37,11 @@ mkdir -p ~/.config/opencode/commands && cp commands/ocask.md ~/.config/opencode/
 | Provider | Auth method | Models |
 |----------|-------------|--------|
 | `deepseek` | `DEEPSEEK_API_KEY` env var, or `$HOME/.deepseek-key` (mode 0600, one line) | DeepSeek V4 Pro, V4 Flash, Chat, Reasoner |
-| `qwen` | `QWEN_API_KEY` env var, or `$HOME/.qwen-key` (mode 0600, one line) | Qwen 3.7 Plus/Max, 3.6 Plus/Pro |
-| `opencode` | `opencode providers login` (picks up existing CLI auth) | Routes via `deepseek/` and `alibaba/` provider prefixes |
+| `opencode` | `opencode providers login` (picks up existing CLI auth) | DeepSeek routes and Tencent hy3 via `openrouter/tencent/hy3` |
 
-For Qwen via OpenCode CLI: get an API key from https://home.qwencloud.com/api-keys and run `opencode providers login alibaba`.
-
-For Alibaba Token Plan billing: set `QWEN_TOKEN_PLAN=1`.
+hy3 has no native ocask provider or ocask-managed key. It is served only over the
+OpenCode CLI route `openrouter/tencent/hy3` and authenticates through OpenCode's
+own OpenRouter credential. It is not reachable through `ocverify.mjs`'s Zen HTTP client.
 
 Verify:
 
@@ -62,8 +61,8 @@ ocask --model deepseek-v4-pro --task ./changes.patch --require-verdict --lens ar
 # Native DeepSeek API (bypasses OpenCode CLI entirely)
 ocask --model deepseek-v4-pro --provider deepseek --task ./diff.patch --require-verdict
 
-# Native Qwen token plan
-QWEN_TOKEN_PLAN=1 ocask --model qwen3.7-plus --provider qwen --task ./diff.patch --require-verdict
+# Tencent hy3 through OpenCode's OpenRouter route
+ocask --model hy3 --provider opencode --task ./diff.patch --require-verdict
 
 # Thermo-nuclear maintainability review
 ocask --model deepseek-v4-pro --task ./feature.diff --require-verdict --lens maintainability
@@ -80,7 +79,7 @@ ocask --model deepseek-v4-pro --task ./diff.patch --json --require-verdict --len
 ```
 ocask --model <id>
       --task <path|-|string>
-      [--provider opencode|deepseek|qwen]
+      [--provider opencode|deepseek]
       [--context <path|-|string>]
       [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general]
       [--require-verdict]
@@ -95,14 +94,14 @@ ocask --model <id>
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--model` | (required) | Short model ID: `deepseek-v4-pro`, `qwen3.7-plus`, etc. |
+| `--model` | (required) | Short model ID: `deepseek-v4-pro` or `hy3` |
 | `--task` | (required) | Path to file, `-` for stdin, or inline string |
-| `--provider` | auto-detect | Backend transport: `opencode`, `deepseek`, `qwen` |
+| `--provider` | auto-detect | Backend transport: `opencode` or `deepseek` |
 | `--context` | — | Additional context file or text |
 | `--lens` | `general` | Audit framework to inject into the prompt |
 | `--require-verdict` | off | Enforce APPROVED/WARNING/BLOCKED contract |
 | `--no-fallback` | off | Pin model identity via the trust table; transport fallback only across same-weights transports |
-| `--panel` | off | Cross-family consensus panel (DeepSeek + Qwen), K-of-N majority |
+| `--panel` | off | Cross-family consensus panel (DeepSeek + hy3), K-of-N majority |
 | `--risk` | `auto` | Panel risk tier (with `--panel`): `trivial`→solo check, `default`/`high`→panel |
 | `--json` | off | JSON object output (not prose) |
 | `--metadata` | — | Path for privacy-safe attempt report (mode 0600) |
@@ -117,11 +116,10 @@ ocask --model <id>
 | DeepSeek V4 Flash | `deepseek-v4-flash` | `deepseek` |
 | DeepSeek Chat | `deepseek-chat` | `deepseek` |
 | DeepSeek Reasoner | `deepseek-reasoner` | `deepseek` |
-| Qwen 3.7 Plus | `qwen3.7-plus` | `qwen` |
-| Qwen 3.7 Max | `qwen3.7-max` | `qwen` |
-| Qwen 3.6 Plus | `qwen3.6-plus` | `qwen` |
+| Tencent hy3 | `hy3` | `opencode` (`openrouter/tencent/hy3`) |
 
-Auto-detection: `deepseek-*` models → deepseek provider, `qwen*` models → qwen provider.
+Auto-detection: `deepseek-*` models use the native DeepSeek provider; `hy3` uses
+the OpenCode CLI and its configured OpenRouter credential. hy3 has no native API provider.
 
 ## Review lenses
 
@@ -148,8 +146,7 @@ ocask (Node.js CLI)
   │   └─ invokeWithFallback()
   │       │
   │       ├─ providers/deepseek.mjs  — POST api.deepseek.com/v1/chat/completions
-  │       ├─ providers/qwen.mjs      — POST dashscope-intl.aliyuncs.com/compatible-mode/v1
-  │       └─ providers/opencode.mjs  — opencode run --pure (deepseek/ for DS, alibaba/ for Qwen)
+  │       └─ providers/opencode.mjs  — opencode run --pure (deepseek/ and openrouter/tencent/hy3)
   │
   ├─ validateAssistantOutput()   — enforces verdict contract, JSONL parsing
   ├─ logging.mjs                 — JSONL observability (~/.local/share/ocask/log.jsonl)
@@ -172,24 +169,24 @@ Two independent layers:
 
 1. **Provider level** — when a transport fails with a retryable error
    (rate limit, auth, timeout, connection), the next provider in the chain
-   is tried: `deepseek → qwen → opencode` (configurable).
+   is tried: `deepseek → opencode` (configurable). hy3 uses `opencode` only.
 
 2. **Model level** — when output is malformed (missing verdict,
    numbers-only), the opposite-family model retries once:
-   `deepseek-v4-pro → qwen3.7-plus` or `qwen3.7-plus → deepseek-v4-flash`.
+   `deepseek-v4-pro → hy3` or `hy3 → deepseek-v4-pro`.
    Only for `--require-verdict` tasks (read-only, safe to replay).
 
 Use `--no-fallback` for mandatory audit gates where the primary model's
 verdict is the acceptance requirement. Under `--no-fallback`, ocask pins model
 **identity** via a curated trust table — transport fallback still proceeds
 across declared same-weights transports (e.g. DeepSeek's native API and the
-OpenCode CLI route), but a DeepSeek model never routes to the Qwen provider.
+OpenCode CLI route); provider serving compatibility remains family-isolated.
 
 ## Consensus verify-panel
 
 `--panel` replaces the single-model verdict with a **cross-family consensus
 panel** — the requested model plus its opposite-family counterpart
-(DeepSeek ↔ Qwen). Every member runs the same task under one shared absolute
+(DeepSeek ↔ hy3). Every member runs the same task under one shared absolute
 deadline, then the verdicts combine:
 
 - **K-of-N majority** — for the default two-member panel, both members must
@@ -269,15 +266,12 @@ missing credentials, and a hang's advice never tells you to raise the timeout.
 | Env var | Provider | Purpose |
 |---------|----------|---------|
 | `DEEPSEEK_API_KEY` | `deepseek` | API key (primary; overrides key file) |
-| `QWEN_API_KEY` | `qwen` | API key (primary; overrides key file) |
-| `QWEN_TOKEN_PLAN` | `qwen` | Set `1` for Alibaba Token Plan billing mode |
 | `OCASK_DISABLE_SERVER` | `opencode` | Set `0` to re-enable persistent server (direct mode is default) |
 | `XDG_DATA_HOME` | all | Base for log and pricing cache (default: `~/.local/share/ocask/`) |
 
 Key files (fallback, read once per invocation):
 
 - `$HOME/.deepseek-key` — mode 0600, one trimmed line
-- `$HOME/.qwen-key` — mode 0600, one trimmed line
 
 ## Tests
 

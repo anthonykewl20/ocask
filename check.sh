@@ -22,7 +22,7 @@ for f in ocask.mjs logging.mjs pricing.mjs ocverify.mjs version.mjs system.mjs \
          README.md ARCHITECTURE.md install.sh check.sh \
          skill/SKILL.md commands/ocask.md \
          providers/factory.mjs providers/deepseek.mjs \
-         providers/qwen.mjs providers/opencode.mjs; do
+         providers/opencode.mjs; do
   file_ok "$REPO/$f" "$f"
 done
 
@@ -47,7 +47,7 @@ regex_ok "VALID_LENSES from LENS_FRAMEWORKS" \
 
 # ── Providers ──
 section "Providers"
-for p in deepseek qwen opencode; do
+for p in deepseek hy3 opencode; do
   text_ok "factory.mjs: $p"       "$p" "$REPO/providers/factory.mjs"
   text_ok "README.md: $p"         "$p" "$REPO/README.md"
   text_ok "ARCHITECTURE.md: $p"   "$p" "$REPO/ARCHITECTURE.md"
@@ -71,15 +71,13 @@ text_ok "imports version"    "from './version.mjs'" "$REPO/ocask.mjs"
 text_ok "has upgrade check"  "ocask upgrade"        "$REPO/ocask.mjs"
 text_ok "system.mjs exports" "systemHealth"          "$REPO/system.mjs"
 text_ok "version.mjs exports" "CURRENT_VERSION"      "$REPO/version.mjs"
-for f in providers/deepseek.mjs providers/qwen.mjs providers/opencode.mjs; do
+for f in providers/deepseek.mjs providers/opencode.mjs; do
   text_ok "$f: exports invoke" "export async function invoke" "$REPO/$f"
 done
 text_ok "factory loads deepseek"  "./deepseek.mjs"  "$REPO/providers/factory.mjs"
-text_ok "factory loads qwen"      "./qwen.mjs"      "$REPO/providers/factory.mjs"
 text_ok "factory loads opencode"  "./opencode.mjs"  "$REPO/providers/factory.mjs"
 text_ok "deepseek returns tokensUsed"  "tokensUsed"  "$REPO/providers/deepseek.mjs"
-text_ok "qwen returns tokensUsed"      "tokensUsed"  "$REPO/providers/qwen.mjs"
-text_ok "qwen prefix = alibaba"        "alibaba"     "$REPO/providers/opencode.mjs"
+text_ok "hy3 route = OpenRouter"       "openrouter/tencent/hy3" "$REPO/providers/factory.mjs"
 text_ok "USAGE has --provider"         "--provider"  "$REPO/ocask.mjs"
 text_ok "USAGE has --lens"             "--lens"      "$REPO/ocask.mjs"
 

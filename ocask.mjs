@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ocask — provider-agnostic review & analysis CLI for paid models.
-// Supports DeepSeek API, Qwen/Alibaba API, and OpenCode CLI backends.
+// Supports DeepSeek API and OpenCode CLI backends.
 // See ARCHITECTURE.md for design rationale.
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -32,7 +32,7 @@ const RISK_PATH_RE = /(^|\/)(auth|login|secret|crypto|token|password|payment|bil
 const ALLOWED_RISK = new Set(['auto', 'trivial', 'default', 'high']);
 
 // ── USAGE ──
-export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek|qwen] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--risk auto|trivial|default|high] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] (review ops --require-verdict may use up to 900_000ms; plain delegation hard-capped at 300_000ms) [--fallback-model <id>]';
+export const USAGE = 'Usage: ocask --model <id> --task <path|-|string> [--provider opencode|deepseek] [--system <path|-|string>] [--context <path|-|string>] [--json] [--require-verdict] [--no-fallback] [--cross-verify] [--panel] [--risk auto|trivial|default|high] [--lens code-review|architecture|security|tdd|maintainability|deep-modules|general] [--metadata <path>] [--temperature 0] [--max-tokens N] [--timeout-ms N] (review ops --require-verdict may use up to 900_000ms; plain delegation hard-capped at 300_000ms) [--fallback-model <id>]';
 
 const BOOLEAN_ARGS = new Set(['json', 'require-verdict', 'no-fallback', 'cross-verify', 'panel']);
 const VALUE_ARGS = new Set([
@@ -186,23 +186,44 @@ export function guardAllowedModels({ model, fallbackModel }) {
 }
 
 export function defaultFallbackModel(model) {
-  if (modelFamily(model) === 'deepseek') return 'qwen3.7-max';
-  if (modelFamily(model) === 'qwen') return 'deepseek-v4-pro';
+  if (modelFamily(model) === 'deepseek') return 'hy3';
+  if (modelFamily(model) === 'hy3') return 'deepseek-v4-pro';
   return undefined;
 }
 
 const PANEL_COUNTERPART_BY_FAMILY = Object.freeze({
-  deepseek: 'qwen3.7-plus',
-  qwen: 'deepseek-v4-pro',
+  deepseek: 'hy3',
+  hy3: 'deepseek-v4-pro',
 });
 
-function panelCounterpartModel(model) {
+export function panelCounterpartModel(model) {
   return PANEL_COUNTERPART_BY_FAMILY[modelFamily(model)];
+}
+
+export function assertOppositeFamilyCounterpart(primaryModel, counterpartModel, label = 'Review') {
+  const primaryFamily = modelFamily(primaryModel);
+  const counterpartFamily = modelFamily(counterpartModel);
+  if (!primaryFamily || !counterpartFamily) {
+    throw new Error(`${label} requires a configured opposite-family counterpart for ${primaryModel}`);
+  }
+  if (primaryFamily === counterpartFamily) {
+    throw new Error(`${label} counterpart ${counterpartModel} shares the primary ${primaryFamily} family`);
+  }
+  return counterpartModel;
+}
+
+export function resolveCrossVerifyBuddy(model) {
+  return assertOppositeFamilyCounterpart(
+    model,
+    defaultFallbackModel(model),
+    'Cross-verification',
+  );
 }
 
 export function resolvePanelMembers({ model, noFallback = false, preferredProvider = null, env = process.env }) {
   void env; // Required panel seam; resolveProviderChain currently has no env input.
   const counterpart = panelCounterpartModel(model);
+  assertOppositeFamilyCounterpart(model, counterpart, 'Panel');
   const models = [model, counterpart].filter(Boolean);
   const families = models.map(panelModel => modelFamily(panelModel));
   if (models.length < 2 || families.some(family => !family) || new Set(families).size < 2) {
@@ -910,9 +931,9 @@ export async function runAsk({
     await logVerdict({ verdict: primaryVerdict, model: result.model, provider, lens, durationMs: metadata.duration_ms, briefRationale: primaryOutput.slice(0, 200) });
   }
 
-  // ── Cross-verify: DeepSeek + Qwen buddy check ──
+  // ── Cross-verify: independent opposite-family buddy check ──
   if (crossVerify && requireVerdict && primaryVerdict) {
-    const buddyModel = defaultFallbackModel(model) || 'qwen3.7-plus';
+    const buddyModel = resolveCrossVerifyBuddy(model);
     const buddyPrompt = buildPrompt({
       taskText: [
         `## BUDDY CROSS-VERIFICATION`,

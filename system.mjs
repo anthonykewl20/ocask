@@ -80,11 +80,6 @@ async function checkProviderAuth(provider) {
       if (env) return env.length >= 10 ? 'DEEPSEEK_API_KEY set' : 'DEEPSEEK_API_KEY too short';
       return checkKeyFile('.deepseek-key', 'DeepSeek');
     }
-    case 'qwen': {
-      const env = process.env.QWEN_API_KEY;
-      if (env) return env.length >= 10 ? 'QWEN_API_KEY set' : 'QWEN_API_KEY too short';
-      return checkKeyFile('.qwen-key', 'Qwen');
-    }
     case 'opencode': {
       const bin = await findOnPath('opencode');
       if (bin) return `OpenCode CLI found at ${bin}`;
@@ -134,7 +129,6 @@ async function probeEndpoint(url, label) {
 async function checkApiConnectivity(provider) {
   switch (provider) {
     case 'deepseek': return probeEndpoint('https://api.deepseek.com/v1/models', 'DeepSeek API');
-    case 'qwen': return probeEndpoint('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models', 'Qwen API');
     case 'opencode': return 'OpenCode CLI (local, no API probe)';
     default: return 'unknown provider';
   }
@@ -184,12 +178,12 @@ export async function systemHealth() {
   checks.push({ category: 'dependencies', ...await run('opencode-cli', checkOpenCodeCli) });
 
   // Provider auth
-  for (const p of ['deepseek', 'qwen', 'opencode']) {
+  for (const p of ['deepseek', 'opencode']) {
     checks.push({ category: 'auth', ...await run(`${p}-auth`, () => checkProviderAuth(p)) });
   }
 
   // Connectivity
-  for (const p of ['deepseek', 'qwen']) {
+  for (const p of ['deepseek']) {
     checks.push({ category: 'connectivity', ...await run(`${p}-connectivity`, () => checkApiConnectivity(p)) });
   }
 

@@ -1,7 +1,7 @@
 # ocask Architecture
 
 A provider-agnostic review and analysis CLI that delegates analytical tasks
-to paid models (DeepSeek, Qwen, OpenCode Go). Designed for multi-model
+to paid models (DeepSeek and Tencent hy3). Designed for multi-model
 orchestration pipelines where a host (Claude) delegates heavy analytical
 work to DeepSeek and small mechanical tasks to GLM.
 
@@ -13,18 +13,17 @@ work to DeepSeek and small mechanical tasks to GLM.
                          │  CLI + Subcommands│
                          └────────┬────────┘
                                   │ invokeWithFallback()
-                  ┌───────────────┼───────────────┐
-                  │               │               │
-           ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
-           │  deepseek    │ │    qwen     │ │  opencode   │
-           │  API provider│ │ API provider│ │ CLI provider│
-           └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-                  │               │               │
-           ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
-           │ api.deepseek │ │ dashscope   │ │ deepseek/    │
-           │    .com      │ │  .aliyuncs  │ │ alibaba/     │
-           └──────────────┘ └─────────────┘ │ prefix route │
-                                     └─────────────┘
+                  ┌───────────────┴───────────────┐
+                  │                               │
+           ┌──────▼──────┐                 ┌──────▼──────┐
+           │  deepseek    │                 │  opencode   │
+           │  API provider│                 │ CLI provider│
+           └──────┬──────┘                 └──────┬──────┘
+                  │                               │
+           ┌──────▼──────┐                 ┌──────▼──────────────┐
+           │ api.deepseek │                 │ deepseek/ and       │
+           │    .com      │                 │ openrouter/tencent/hy3│
+           └──────────────┘                 └─────────────────────┘
 
 Observability (every invocation):
   runAsk ──► logging.mjs ──► ~/.local/share/ocask/log.jsonl
@@ -64,7 +63,7 @@ optimized for analytical reasoning models. Three components:
 
 ### 3. Provider Abstraction (`providers/factory.mjs`)
 
-The factory lazily loads three backends sharing a unified contract:
+The factory lazily loads two backends sharing a unified contract:
 
 ```javascript
 export async function invoke({ model, prompt, timeoutMs, env, cwd })
@@ -86,7 +85,7 @@ export async function invoke({ model, prompt, timeoutMs, env, cwd })
 | `PROVIDER_ERROR` | Generic 5xx | Yes |
 | `CONNECTION_ERROR` | DNS/TCP failure | Yes |
 | `MODEL_NOT_FOUND` | Unknown model | Yes |
-| `INSUFFICIENT_BALANCE` | Qwen billing (402) | Yes |
+| `INSUFFICIENT_BALANCE` | Provider billing (402) | Yes |
 | `MALFORMED_RESPONSE` | Invalid response shape | **No** |
 | `ENTITLEMENT_UNAVAILABLE` | Key classification mismatch | **No** |
 | `INTERRUPTED` | SIGINT/SIGTERM | **No** |
@@ -100,17 +99,11 @@ export async function invoke({ model, prompt, timeoutMs, env, cwd })
 - Maps `deepseek-v4-pro` → `deepseek-chat`, `deepseek-v4-flash` → `deepseek-chat`
 - Returns `tokensUsed` from `body.usage`
 
-#### `qwen` — Native Alibaba DashScope API
-- POST `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions`
-- Auth: `QWEN_API_KEY` env var or `$HOME/.qwen-key` (mode 0600)
-- Token Plan: set `QWEN_TOKEN_PLAN=1` for `x-dashscope-plugin` header
-- Maps `qwen3.7-plus` → `qwen-plus`, `qwen3.7-max` → `qwen-max`
-- Handles both OpenAI-compatible (`choices[0].message`) and DashScope-native (`output.text`) response formats
-- Returns `tokensUsed` from `body.usage`
-
 #### `opencode` — OpenCode CLI
 - Invokes `opencode run --pure --auto --format json`
-- Provider prefix routing: DeepSeek models → `deepseek/`, Qwen models → `alibaba/`
+- Table-backed route for hy3: `openrouter/tencent/hy3`; other known models derive their family prefix
+- hy3 is available only through this CLI transport, authenticated by OpenCode's own OpenRouter credential
+- The Zen HTTP client in `ocverify.mjs` does not serve hy3
 - Adds `--variant max` for DeepSeek models
 - Default: direct one-shot mode (no persistent server). Opt-in with `OCASK_DISABLE_SERVER=0`
 - Prompt via stdin, output parsed as JSONL via `parseOpenCodeJsonl`
@@ -124,9 +117,9 @@ Two independent layers:
    ```
    deepseek → opencode
    ```
-   Qwen models symmetrically use `qwen → opencode`. Cross-family native
-   transports in the configured defaults are removed by the serving-compatibility
-   gate before invocation. Chains remain configurable per provider family.
+   hy3 uses `opencode` only. Cross-family transports in configured chains are
+   removed by the serving-compatibility gate before invocation. Chains remain
+   configurable per provider family.
 
 2. **Model-level** (`runAsk` in ocask.mjs): malformed output (missing verdict,
    numbers-only → `MODEL_OUTPUT`) first retries the **same** model up to
@@ -140,11 +133,11 @@ Two independent layers:
 *identity*, not a transport. The factory carries a curated **identity trust
 table** (`IDENTITY_TRANSPORT_TRUST` in `factory.mjs`): a human-asserted
 declaration of which transports serve the same weights
-(`deepseek-v4-pro → {deepseek, opencode}`, `qwen3.7-plus → {qwen, opencode}`).
+(`deepseek-v4-pro → {deepseek, opencode}`, `hy3 → {opencode}`).
 Under the pin the resolver admits only the native family transport or an
 explicitly declared same-weights transport, so a DeepSeek model can fall back
-from the native API to the OpenCode CLI route but never to the Qwen provider
-(hard reject via `providerSupportsModel` + `isIdentityPreservingTransport`).
+from the native API to the OpenCode CLI route while family-incompatible
+transports hard-reject via `providerSupportsModel` + `isIdentityPreservingTransport`.
 Each run records `identity_preserved` in its metadata. The table is a
 *declaration*, not a cryptographic verification: a non-null `snapshotId` would
 be the wire model ID and supersede the mutable alias; today every entry is
@@ -153,7 +146,7 @@ be the wire model ID and supersede the mutable alias; today every entry is
 ### Consensus Panel (`ocask.mjs` — `runPanel`)
 
 `--panel` elevates a single verdict to a **cross-family consensus panel**: the
-requested model plus its opposite-family counterpart (DeepSeek ↔ Qwen, resolved
+requested model plus its opposite-family counterpart (DeepSeek ↔ hy3, resolved
 through the trust table above). All members share **one absolute deadline** —
 the budget is not per-attempt; primary, fallback, and every panel member draw
 from the same clock, so a slow member cannot extend the run past the ceiling.
@@ -288,7 +281,7 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 
 ### Rate Limiting
 - 429 with Retry-After → `RATE_LIMITED`. Provider skipped.
-- Quota exhausted → `RATE_LIMITED` or `INSUFFICIENT_BALANCE` (Qwen 402). Provider skipped.
+- Quota exhausted → `RATE_LIMITED` or `INSUFFICIENT_BALANCE` (provider 402). Provider skipped.
 - All providers exhausted → `ALL_PROVIDERS_EXHAUSTED` with attempt history.
 
 ### Network & Transport
@@ -311,8 +304,8 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 
 ### API Keys
 - Never in argv, prompt text, metadata reports, or log files.
-- Key files (`~/.deepseek-key`, `~/.qwen-key`): mode 0600, non-symlink, user-owned.
-- Env vars (`DEEPSEEK_API_KEY`, `QWEN_API_KEY`): in-process only, never serialized.
+- Key file (`~/.deepseek-key`): mode 0600, non-symlink, user-owned.
+- Env var (`DEEPSEEK_API_KEY`): in-process only, never serialized.
 - OpenCode CLI: auth via `opencode providers login`.
 
 ### Logs
@@ -330,14 +323,13 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 | Env var | Provider | Purpose |
 |---------|----------|---------|
 | `DEEPSEEK_API_KEY` | `deepseek` | API key (overrides key file) |
-| `QWEN_API_KEY` | `qwen` | API key (overrides key file) |
-| `QWEN_TOKEN_PLAN` | `qwen` | Set `1` for Alibaba Token Plan billing |
 | `OCASK_DISABLE_SERVER` | `opencode` | Set `0` to re-enable persistent server |
 | `XDG_DATA_HOME` | all | Base for `~/.local/share/ocask/` (log, pricing cache) |
 | `OCASK_REFUSE_DEFAULT_LOG` | tests | Set exactly `1` to refuse telemetry in the default data directory |
 
-Key files: `$HOME/.deepseek-key`, `$HOME/.qwen-key` (mode 0600, one trimmed line). `HOME`
-must be present in the caller-supplied invocation environment for these files to be visible.
+Key file: `$HOME/.deepseek-key` (mode 0600, one trimmed line). `HOME` must be
+present in the caller-supplied invocation environment for this file to be visible.
+hy3 credentials remain owned by OpenCode and are not read by ocask.
 
 ## Project Structure
 
@@ -351,7 +343,6 @@ ocask/
 ├── providers/
 │   ├── factory.mjs           # Lazy-loaded provider registry, fallback chain
 │   ├── deepseek.mjs          # Native DeepSeek API (fetch)
-│   ├── qwen.mjs              # Native Alibaba DashScope API (fetch)
 │   └── opencode.mjs          # OpenCode CLI (child_process spawn)
 ├── ocask.test.mjs            # 23 unit tests
 ├── skill/SKILL.md            # Claude Code skill

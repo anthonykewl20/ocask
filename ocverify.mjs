@@ -10,9 +10,7 @@ const execFileAsync = promisify(execFile);
 export const PAID_MODELS = [
   'deepseek-v4-pro',
   'deepseek-v4-flash',
-  'qwen3.7-max',
-  'qwen3.7-plus',
-  'qwen3.6-plus',
+  'hy3',
   'kimi-k2.7-code',
   'kimi-k2.6',
   'minimax-m3',
@@ -20,6 +18,11 @@ export const PAID_MODELS = [
   'mimo-v2.5-pro',
   'mimo-v2.5'
 ];
+
+// Measured 2026-07-23: Zen POST /chat/completions returned HTTP 400
+// model_not_supported for hy3-preview. hy3 is served only by `ocask --model hy3`
+// through the OpenCode CLI, so it must never reach this HTTP client.
+export const ZEN_SERVABLE_MODELS = PAID_MODELS.filter(model => model !== 'hy3');
 
 const BASE_URL = 'https://opencode.ai/zen/go/v1';
 const CHAT_URL = `${BASE_URL}/chat/completions`;
@@ -103,6 +106,14 @@ export function isPaidModelAllowed(modelId) {
   if (!modelId || typeof modelId !== 'string') return false;
   if (/-free$/i.test(modelId)) return false;
   return PAID_MODELS.includes(modelId);
+}
+
+function isZenServableModel(modelId) {
+  return ZEN_SERVABLE_MODELS.includes(modelId);
+}
+
+function zenModelError(label, modelId) {
+  return `${label} ${modelId} is not served by the Zen HTTP verifier. Use ocask --model ${modelId} instead; ocask routes it through the OpenCode CLI.`;
 }
 
 export function buildVerifierPrompt({ lens, diff, spec, acceptance, context }) {
@@ -529,8 +540,15 @@ export async function runVerifier({
   tools = false,
   context = ''
 }) {
+  if (!isPaidModelAllowed(model)) {
+    throw new Error(`Model ${model} is not allowed. Use a paid model from the allowlist and do not use free tiers.`);
+  }
   if (fallbackModel && fallbackModel !== model && !isPaidModelAllowed(fallbackModel)) {
     throw new Error(`Fallback model ${fallbackModel} is not allowed. Use a paid model from the allowlist and do not use free tiers.`);
+  }
+  if (!isZenServableModel(model)) throw new Error(zenModelError('Model', model));
+  if (fallbackModel && fallbackModel !== model && !isZenServableModel(fallbackModel)) {
+    throw new Error(zenModelError('Fallback model', fallbackModel));
   }
 
   const prompt = buildVerifierPrompt({
@@ -686,6 +704,11 @@ export async function runProbe(args, fetchImpl = fetch) {
     process.exitCode = 1;
     return;
   }
+  if (!isZenServableModel(args.model)) {
+    console.error(zenModelError('Model', args.model));
+    process.exitCode = 1;
+    return;
+  }
 
   const apiKey = await readApiKey();
   if (!apiKey) {
@@ -755,8 +778,19 @@ export async function runMain(argv = process.argv.slice(2), fetchImpl = fetch, w
     return;
   }
 
+  if (!isZenServableModel(args.model)) {
+    writeStdout(JSON.stringify(errorVerdict(zenModelError('Model', args.model), { model: args.model, lens: args.lens })));
+    process.exitCode = 1;
+    return;
+  }
+
   if (args['fallback-model'] && !isPaidModelAllowed(args['fallback-model'])) {
     writeStdout(JSON.stringify(errorVerdict(`Fallback model ${args['fallback-model']} is not allowed. Use a paid model from the allowlist and do not use free tiers.`, { model: args.model, lens: args.lens })));
+    process.exitCode = 1;
+    return;
+  }
+  if (args['fallback-model'] && !isZenServableModel(args['fallback-model'])) {
+    writeStdout(JSON.stringify(errorVerdict(zenModelError('Fallback model', args['fallback-model']), { model: args.model, lens: args.lens })));
     process.exitCode = 1;
     return;
   }
