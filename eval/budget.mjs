@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Budget tracker for offline evaluation runs.
 
-// Keep this as the single budget-default source so run-live and matrix runners stay in sync.
 export const DEFAULT_BUDGET_CAP = 5000;
 
 function normalizeCap(cap) {
