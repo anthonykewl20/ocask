@@ -549,6 +549,39 @@ export async function runLive({
   });
 }
 
+export async function executeLiveRun({
+  env = process.env,
+  ocaskPath = DEFAULT_OCASK_PATH,
+  invoke,
+  costSnapshotFn,
+  capUsd = liveCapFromEnv(env),
+  concurrency = liveConcurrencyFromEnv(env),
+  outputMode = liveOutputModeFromEnv(env),
+  runLiveFn = runLive,
+  persistLiveRunArtifactsFn = persistLiveRunArtifacts,
+  resolveSystemUnderTestFn = resolveSystemUnderTest,
+} = {}) {
+  const systemUnderTest = env.EVAL_FREEZE_BASELINE === 'true'
+    ? await resolveSystemUnderTestFn(ocaskPath)
+    : null;
+  const result = await runLiveFn({
+    env,
+    invoke,
+    costSnapshotFn,
+    capUsd,
+    concurrency,
+    outputMode,
+  });
+  const persistence = await persistLiveRunArtifactsFn(result, {
+    env,
+    ocaskPath,
+    capUsd,
+    concurrency,
+    systemUnderTest,
+  });
+  return { result, persistence };
+}
+
 async function main() {
   const env = process.env;
   const gateMessage = describeEntryGate(env);
@@ -561,9 +594,6 @@ async function main() {
   const concurrency = liveConcurrencyFromEnv(env);
   const outputMode = liveOutputModeFromEnv(env);
   const ocaskPath = env.EVAL_OCASK_PATH || DEFAULT_OCASK_PATH;
-  const systemUnderTest = env.EVAL_FREEZE_BASELINE === 'true'
-    ? await resolveSystemUnderTest(ocaskPath)
-    : null;
   let baselineCost = null;
   const costSnapshotFn = async () => {
     const totalCost = await snapshotCostFromOcask({ ocaskPath, spawnImpl: spawn });
@@ -580,21 +610,14 @@ async function main() {
     spawnImpl: spawn,
   });
 
-  const result = await runLive({
+  const { result, persistence } = await executeLiveRun({
     env,
+    ocaskPath,
     invoke,
     costSnapshotFn,
     capUsd,
     concurrency,
     outputMode,
-  });
-
-  const persistence = await persistLiveRunArtifacts(result, {
-    env,
-    ocaskPath,
-    capUsd: capUsd ?? baselineCost ?? 0,
-    concurrency,
-    systemUnderTest,
   });
 
   console.log(`RUN_LIVE_EVAL completed: ${result.status}.`);

@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import {
   buildFrozenBaselinePayload,
+  executeLiveRun,
   liveInvoke,
   persistLiveRunArtifacts,
   resolveSystemUnderTest,
@@ -418,6 +419,41 @@ test('opt-in baseline persistence records the invoked checkout git identity', as
   });
   assert.deepEqual(frozen.system_under_test, systemUnderTest);
   assert.equal(frozen.output_mode, 'json');
+});
+
+test('executeLiveRun captures checkout identity before measurement and carries it to persistence', async () => {
+  const events = [];
+  const capturedIdentity = {
+    path: 'ocask.mjs',
+    git_ref: 'test-checkout',
+    git_commit: 'before-measurement',
+    dirty: false,
+    resolution: 'resolved',
+  };
+
+  const outcome = await executeLiveRun({
+    env: { RUN_LIVE_EVAL: 'true', EVAL_FREEZE_BASELINE: 'true' },
+    ocaskPath: '/tmp/test-checkout/ocask.mjs',
+    invoke: async () => ({ output: 'VERDICT: BLOCKED\nReview rationale.' }),
+    costSnapshotFn: async () => 0,
+    resolveSystemUnderTestFn: async () => {
+      events.push('identity');
+      return capturedIdentity;
+    },
+    runLiveFn: async () => {
+      events.push('measurement');
+      return { status: 'COMPLETED' };
+    },
+    persistLiveRunArtifactsFn: async (_result, options) => {
+      events.push('persistence');
+      assert.equal(options.systemUnderTest, capturedIdentity);
+      return { baseline_frozen: true };
+    },
+  });
+
+  assert.deepEqual(events, ['identity', 'measurement', 'persistence']);
+  assert.equal(outcome.result.status, 'COMPLETED');
+  assert.equal(outcome.persistence.baseline_frozen, true);
 });
 
 test('unresolved system-under-test identity is explicit instead of claiming a ref', async (t) => {
