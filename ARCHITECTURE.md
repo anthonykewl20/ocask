@@ -122,9 +122,11 @@ Two independent layers:
 1. **Provider-level** (`invokeWithFallback` in factory): transport failures
    (rate limit, auth, timeout, connection) try the next provider:
    ```
-   deepseek → qwen → opencode
+   deepseek → opencode
    ```
-   Configurable per provider family.
+   Qwen models symmetrically use `qwen → opencode`. Cross-family native
+   transports in the configured defaults are removed by the serving-compatibility
+   gate before invocation. Chains remain configurable per provider family.
 
 2. **Model-level** (`runAsk` in ocask.mjs): malformed output (missing verdict,
    numbers-only → `MODEL_OUTPUT`) first retries the **same** model up to
@@ -236,7 +238,8 @@ Token data flows: provider → `tokensUsed` → `logAttemptResult` → log.jsonl
 ## Sad Paths & Edge Cases
 
 ### Auth Failures
-- Env var not set, key file missing → `AUTH_FAILURE`. Provider skipped.
+- Env var not set and key file missing → provider is skipped before invocation with
+  `NOT_CONFIGURED`, unless explicitly pinned or it is the last available transport.
 - Key expired/revoked → API 401/403 → `AUTH_FAILURE`. Retryable on next provider.
 - OpenCode Go key Lite-tier → `ENTITLEMENT_UNAVAILABLE`. Not retryable.
 

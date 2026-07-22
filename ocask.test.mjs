@@ -1019,6 +1019,75 @@ test('unlisted transport under the identity pin fails our-side without invocatio
   );
 });
 
+test('default fallback skips an unconfigured native transport without invoking it', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  let fetchCalls = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetchCalls++; throw new Error('DeepSeek invoke must not reach fetch'); };
+  try {
+    const result = await invokeWithFallback({
+      model: DEEPSEEK_PRO_MODEL,
+      prompt: 'use the configured fallback',
+      env: fixture.env,
+    });
+    assert.equal(result.provider, 'opencode');
+    assert.deepEqual(result.attempts, [{
+      provider: 'deepseek',
+      duration_ms: 0,
+      outcome: 'skipped',
+      reason_code: 'NOT_CONFIGURED',
+    }]);
+    assert.equal(fetchCalls, 0, 'the unconfigured DeepSeek transport was never invoked');
+  } finally {
+    globalThis.fetch = previousFetch;
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('an unconfigured transport is still attempted when skipping would empty the chain', async () => {
+  const fixture = await makeFakeOpenCodeCli();
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'retain one transport',
+        chain: { deepseek: ['deepseek'] },
+        env: fixture.env,
+      }),
+      error => error.code === 'ALL_PROVIDERS_EXHAUSTED'
+        && error.cause?.code === 'AUTH_FAILURE'
+        && error.attempts?.[0]?.outcome === 'failed',
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('provider exhaustion names only transports that genuinely attempted invocation', async () => {
+  const fixture = await makeFakeOpenCodeCli('failure');
+  try {
+    await assert.rejects(
+      invokeWithFallback({
+        model: DEEPSEEK_PRO_MODEL,
+        prompt: 'force exhaustion',
+        env: fixture.env,
+      }),
+      error => {
+        assert.equal(error.code, 'ALL_PROVIDERS_EXHAUSTED');
+        assert.match(error.message, /opencode/);
+        assert.doesNotMatch(error.message, /deepseek/);
+        assert.deepEqual(error.attempts.map(({ provider, outcome, reason_code }) => ({ provider, outcome, reason_code })), [
+          { provider: 'deepseek', outcome: 'skipped', reason_code: 'NOT_CONFIGURED' },
+          { provider: 'opencode', outcome: 'failed', reason_code: 'PROVIDER_ERROR' },
+        ]);
+        return true;
+      },
+    );
+  } finally {
+    await fs.rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 // install.sh installs the CLI as a symlink, so argv[1] is the link path while
 // import.meta.url is the resolved target. `pricing` is local-only: no network,
 // no spend. A silent exit 0 here is the exact shape of the outage this guards.
