@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Parse verdict-oriented output from offline/recorded ocask runs.
 
-const VALID_VERDICTS = Object.freeze(['APPROVED', 'WARNING', 'BLOCKED']);
+import { extractVerdict } from '../ocask.mjs';
+
 const TRUNCATION_MARKERS = Object.freeze([
   '[truncated]',
   '…[truncated]',
   'output truncated',
 ]);
 const TEXT_FIELDS = Object.freeze(['output', 'raw_output', 'response']);
-
-function normalizeVerdict(value) {
-  if (typeof value !== 'string') return null;
-  const candidate = value.trim().toUpperCase();
-  return VALID_VERDICTS.includes(candidate) ? candidate : null;
-}
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -28,24 +23,18 @@ function parseJson(value) {
   }
 }
 
-function verdictFromText(rawText) {
-  if (typeof rawText !== 'string') return null;
-  const matched = rawText.match(/VERDICT\s*:\s*(APPROVED|WARNING|BLOCKED)/i);
-  return matched ? matched[1].trim().toUpperCase() : null;
-}
-
 function verdictFromPayload(payload) {
   if (!isObject(payload)) return null;
 
-  const direct = normalizeVerdict(payload.verdict);
+  const direct = extractVerdict(payload);
   if (direct) return direct;
 
   if (typeof payload.output === 'string') {
     const nested = parseJson(payload.output);
-    const nestedVerdict = nested ? normalizeVerdict(nested.verdict) : null;
+    const nestedVerdict = nested ? extractVerdict(nested) : null;
     if (nestedVerdict) return nestedVerdict;
 
-    const outputVerdict = verdictFromText(payload.output);
+    const outputVerdict = extractVerdict(payload.output);
     if (outputVerdict) return outputVerdict;
   }
 
@@ -165,13 +154,13 @@ function payloadCandidates(rawOutput) {
 }
 
 function parseVerdictFromSources(texts, payloads) {
-  for (const text of texts) {
-    const candidate = verdictFromText(text);
+  for (const payload of payloads) {
+    const candidate = verdictFromPayload(payload);
     if (candidate) return candidate;
   }
 
-  for (const payload of payloads) {
-    const candidate = verdictFromPayload(payload);
+  for (const text of texts) {
+    const candidate = extractVerdict(text);
     if (candidate) return candidate;
   }
 
