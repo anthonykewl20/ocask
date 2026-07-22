@@ -370,8 +370,8 @@ test('opt-in baseline persistence records the invoked checkout git identity', as
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocask-eval-checkout-'));
   t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
   const checkoutDir = path.join(tempDir, 'checkout');
-  const resultsPath = path.join(tempDir, 'run-live-results.json');
-  const frozenBaselinePath = path.join(tempDir, 'frozen-baseline.json');
+  const resultsPath = path.join(checkoutDir, 'run-live-results.json');
+  const frozenBaselinePath = path.join(checkoutDir, 'frozen-baseline.json');
   await fs.mkdir(checkoutDir);
   await fs.writeFile(path.join(checkoutDir, 'ocask.mjs'), '#!/usr/bin/env node\n', 'utf8');
   execFileSync('git', ['init', '-b', 'test-checkout'], { cwd: checkoutDir });

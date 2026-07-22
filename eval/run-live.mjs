@@ -495,23 +495,28 @@ export async function persistLiveRunArtifacts(result, {
   concurrency = DEFAULT_LIVE_CONCURRENCY,
   writeJsonFn = writeJson,
   resolveSystemUnderTestFn = resolveSystemUnderTest,
+  systemUnderTest = null,
 } = {}) {
+  const freezeRequested = env.EVAL_FREEZE_BASELINE === 'true';
+  const canFreeze = freezeRequested && result.can_freeze_baseline && result.baseline;
+  const measuredSystem = canFreeze
+    ? systemUnderTest ?? await resolveSystemUnderTestFn(ocaskPath)
+    : null;
+
   await writeJsonFn(resultsPath, result);
 
-  const freezeRequested = env.EVAL_FREEZE_BASELINE === 'true';
-  if (!freezeRequested || !result.can_freeze_baseline || !result.baseline) {
+  if (!canFreeze) {
     return { baseline_frozen: false };
   }
 
-  const systemUnderTest = await resolveSystemUnderTestFn(ocaskPath);
   const frozen = buildFrozenBaselinePayload(result, {
     capUsd,
     concurrency,
     outputMode: result.output_mode,
-    systemUnderTest,
+    systemUnderTest: measuredSystem,
   });
   await writeJsonFn(frozenBaselinePath, frozen);
-  return { baseline_frozen: true, system_under_test: systemUnderTest };
+  return { baseline_frozen: true, system_under_test: measuredSystem };
 }
 
 export async function runLive({
@@ -556,6 +561,9 @@ async function main() {
   const concurrency = liveConcurrencyFromEnv(env);
   const outputMode = liveOutputModeFromEnv(env);
   const ocaskPath = env.EVAL_OCASK_PATH || DEFAULT_OCASK_PATH;
+  const systemUnderTest = env.EVAL_FREEZE_BASELINE === 'true'
+    ? await resolveSystemUnderTest(ocaskPath)
+    : null;
   let baselineCost = null;
   const costSnapshotFn = async () => {
     const totalCost = await snapshotCostFromOcask({ ocaskPath, spawnImpl: spawn });
@@ -586,6 +594,7 @@ async function main() {
     ocaskPath,
     capUsd: capUsd ?? baselineCost ?? 0,
     concurrency,
+    systemUnderTest,
   });
 
   console.log(`RUN_LIVE_EVAL completed: ${result.status}.`);
